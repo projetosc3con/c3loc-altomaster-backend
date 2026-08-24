@@ -1,7 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient } from '../config/supabase';
-import { getStockMovements } from '../services/stockMovementService';
+import { getStockMovements, recordStockMovement } from '../services/stockMovementService';
 
 export const CATEGORY_PREFIXES: Record<string, string> = {
   'Consumo': 'C',
@@ -149,6 +149,23 @@ export const createPart = async (req: AuthRequest, res: Response) => {
       .single();
 
     if (error) throw error;
+
+    // Se cadastrado com quantidade > 0, registra a movimentação de ENTRADA inicial
+    if (data && Number(data.quantity) > 0) {
+      await recordStockMovement(supabase, {
+        part_id: data.id,
+        movement_type: 'ENTRADA',
+        quantity: Number(data.quantity),
+        unit_value: Number(data.unit_value) || 0,
+        previous_stock: 0,
+        new_stock: Number(data.quantity),
+        reference_type: 'MANUAL_ADJUSTMENT',
+        reference_label: `Cadastro de ${data.internal_code || 'Peça'}`,
+        notes: 'Saldo inicial inserido no cadastro do material.',
+        created_by: req.user?.id || null,
+      });
+    }
+
     return res.status(201).json(data);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });

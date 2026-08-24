@@ -63,7 +63,31 @@ export const getEquipmentById = async (req: AuthRequest, res: Response) => {
       .single();
 
     if (error) throw error;
-    return res.json(data);
+    if (!data) return res.status(404).json({ error: 'Equipamento não encontrado' });
+
+    let enriched = { ...data };
+    if (data.status === 'Locado') {
+      const { data: rental } = await supabase
+        .from('rental_invoices')
+        .select('client_name, billing_period_start, billing_period_end, work_site, billing_status')
+        .eq('equipment_id', id)
+        .neq('billing_status', 'Cancelada')
+        .order('billing_period_end', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (rental) {
+        enriched = {
+          ...enriched,
+          rental_client_name: rental.client_name,
+          rental_period_start: rental.billing_period_start,
+          rental_period_end: rental.billing_period_end,
+          rental_work_site: rental.work_site,
+        };
+      }
+    }
+
+    return res.json(enriched);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
@@ -93,9 +117,19 @@ export const updateEquipment = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   try {
     const supabase = getSupabaseUserClient(req.token!);
+    const updateData = { ...req.body };
+    delete updateData.id;
+    delete updateData.created_at;
+    delete updateData.updated_at;
+    delete updateData.rental_client_name;
+    delete updateData.rental_period_start;
+    delete updateData.rental_period_end;
+    delete updateData.rental_work_site;
+    delete updateData.rental_contract_number;
+
     const { data, error } = await supabase
       .from('equipments')
-      .update(req.body)
+      .update(updateData)
       .eq('id', id)
       .select()
       .single();

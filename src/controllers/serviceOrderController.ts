@@ -72,11 +72,12 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
 
     if (osError) throw osError;
 
-    // 2. Update equipment status to 'Em Manutenção'
+    // 2. Update equipment status based on OS status
     if (osData.equipment_id) {
+        const isAvailable = osData.status === 'Concluída' || osData.status === 'Encerrada com pendências' || osData.status === 'Cancelada';
         await supabase
             .from('equipments')
-            .update({ status: 'Em Manutenção' })
+            .update({ status: isAvailable ? 'Disponível' : 'Em Manutenção' })
             .eq('id', osData.equipment_id);
     }
 
@@ -248,7 +249,7 @@ export const updateServiceOrder = async (req: AuthRequest, res: Response) => {
 
         // 2. Update equipment status based on OS status
         if (os.equipment_id) {
-            if (os.status === 'Concluída' || os.status === 'Cancelada') {
+            if (os.status === 'Concluída' || os.status === 'Encerrada com pendências' || os.status === 'Cancelada') {
                 await supabase
                     .from('equipments')
                     .update({ status: 'Disponível' })
@@ -377,11 +378,16 @@ export const updateServiceOrderStatus = async (req: AuthRequest, res: Response) 
 
         if (osError) throw osError;
 
-        // If OS is concluded, update equipment status back to 'Disponível'
-        if (status === 'Concluída' && os.equipment_id) {
+        // If OS is concluded, closed with pendencies or cancelled, update equipment status back to 'Disponível'
+        if ((status === 'Concluída' || status === 'Encerrada com pendências' || status === 'Cancelada') && os.equipment_id) {
             await supabase
                 .from('equipments')
                 .update({ status: 'Disponível' })
+                .eq('id', os.equipment_id);
+        } else if (os.equipment_id) {
+            await supabase
+                .from('equipments')
+                .update({ status: 'Em Manutenção' })
                 .eq('id', os.equipment_id);
         }
 

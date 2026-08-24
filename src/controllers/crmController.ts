@@ -423,10 +423,14 @@ export const convertLead = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: 'Lead já foi convertido.' });
     }
 
-    // 2. Buscar dados adicionais no opencnpj
+    // 2. Buscar dados adicionais no opencnpj e extrair nota/score
+    const rawScore = req.body.average_score ?? (req.body.score != null ? req.body.score / 200 : null);
+    const averageScore = rawScore != null ? Number(Number(rawScore).toFixed(1)) : 0;
+
     let clientData: any = {
       company_name: lead.company_name,
       cnpj: lead.cnpj || '',
+      average_score: averageScore,
       active: true
     };
 
@@ -476,14 +480,36 @@ export const convertLead = async (req: AuthRequest, res: Response) => {
       }
     }
 
-    // 3. Inserir na tabela clients
-    const { data: newClient, error: clientError } = await supabase
-      .from('clients')
-      .insert([clientData])
-      .select()
-      .single();
+    // 3. Inserir ou atualizar na tabela clients
+    let newClient: any = null;
+    if (clientData.cnpj) {
+      const { data: existingClient } = await supabase
+        .from('clients')
+        .select('*')
+        .eq('cnpj', clientData.cnpj)
+        .maybeSingle();
 
-    if (clientError) throw clientError;
+      if (existingClient) {
+        const { data: updatedClient, error: updateError } = await supabase
+          .from('clients')
+          .update(clientData)
+          .eq('id', existingClient.id)
+          .select()
+          .single();
+        if (updateError) throw updateError;
+        newClient = updatedClient;
+      }
+    }
+
+    if (!newClient) {
+      const { data: insertedClient, error: clientError } = await supabase
+        .from('clients')
+        .insert([clientData])
+        .select()
+        .single();
+      if (clientError) throw clientError;
+      newClient = insertedClient;
+    }
 
     // 4. Migrar contatos (crm_contacts -> vinculá-los ao client_id)
     await supabase
