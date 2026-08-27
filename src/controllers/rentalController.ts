@@ -167,6 +167,48 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
             .eq('id', invoiceData.equipment_id);
     }
 
+    // Disparar lançamento correspondente em `bills` (tipo receivable)
+    if (data && data.client_id && data.due_date && total_value > 0) {
+      const dueDate = String(data.due_date).split('T')[0];
+
+      // Verifica se já existe um lançamento com o mesmo valor, mesma data e mesmo cliente
+      const { data: existingBills, error: checkError } = await supabase
+        .from('bills')
+        .select('id')
+        .eq('client_id', data.client_id)
+        .eq('due_date', dueDate)
+        .eq('gross_value', total_value);
+
+      if (checkError) {
+        console.error('[rentalController] Erro ao consultar duplicidade em bills:', checkError);
+      }
+
+      if (!checkError && (!existingBills || existingBills.length === 0)) {
+        const billStatus = data.reconciliation_status || 'Pendente';
+        const { error: billError } = await supabase
+          .from('bills')
+          .insert({
+            origin: 'MANUAL',
+            type: 'receivable',
+            rental_invoice_id: data.id,
+            client_id: data.client_id,
+            counterparty_name: data.client_name || invoiceData.client_name || null,
+            description: data.invoice_number ? `Fatura de Locação #${data.invoice_number}` : 'Fatura de Locação',
+            gross_value: total_value,
+            fee_amount: 0,
+            net_value: total_value,
+            due_date: dueDate,
+            status: billStatus,
+            reconciled_at: billStatus === 'Recebido' ? new Date().toISOString() : null,
+            created_by: req.user?.id || null,
+          });
+
+        if (billError) {
+          console.error('[rentalController] Erro ao criar lançamento em bills:', billError);
+        }
+      }
+    }
+
     return res.status(201).json(data);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });

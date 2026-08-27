@@ -156,3 +156,20 @@ export const deleteEquipment = async (req: AuthRequest, res: Response) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
+export const getEquipmentRentals = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+    const { data, error } = await supabase
+      .from('rental_invoices')
+      .select('*')
+      .eq('equipment_id', id)
+      .order('return_date', { ascending: false, nullsFirst: true });
+
+    if (error) throw error;
+    return res.json(data || []);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+};
