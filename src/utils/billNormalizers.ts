@@ -19,7 +19,11 @@ export function normalizeBill(row: any): BillStatementItem {
     description: row.description,
     invoice_url: row.payment?.invoice_url ?? null,
     bank_slip_url: row.payment?.bank_slip_url ?? null,
-    is_reconciled: row.bank_transaction_date != null,
+    is_reconciled: row.reconciled_at != null || row.bank_transaction_date != null,
+    created_by_name: row.creator?.full_name ?? null,
+    created_by_photo: row.creator?.photo_url ?? null,
+    created_at: row.created_at ?? null,
+    updated_at: row.updated_at ?? null,
     raw: row,
   };
 }

@@ -141,6 +141,7 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
       Number(cost_training);
 
     const invoiceData = {
+      billing_method: req.body.billing_method || 'MANUAL',
       ...req.body,
       total_value: total_value
     };
@@ -153,18 +154,42 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
 
     if (error) throw error;
 
-    // Side effect: If return_date is set, update equipment status to 'Disponível'
-    if (invoiceData.return_date && invoiceData.equipment_id) {
-        await supabase
-            .from('equipments')
-            .update({ status: 'Disponível' })
-            .eq('id', invoiceData.equipment_id);
+    // Side effect: Logic for equipment status
+    let warningMessage: string | null = null;
+    const todayStr = new Date().toISOString().split('T')[0];
+    const returnDateStr = invoiceData.return_date ? String(invoiceData.return_date).split('T')[0] : null;
+    const periodEndStr = invoiceData.billing_period_end ? String(invoiceData.billing_period_end).split('T')[0] : null;
+
+    if (returnDateStr && invoiceData.equipment_id) {
+        if (returnDateStr <= todayStr) {
+            // Data de retorno preenchida e menor ou igual a hoje -> 'Disponível'
+            await supabase
+                .from('equipments')
+                .update({ status: 'Disponível' })
+                .eq('id', invoiceData.equipment_id);
+        } else {
+            // Data de retorno futura -> permanece 'Locado'
+            await supabase
+                .from('equipments')
+                .update({ status: 'Locado' })
+                .eq('id', invoiceData.equipment_id);
+        }
     } else if (invoiceData.equipment_id) {
-        // If it's a new rental without return date, equipment becomes 'Locado'
-        await supabase
-            .from('equipments')
-            .update({ status: 'Locado' })
-            .eq('id', invoiceData.equipment_id);
+        if (periodEndStr && periodEndStr < todayStr) {
+            // Sem data de retorno e período final no passado -> 'Disponível' com aviso
+            await supabase
+                .from('equipments')
+                .update({ status: 'Disponível' })
+                .eq('id', invoiceData.equipment_id);
+
+            warningMessage = 'A locação foi cadastrada sem data de retorno mesmo sendo no passado, por isso o equipamento ficará disponível no estoque.';
+        } else {
+            // Sem data de retorno no presente/futuro -> 'Locado'
+            await supabase
+                .from('equipments')
+                .update({ status: 'Locado' })
+                .eq('id', invoiceData.equipment_id);
+        }
     }
 
     // Disparar lançamento correspondente em `bills` (tipo receivable)
@@ -209,7 +234,10 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
       }
     }
 
-    return res.status(201).json(data);
+    return res.status(201).json({
+      ...data,
+      ...(warningMessage ? { warning: warningMessage } : {})
+    });
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
@@ -257,11 +285,37 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
     if (error) throw error;
 
     // Side effect logic for equipment status
-    if (updateData.return_date && data.equipment_id) {
-        await supabase
-            .from('equipments')
-            .update({ status: 'Disponível' })
-            .eq('id', data.equipment_id);
+    const todayStr = new Date().toISOString().split('T')[0];
+    const returnDate = updateData.return_date !== undefined ? updateData.return_date : data.return_date;
+    const returnDateStr = returnDate ? String(returnDate).split('T')[0] : null;
+    const periodEnd = updateData.billing_period_end !== undefined ? updateData.billing_period_end : data.billing_period_end;
+    const periodEndStr = periodEnd ? String(periodEnd).split('T')[0] : null;
+    const targetEquipId = updateData.equipment_id || data.equipment_id;
+
+    if (returnDateStr && targetEquipId) {
+        if (returnDateStr <= todayStr) {
+            await supabase
+                .from('equipments')
+                .update({ status: 'Disponível' })
+                .eq('id', targetEquipId);
+        } else {
+            await supabase
+                .from('equipments')
+                .update({ status: 'Locado' })
+                .eq('id', targetEquipId);
+        }
+    } else if (targetEquipId) {
+        if (periodEndStr && periodEndStr < todayStr) {
+            await supabase
+                .from('equipments')
+                .update({ status: 'Disponível' })
+                .eq('id', targetEquipId);
+        } else {
+            await supabase
+                .from('equipments')
+                .update({ status: 'Locado' })
+                .eq('id', targetEquipId);
+        }
     }
 
     return res.json(data);

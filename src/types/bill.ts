@@ -33,10 +33,18 @@ export interface CreateBillPayload {
   barcode?: string;
   gross_value: number;
   due_date: string;
+  status?: BillStatus;
+  is_reconciled?: boolean;
   already_settled?: boolean;
   settled_date?: string;
   bank_transaction_date?: string;
   bank_raw_snapshot?: Record<string, unknown>;
+  created_by?: string;
+}
+
+export interface UpdateBillPayload {
+  status?: BillStatus;
+  is_reconciled?: boolean;
 }
 
 // Item normalizado do extrato bancário (GET /api/bills): mescla `bills`
@@ -63,6 +71,10 @@ export interface BillStatementItem {
   invoice_url: string | null;
   bank_slip_url: string | null;
   is_reconciled: boolean;
+  created_by_name?: string | null;
+  created_by_photo?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
   raw: Record<string, unknown>;
 }
 

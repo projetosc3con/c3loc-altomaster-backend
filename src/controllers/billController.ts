@@ -38,7 +38,7 @@ export const listBills = async (req: AuthRequest, res: Response) => {
 
     let billsQuery = supabase
       .from('bills')
-      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url)')
+      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
       .order('created_at', { ascending: false });
 
     if (client_id) billsQuery = billsQuery.eq('client_id', client_id as string);
@@ -47,7 +47,7 @@ export const listBills = async (req: AuthRequest, res: Response) => {
     if (type) billsQuery = billsQuery.eq('type', type as string);
     if (from) billsQuery = billsQuery.gte('due_date', from as string);
     if (to) billsQuery = billsQuery.lte('due_date', to as string);
-    if (unreconciled === 'true') billsQuery = billsQuery.is('bank_transaction_date', null);
+    if (unreconciled === 'true') billsQuery = billsQuery.is('bank_transaction_date', null).is('reconciled_at', null);
 
     const { data: bills, error: billsError } = await billsQuery;
     if (billsError) throw billsError;
@@ -128,7 +128,7 @@ export const createBill = async (req: AuthRequest, res: Response) => {
     const supabase = getSupabaseUserClient(req.token!);
     const {
       type, counterparty_name, description, barcode,
-      gross_value, due_date, already_settled, settled_date,
+      gross_value, due_date, status, is_reconciled, already_settled, settled_date,
       bank_transaction_date, bank_raw_snapshot,
     } = req.body as CreateBillPayload;
 
@@ -141,8 +141,18 @@ export const createBill = async (req: AuthRequest, res: Response) => {
     if (!due_date) {
       return res.status(400).json({ error: 'due_date é obrigatório' });
     }
-    if (already_settled && !settled_date) {
-      return res.status(400).json({ error: 'settled_date é obrigatório quando already_settled=true' });
+
+    const resolvedStatus = status || (already_settled ? 'Recebido' : 'Pendente');
+
+    let reconciledAt: string | null = null;
+    if (is_reconciled !== undefined) {
+      if (is_reconciled) {
+        reconciledAt = settled_date ? new Date(settled_date as string).toISOString() : new Date().toISOString();
+      } else {
+        reconciledAt = null;
+      }
+    } else if (already_settled) {
+      reconciledAt = settled_date ? new Date(settled_date as string).toISOString() : new Date().toISOString();
     }
 
     // Lançamento manual não vincula a um cliente cadastrado — apenas um
@@ -160,23 +170,114 @@ export const createBill = async (req: AuthRequest, res: Response) => {
         fee_amount: 0,
         net_value: gross_value,
         due_date,
-        status: already_settled ? 'Recebido' : 'Pendente',
-        reconciled_at: already_settled ? new Date(settled_date as string).toISOString() : null,
+        status: resolvedStatus,
+        reconciled_at: reconciledAt,
         bank_transaction_date: bank_transaction_date || null,
         bank_raw_snapshot: bank_raw_snapshot || null,
+        created_by: req.user?.id || req.body.created_by || null,
         // Coluna `barcode` só existe depois da migração
         // `ALTER TABLE bills ADD COLUMN barcode text;` — incluída apenas
         // quando informada pra não quebrar lançamentos sem código de barras
         // caso a migração ainda não tenha rodado.
         ...(barcode ? { barcode } : {}),
       })
-      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj)')
+      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
       .single();
     if (error) throw error;
 
-    return res.status(201).json(data);
+    return res.status(201).json(normalizeBill(data));
   } catch (error: any) {
     console.error('[createBill] Erro:', error.message);
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+export const updateBill = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+    const { status, is_reconciled } = req.body;
+
+    // Buscar bill atual para validar existência e origem
+    const { data: currentBill, error: fetchError } = await supabase
+      .from('bills')
+      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !currentBill) {
+      return res.status(404).json({ error: 'Lançamento não encontrado' });
+    }
+
+    if (currentBill.origin !== 'MANUAL') {
+      return res.status(400).json({ error: 'Apenas lançamentos de origem MANUAL podem ser editados diretamente.' });
+    }
+
+    const updatePayload: Record<string, any> = {
+      updated_at: new Date().toISOString()
+    };
+
+    if (status !== undefined) {
+      updatePayload.status = status;
+    }
+
+    if (is_reconciled !== undefined) {
+      if (is_reconciled) {
+        // Forçar conciliação manual gravando reconciled_at com o timestamp atual
+        updatePayload.reconciled_at = new Date().toISOString();
+      } else {
+        // Desmarcar conciliação
+        updatePayload.reconciled_at = null;
+        updatePayload.bank_transaction_date = null;
+      }
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('bills')
+      .update(updatePayload)
+      .eq('id', id)
+      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
+      .single();
+
+    if (updateError) throw updateError;
+
+    return res.json(normalizeBill(updated));
+  } catch (error: any) {
+    console.error('[updateBill] Erro:', error.message);
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+export const deleteBill = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+
+    // Buscar bill atual para validar existência e origem
+    const { data: currentBill, error: fetchError } = await supabase
+      .from('bills')
+      .select('id, origin')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !currentBill) {
+      return res.status(404).json({ error: 'Lançamento não encontrado' });
+    }
+
+    if (currentBill.origin !== 'MANUAL') {
+      return res.status(400).json({ error: 'Apenas lançamentos de origem MANUAL podem ser excluídos diretamente.' });
+    }
+
+    const { error: deleteError } = await supabase
+      .from('bills')
+      .delete()
+      .eq('id', id);
+
+    if (deleteError) throw deleteError;
+
+    return res.json({ success: true, message: 'Lançamento excluído com sucesso.' });
+  } catch (error: any) {
+    console.error('[deleteBill] Erro:', error.message);
     return res.status(500).json({ error: error.message });
   }
 };
