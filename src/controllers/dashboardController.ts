@@ -29,45 +29,51 @@ const getAdminDashboard = async (req: AuthRequest, res: Response, supabase: any)
     const currentYear = now.getFullYear();
     const currentMonth = now.getMonth(); // 0-indexed
 
-    // ── 1. Monthly billing (current month) based on bank_reconciliation_date ──
-    const startOfMonth = `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-01`;
+    // ── 1. Window of last 6 months for bills ──
+    const d6 = new Date(currentYear, currentMonth - 5, 1);
+    const sixMonthsStart = `${d6.getFullYear()}-${String(d6.getMonth() + 1).padStart(2, '0')}-01`;
     const endOfMonth = new Date(currentYear, currentMonth + 1, 0); // last day
     const endOfMonthStr = `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-${String(endOfMonth.getDate()).padStart(2, '0')}`;
 
-    const { data: currentMonthData } = await supabase
-      .from('rental_invoices')
-      .select('total_value')
-      .eq('reconciliation_status', 'Recebido')
-      .gte('bank_reconciliation_date', startOfMonth)
-      .lte('bank_reconciliation_date', endOfMonthStr);
+    const startOfMonth = `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-01`;
 
-    const currentMonthTotal = (currentMonthData || []).reduce((acc: number, r: any) => acc + Number(r.total_value || 0), 0);
-
-    // Previous month
     const prevMonth = currentMonth === 0 ? 11 : currentMonth - 1;
     const prevYear = currentMonth === 0 ? currentYear - 1 : currentYear;
     const startOfPrevMonth = `${prevYear}-${String(prevMonth + 1).padStart(2, '0')}-01`;
     const endOfPrevMonth = new Date(prevYear, prevMonth + 1, 0);
     const endOfPrevMonthStr = `${prevYear}-${String(prevMonth + 1).padStart(2, '0')}-${String(endOfPrevMonth.getDate()).padStart(2, '0')}`;
 
-    const { data: prevMonthData } = await supabase
-      .from('rental_invoices')
-      .select('total_value')
-      .eq('reconciliation_status', 'Recebido')
-      .gte('bank_reconciliation_date', startOfPrevMonth)
-      .lte('bank_reconciliation_date', endOfPrevMonthStr);
+    const { data: billsData } = await supabase
+      .from('bills')
+      .select('gross_value, net_value, type, due_date')
+      .gte('due_date', sixMonthsStart)
+      .lte('due_date', endOfMonthStr);
 
-    const prevMonthTotal = (prevMonthData || []).reduce((acc: number, r: any) => acc + Number(r.total_value || 0), 0);
+    const calcBalance = (list: any[]) =>
+      (list || []).reduce((acc: number, b: any) => {
+        const val = Number(b.net_value ?? b.gross_value ?? 0);
+        return b.type === 'payable' ? acc - val : acc + val;
+      }, 0);
 
-    const variation = prevMonthTotal > 0
-      ? ((currentMonthTotal - prevMonthTotal) / prevMonthTotal) * 100
-      : currentMonthTotal > 0 ? 100 : 0;
+    const currentMonthBills = (billsData || []).filter(
+      (b: any) => b.due_date && b.due_date >= startOfMonth && b.due_date <= endOfMonthStr
+    );
+    const currentMonthTotal = calcBalance(currentMonthBills);
 
-    // ── 2. Pending reconciliation count ──
+    const prevMonthBills = (billsData || []).filter(
+      (b: any) => b.due_date && b.due_date >= startOfPrevMonth && b.due_date <= endOfPrevMonthStr
+    );
+    const prevMonthTotal = calcBalance(prevMonthBills);
+
+    const variation = prevMonthTotal !== 0
+      ? ((currentMonthTotal - prevMonthTotal) / Math.abs(prevMonthTotal)) * 100
+      : currentMonthTotal !== 0 ? 100 : 0;
+
+    // ── 2. Pending reconciliation count (bills) ──
     const { count: pendingReconciliationCount } = await supabase
-      .from('rental_invoices')
+      .from('bills')
       .select('*', { count: 'exact', head: true })
-      .in('reconciliation_status', ['No prazo', 'Atrasado']);
+      .in('status', ['No prazo', 'Atrasado', 'Pendente']);
 
     // ── 3. Equipment with status "Locado" ──
     const { count: rentedEquipmentCount } = await supabase
@@ -80,28 +86,24 @@ const getAdminDashboard = async (req: AuthRequest, res: Response, supabase: any)
       .from('service_orders')
       .select('*', { count: 'exact', head: true });
 
-    // ── 5. Revenue last 6 months (for chart) ──
+    // ── 5. Balance last 6 months (for chart) ──
     const revenueByMonth: { month: string; label: string; total: number }[] = [];
+    const monthNames = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
+
     for (let i = 5; i >= 0; i--) {
       const d = new Date(currentYear, currentMonth - i, 1);
       const mYear = d.getFullYear();
       const mMonth = d.getMonth();
-      const mStart = `${mYear}-${String(mMonth + 1).padStart(2, '0')}-01`;
-      const mEndDate = new Date(mYear, mMonth + 1, 0);
-      const mEnd = `${mYear}-${String(mMonth + 1).padStart(2, '0')}-${String(mEndDate.getDate()).padStart(2, '0')}`;
+      const monthPrefix = `${mYear}-${String(mMonth + 1).padStart(2, '0')}`;
 
-      const { data: mData } = await supabase
-        .from('rental_invoices')
-        .select('total_value')
-        .eq('reconciliation_status', 'Recebido')
-        .gte('bank_reconciliation_date', mStart)
-        .lte('bank_reconciliation_date', mEnd);
+      const mBills = (billsData || []).filter(
+        (b: any) => b.due_date && b.due_date.startsWith(monthPrefix)
+      );
 
-      const monthNames = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
       revenueByMonth.push({
-        month: `${mYear}-${String(mMonth + 1).padStart(2, '0')}`,
+        month: monthPrefix,
         label: monthNames[mMonth],
-        total: (mData || []).reduce((acc: number, r: any) => acc + Number(r.total_value || 0), 0),
+        total: calcBalance(mBills),
       });
     }
 

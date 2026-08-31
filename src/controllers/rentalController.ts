@@ -20,80 +20,70 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
     const valueMin = parseFloat(req.query.value_min as string) || 0;
     const valueMax = parseFloat(req.query.value_max as string) || 0;
 
-    let query = supabase
+    const applyFilters = (q: any) => {
+      if (search) {
+        q = q.or(
+          `client_name.ilike.%${search}%,equipment_name.ilike.%${search}%,asset_number.ilike.%${search}%,invoice_number.ilike.%${search}%`
+        );
+      }
+      if (billingStatus) {
+        q = q.eq('billing_status', billingStatus);
+      }
+      if (reconciliationStatus) {
+        q = q.eq('reconciliation_status', reconciliationStatus);
+      }
+      if (dateFrom) {
+        q = q.gte('billing_period_start', dateFrom);
+      }
+      if (dateTo) {
+        q = q.lte('billing_period_start', dateTo);
+      }
+      if (valueMin > 0) {
+        q = q.gte('total_value', valueMin);
+      }
+      if (valueMax > 0) {
+        q = q.lte('total_value', valueMax);
+      }
+      return q;
+    };
+
+    let dataQuery = supabase
       .from('rental_invoices')
       .select('*', { count: 'exact' });
+    dataQuery = applyFilters(dataQuery);
 
-    // Full-text search across multiple columns
-    if (search) {
-      query = query.or(
-        `client_name.ilike.%${search}%,equipment_name.ilike.%${search}%,asset_number.ilike.%${search}%,invoice_number.ilike.%${search}%`
-      );
-    }
-
-    // Status filters
-    if (billingStatus) {
-      query = query.eq('billing_status', billingStatus);
-    }
-    if (reconciliationStatus) {
-      query = query.eq('reconciliation_status', reconciliationStatus);
-    }
-
-    // Date range filter (on billing_period_start)
-    if (dateFrom) {
-      query = query.gte('billing_period_start', dateFrom);
-    }
-    if (dateTo) {
-      query = query.lte('billing_period_start', dateTo);
-    }
-
-    // Value range filter
-    if (valueMin > 0) {
-      query = query.gte('total_value', valueMin);
-    }
-    if (valueMax > 0) {
-      query = query.lte('total_value', valueMax);
-    }
-
-    const { data, error, count } = await query
-      .order('created_at', { ascending: false })
-      .range(from, to);
-
-    if (error) throw error;
-
-    // Fetch extra stats for the cards
-    // 1. Pending Reconciliation Count (No prazo or Atrasado)
-    const { count: pendingCount } = await supabase
+    let statsQuery = supabase
       .from('rental_invoices')
-      .select('*', { count: 'exact', head: true })
-      .or('reconciliation_status.eq.No prazo,reconciliation_status.eq.Atrasado');
+      .select('reconciliation_status, total_value');
+    statsQuery = applyFilters(statsQuery);
 
-    // 2. Monthly Received Total
-    const now = new Date();
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59).toISOString();
+    const [dataResult, statsResult] = await Promise.all([
+      dataQuery.order('created_at', { ascending: false }).range(from, to),
+      statsQuery
+    ]);
 
-    const { data: receivedData } = await supabase
-      .from('rental_invoices')
-      .select('total_value')
-      .eq('reconciliation_status', 'Recebido')
-      .gte('bank_reconciliation_date', startOfMonth)
-      .lte('bank_reconciliation_date', endOfMonth);
+    if (dataResult.error) throw dataResult.error;
+    if (statsResult.error) throw statsResult.error;
 
-    const monthlyReceivedTotal = (receivedData || []).reduce((acc, curr) => acc + Number(curr.total_value || 0), 0);
+    const statsData = statsResult.data || [];
+    const pendingCount = statsData.filter(
+      item => item.reconciliation_status === 'No prazo' || item.reconciliation_status === 'Atrasado' || item.reconciliation_status === 'Pendente'
+    ).length;
+    const totalValue = statsData.reduce((acc, curr) => acc + Number(curr.total_value || 0), 0);
 
-    const total = count ?? 0;
+    const total = dataResult.count ?? 0;
     const totalPages = Math.ceil(total / limit);
 
     return res.json({
-      data,
+      data: dataResult.data,
       total,
       page,
       limit,
       totalPages,
       stats: {
-        pendingReconciliationCount: pendingCount || 0,
-        monthlyReceivedTotal
+        pendingReconciliationCount: pendingCount,
+        totalValue,
+        monthlyReceivedTotal: totalValue
       }
     });
   } catch (error: any) {
