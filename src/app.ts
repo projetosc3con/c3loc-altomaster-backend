@@ -21,6 +21,7 @@ import paymentRoutes from './routes/paymentRoutes';
 import serasaRoutes from './routes/serasaRoutes';
 import fiscalRoutes from './routes/fiscalRoutes';
 import billRoutes from './routes/billRoutes';
+import powerBiRoutes from './routes/powerBiRoutes';
 
 dotenv.config();
 
@@ -45,6 +46,9 @@ app.post('/api/auth/complete-signup', completeSignup);
 
 // Sem autenticação — chamada server-to-server do Asaas, sem JWT de usuário.
 app.use('/api/webhooks', asaasWebhookRoutes);
+
+// Rota com autenticação via API Key estática para ingestão do Power BI
+app.use('/api/powerbi', powerBiRoutes);
 
 // Protected routes
 app.use('/api/rentals', authenticate, rentalRoutes);
