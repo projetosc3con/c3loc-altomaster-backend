@@ -4,6 +4,7 @@ import * as rentalController from '../controllers/rentalController';
 const router = Router();
 
 router.get('/', rentalController.getAllInvoices);
+router.get('/:id/contract-deal', rentalController.getOrCreateRentalContractDeal);
 router.get('/:id', rentalController.getInvoiceById);
 router.post('/', rentalController.createInvoice);
 router.put('/:id', rentalController.updateInvoice);

@@ -329,3 +329,196 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
+export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+
+    // 1. Fetch rental invoice
+    const { data: rental, error: rentalError } = await supabase
+      .from('rental_invoices')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (rentalError || !rental) {
+      return res.status(404).json({ error: 'Fatura de locação não encontrada' });
+    }
+
+    // 2. If deal_id already exists in rental or crm_deals links to rental_invoice_id, fetch the deal
+    if (rental.deal_id) {
+      const { data: existingDeal } = await supabase
+        .from('crm_deals')
+        .select('*, clients(*)')
+        .eq('id', rental.deal_id)
+        .maybeSingle();
+
+      if (existingDeal) {
+        return res.json({ deal: existingDeal });
+      }
+    }
+
+    const { data: dealByInvoice } = await supabase
+      .from('crm_deals')
+      .select('*, clients(*)')
+      .eq('rental_invoice_id', rental.id)
+      .maybeSingle();
+
+    if (dealByInvoice) {
+      if (!rental.deal_id) {
+        await supabase
+          .from('rental_invoices')
+          .update({ deal_id: dealByInvoice.id })
+          .eq('id', rental.id);
+      }
+      return res.json({ deal: dealByInvoice });
+    }
+
+    // 3. Find the "Fechado Ganho" stage in the CRM pipelines
+    const { data: wonStage } = await supabase
+      .from('crm_pipeline_stages')
+      .select('id, pipeline_id')
+      .eq('is_won', true)
+      .order('position', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    let stageId = wonStage?.id;
+    let pipelineId = wonStage?.pipeline_id;
+
+    if (!stageId) {
+      const { data: stageByName } = await supabase
+        .from('crm_pipeline_stages')
+        .select('id, pipeline_id')
+        .ilike('name', '%Ganho%')
+        .limit(1)
+        .maybeSingle();
+      stageId = stageByName?.id;
+      pipelineId = stageByName?.pipeline_id;
+    }
+
+    // 4. Build title: equipment_name + asset_number
+    const titleParts = [rental.equipment_name, rental.asset_number].filter(Boolean);
+    const title = titleParts.length > 0 ? titleParts.join(' - ') : `Locação Nº ${rental.invoice_number || rental.id.substring(0, 8)}`;
+
+    const expectedCloseDate = rental.billing_period_start
+      ? rental.billing_period_start.split('T')[0]
+      : (rental.created_at ? rental.created_at.split('T')[0] : new Date().toISOString().split('T')[0]);
+
+    const dealPayload = {
+      pipeline_id: pipelineId || null,
+      stage_id: stageId || null,
+      client_id: rental.client_id || null,
+      rental_invoice_id: rental.id,
+      title: title,
+      value: Number(rental.total_value) || 0,
+      expected_close_date: expectedCloseDate,
+      closed_at: new Date().toISOString(),
+      owner_id: req.user?.id || rental.created_by || null,
+      description: `Locação Nº ${rental.invoice_number || rental.id.substring(0, 8)}`,
+    };
+
+    const { data: newDeal, error: dealError } = await supabase
+      .from('crm_deals')
+      .insert(dealPayload)
+      .select('*, clients(*)')
+      .single();
+
+    if (dealError) throw dealError;
+
+    // 5. Update rental with deal_id
+    await supabase
+      .from('rental_invoices')
+      .update({ deal_id: newDeal.id })
+      .eq('id', rental.id);
+
+    // 6. Pre-populate contract form for this deal if not already created
+    const { data: existingForm } = await supabase
+      .from('crm_deal_contract_forms')
+      .select('id')
+      .eq('deal_id', newDeal.id)
+      .maybeSingle();
+
+    if (!existingForm) {
+      let clientAddressFull = '';
+      let clientStateReg = '';
+      let clientContactName = '';
+      let clientPhone = '';
+      if (rental.client_id) {
+        const { data: clientData } = await supabase
+          .from('clients')
+          .select('*')
+          .eq('id', rental.client_id)
+          .maybeSingle();
+
+        if (clientData) {
+          clientContactName = clientData.contact_name || '';
+          clientPhone = clientData.phone || '';
+          clientStateReg = clientData.state_subscription || '';
+          clientAddressFull = [
+            clientData.address_street,
+            clientData.address_number,
+            clientData.address_complement,
+            clientData.address_city && clientData.address_state ? `${clientData.address_city}/${clientData.address_state}` : clientData.address_city,
+            clientData.address_zip ? `CEP: ${clientData.address_zip}` : ''
+          ].filter(Boolean).join(', ');
+        }
+      }
+
+      let durationDays = 30;
+      if (rental.billing_period_start && rental.billing_period_end) {
+        const start = new Date(rental.billing_period_start).getTime();
+        const end = new Date(rental.billing_period_end).getTime();
+        const diff = Math.round((end - start) / (1000 * 60 * 60 * 24));
+        if (diff > 0) durationDays = diff;
+      }
+
+      const formPayload = {
+        deal_id: newDeal.id,
+        contract_date: new Date().toISOString().split('T')[0],
+        locatario_company_name: rental.client_name || '',
+        locatario_cnpj: rental.cnpj || '',
+        locatario_state_registration: clientStateReg,
+        locatario_address_full: clientAddressFull,
+        equipment_description: rental.equipment_name ? `${rental.equipment_name} (${rental.asset_number || ''})`.trim() : '',
+        equipment_model: rental.equipment_type || '',
+        contract_duration_days: durationDays,
+        period_start: rental.billing_period_start ? rental.billing_period_start.split('T')[0] : null,
+        period_end: rental.billing_period_end ? rental.billing_period_end.split('T')[0] : null,
+        cost_rental: Number(rental.cost_rental) || 0,
+        cost_insurance: Number(rental.cost_insurance) || 0,
+        cost_freight: Number(rental.cost_freight) || 0,
+        cost_rcd: Number(rental.cost_rcd) || 0,
+        cost_third_party: Number(rental.cost_third_party) || 0,
+        cost_training: Number(rental.cost_training) || 0,
+        cost_total: Number(rental.total_value) || 0,
+        billing_interval_days: 28,
+        work_site: rental.work_site || '',
+        site_contact_name: clientContactName,
+        site_contact_phone: clientPhone,
+        notes: rental.notes || '',
+        form_status: 'Rascunho',
+        created_by: req.user?.id
+      };
+
+      const { data: createdForm } = await supabase
+        .from('crm_deal_contract_forms')
+        .insert(formPayload)
+        .select()
+        .single();
+
+      if (createdForm) {
+        await supabase
+          .from('crm_deals')
+          .update({ contract_form_id: createdForm.id })
+          .eq('id', newDeal.id);
+      }
+    }
+
+    return res.json({ deal: newDeal });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+};
+

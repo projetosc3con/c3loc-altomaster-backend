@@ -865,6 +865,8 @@ export const getContractForm = async (req: AuthRequest, res: Response) => {
       .from('crm_deal_contract_forms')
       .select('*')
       .eq('deal_id', dealId)
+      .order('created_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
 
     if (error) throw error;
@@ -873,8 +875,51 @@ export const getContractForm = async (req: AuthRequest, res: Response) => {
       return res.json(form);
     }
 
+    // Se não tem form na tabela, tenta buscar do último contrato gerado (snapshot)
+    const { data: lastContract } = await supabase
+      .from('crm_deal_contracts')
+      .select('*')
+      .eq('deal_id', dealId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (lastContract?.snapshot) {
+      const s = lastContract.snapshot;
+      return res.json({
+        deal_id: dealId,
+        contract_date: s.contract_date || new Date().toISOString().split('T')[0],
+        locatario_company_name: s.locatario?.company_name || '',
+        locatario_cnpj: s.locatario?.cnpj || '',
+        locatario_state_registration: s.locatario?.state_registration || '',
+        locatario_address_full: s.locatario?.address_full || '',
+        equipment_description: s.equipment?.description || '',
+        equipment_model: s.equipment?.model || '',
+        contract_duration_days: s.contract_duration_days || 0,
+        period_start: s.period_start || '',
+        period_end: s.period_end || '',
+        cost_rental: s.costs?.rental || 0,
+        cost_insurance: s.costs?.insurance || 0,
+        cost_freight: s.costs?.freight || 0,
+        cost_rcd: s.costs?.rcd || 0,
+        cost_third_party: s.costs?.third_party || 0,
+        cost_training: s.costs?.training || 0,
+        cost_total: s.costs?.total || 0,
+        billing_interval_days: s.billing_interval_days || 28,
+        work_site: s.work_site || '',
+        site_contact_name: s.site_contact_name || '',
+        site_contact_phone: s.site_contact_phone || '',
+        notes: s.notes || '',
+        form_status: 'Pronto para Gerar'
+      });
+    }
+
     // Se não tem form, preenche com os dados do deal e cliente
-    const { data: deal } = await supabase.from('crm_deals').select('*, leads:crm_leads(company_name, cnpj), clients(company_name, cnpj, state_subscription, address_street, address_number, address_city, address_state)').eq('id', dealId).single();
+    const { data: deal } = await supabase
+      .from('crm_deals')
+      .select('*, leads:crm_leads(company_name, cnpj), clients(company_name, cnpj, state_subscription, address_street, address_number, address_city, address_state, contact_name, phone)')
+      .eq('id', dealId)
+      .single();
     if (!deal) return res.status(404).json({ error: 'Deal não encontrado' });
 
     const entity = deal.clients || deal.leads || {};
@@ -884,7 +929,7 @@ export const getContractForm = async (req: AuthRequest, res: Response) => {
       contract_date: new Date().toISOString().split('T')[0],
       locatario_company_name: entity.company_name || '',
       locatario_cnpj: entity.cnpj || '',
-      locatario_state_registration: entity.state_registration || '',
+      locatario_state_registration: entity.state_registration || entity.state_subscription || '',
       locatario_address_full: entity.address_full || (entity.address_street ? `${entity.address_street}, ${entity.address_number} - ${entity.address_city}/${entity.address_state}` : ''),
       equipment_description: '',
       equipment_model: '',
@@ -900,14 +945,61 @@ export const getContractForm = async (req: AuthRequest, res: Response) => {
       cost_total: Number(deal.value) || 0,
       billing_interval_days: 28,
       work_site: '',
-      site_contact_name: '',
-      site_contact_phone: '',
+      site_contact_name: entity.contact_name || '',
+      site_contact_phone: entity.phone || '',
       notes: '',
       form_status: 'Rascunho'
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
+};
+
+const buildContractSnapshot = async (form: any, contractNumber: string) => {
+  const { data: settings } = await supabaseAdmin.from('erp_company_settings').select('*').eq('active', true).single();
+  return {
+    contract_number: contractNumber,
+    contract_date: form.contract_date,
+    locador: settings ? {
+      company_name: settings.company_name,
+      cnpj: settings.cnpj,
+      state_registration: settings.state_registration,
+      address_full: settings.address_full,
+      logo_url: settings.logo_url,
+      bank_name: settings.bank_name,
+      bank_code: settings.bank_code,
+      bank_agency: settings.bank_agency,
+      bank_account: settings.bank_account,
+      bank_pix_key: settings.bank_pix_key
+    } : {},
+    locatario: {
+      company_name: form.locatario_company_name,
+      cnpj: form.locatario_cnpj,
+      state_registration: form.locatario_state_registration,
+      address_full: form.locatario_address_full
+    },
+    equipment: {
+      description: form.equipment_description,
+      model: form.equipment_model
+    },
+    contract_duration_days: form.contract_duration_days,
+    period_start: form.period_start,
+    period_end: form.period_end,
+    costs: {
+      rental: form.cost_rental,
+      insurance: form.cost_insurance,
+      freight: form.cost_freight,
+      rcd: form.cost_rcd,
+      third_party: form.cost_third_party,
+      training: form.cost_training,
+      total: form.cost_total
+    },
+    billing_interval_days: form.billing_interval_days,
+    work_site: form.work_site,
+    site_contact_name: form.site_contact_name,
+    site_contact_phone: form.site_contact_phone,
+    clauses: settings?.contract_clauses || {}
+  };
 };
 
 export const saveContractForm = async (req: AuthRequest, res: Response) => {
@@ -930,21 +1022,51 @@ export const saveContractForm = async (req: AuthRequest, res: Response) => {
     if (body.period_start === '') body.period_start = null;
     if (body.period_end === '') body.period_end = null;
 
-    const { data: existing } = await supabase.from('crm_deal_contract_forms').select('id').eq('deal_id', dealId).maybeSingle();
+    // Check if there is an existing active contract
+    const { data: existingContract } = await supabase
+      .from('crm_deal_contracts')
+      .select('*')
+      .eq('deal_id', dealId)
+      .neq('status', 'Cancelado')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    if (existing) {
+    // If a contract already exists and user is saving as ready, keep form_status as 'PDF Gerado'
+    if (existingContract && body.form_status === 'Pronto para Gerar') {
+      body.form_status = 'PDF Gerado';
+    }
+
+    const { data: existingForm } = await supabase.from('crm_deal_contract_forms').select('id').eq('deal_id', dealId).maybeSingle();
+
+    let savedForm: any;
+    if (existingForm) {
       body.updated_at = new Date().toISOString();
-      const { data, error } = await supabase.from('crm_deal_contract_forms').update(body).eq('id', existing.id).select().single();
+      const { data, error } = await supabase.from('crm_deal_contract_forms').update(body).eq('id', existingForm.id).select().single();
       if (error) throw error;
-      res.json(data);
+      savedForm = data;
     } else {
       body.created_by = req.user?.id;
       const { data, error } = await supabase.from('crm_deal_contract_forms').insert(body).select().single();
       if (error) throw error;
+      savedForm = data;
       
       await supabase.from('crm_deals').update({ contract_form_id: data.id }).eq('id', dealId);
-      res.json(data);
     }
+
+    // If an existing contract already exists, update its snapshot in-place (preserving the contract number!)
+    if (existingContract) {
+      const updatedSnapshot = await buildContractSnapshot(savedForm, existingContract.contract_number);
+      await supabase
+        .from('crm_deal_contracts')
+        .update({
+          snapshot: updatedSnapshot,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', existingContract.id);
+    }
+
+    res.json(savedForm);
   } catch (error: any) {
     console.error('Error saving contract form:', error);
     res.status(500).json({ error: error.message });
@@ -960,73 +1082,71 @@ export const generateContractRecord = async (req: AuthRequest, res: Response) =>
     if (formError || !form) throw new Error('Formulário não encontrado');
     if (form.form_status === 'Rascunho') throw new Error('Preencha os campos obrigatórios');
 
-    const { data: settings } = await supabaseAdmin.from('erp_company_settings').select('*').eq('active', true).single();
+    // Check if an existing active contract already exists for this deal
+    const { data: existingContract } = await supabase
+      .from('crm_deal_contracts')
+      .select('*')
+      .eq('deal_id', dealId)
+      .neq('status', 'Cancelado')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    const snapshot = {
-      contract_date: form.contract_date,
-      locador: settings ? {
-        company_name: settings.company_name,
-        cnpj: settings.cnpj,
-        state_registration: settings.state_registration,
-        address_full: settings.address_full,
-        logo_url: settings.logo_url,
-        bank_name: settings.bank_name,
-        bank_code: settings.bank_code,
-        bank_agency: settings.bank_agency,
-        bank_account: settings.bank_account,
-        bank_pix_key: settings.bank_pix_key
-      } : {},
-      locatario: {
-        company_name: form.locatario_company_name,
-        cnpj: form.locatario_cnpj,
-        state_registration: form.locatario_state_registration,
-        address_full: form.locatario_address_full
-      },
-      equipment: {
-        description: form.equipment_description,
-        model: form.equipment_model
-      },
-      contract_duration_days: form.contract_duration_days,
-      period_start: form.period_start,
-      period_end: form.period_end,
-      costs: {
-        rental: form.cost_rental,
-        insurance: form.cost_insurance,
-        freight: form.cost_freight,
-        rcd: form.cost_rcd,
-        third_party: form.cost_third_party,
-        training: form.cost_training,
-        total: form.cost_total
-      },
-      billing_interval_days: form.billing_interval_days,
-      work_site: form.work_site,
-      site_contact_name: form.site_contact_name,
-      site_contact_phone: form.site_contact_phone,
-      clauses: settings?.contract_clauses || {}
-    };
+    let contractNumber: string;
+    let record: any;
+    let snapshot: any;
 
-    const { data: contractNumber } = await supabase.rpc('get_next_contract_number');
+    if (existingContract) {
+      // REUSE EXISTING CONTRACT NUMBER AND UPDATE THE RECORD (EDIT IN-PLACE)
+      contractNumber = existingContract.contract_number;
+      snapshot = await buildContractSnapshot(form, contractNumber);
 
-    const { count } = await supabase.from('crm_deal_contracts').select('*', { count: 'exact', head: true }).eq('deal_id', dealId);
-    const version = (count || 0) + 1;
+      const { data: updatedRecord, error: updateError } = await supabase
+        .from('crm_deal_contracts')
+        .update({
+          snapshot,
+          status: existingContract.status === 'Assinado' ? 'Assinado' : 'Gerado',
+          generated_by: req.user?.id,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', existingContract.id)
+        .select()
+        .single();
 
-    await supabase.from('crm_deal_contracts').update({ status: 'Cancelado' }).eq('deal_id', dealId).neq('status', 'Assinado');
+      if (updateError) throw updateError;
+      record = updatedRecord;
+    } else {
+      // NO EXISTING CONTRACT (FIRST GENERATION OR PREVIOUS CONTRACT DELETED) -> GENERATE NEW NUMBER
+      const { data: nextNum } = await supabase.rpc('get_next_contract_number');
+      contractNumber = nextNum;
+      snapshot = await buildContractSnapshot(form, contractNumber);
 
-    const { data: record, error: recordError } = await supabase.from('crm_deal_contracts').insert({
-      deal_id: dealId,
-      contract_form_id: form.id,
-      contract_number: contractNumber,
-      version,
-      status: 'Gerado',
-      generated_by: req.user?.id,
-      snapshot: { ...snapshot, contract_number: contractNumber }
-    }).select().single();
+      const { data: newRecord, error: recordError } = await supabase
+        .from('crm_deal_contracts')
+        .insert({
+          deal_id: dealId,
+          contract_form_id: form.id,
+          contract_number: contractNumber,
+          version: 1,
+          status: 'Gerado',
+          generated_by: req.user?.id,
+          snapshot
+        })
+        .select()
+        .single();
 
-    if (recordError) throw recordError;
+      if (recordError) throw recordError;
+      record = newRecord;
+
+      await supabase
+        .from('crm_deals')
+        .update({ active_contract_id: record.id })
+        .eq('id', dealId);
+    }
 
     await supabase.from('crm_deal_contract_forms').update({ form_status: 'PDF Gerado', updated_by: req.user?.id }).eq('id', form.id);
 
-    res.json({ record, snapshot: { ...snapshot, contract_number: contractNumber } });
+    res.json({ record, snapshot });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
