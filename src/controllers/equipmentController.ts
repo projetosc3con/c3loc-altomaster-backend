@@ -161,6 +161,30 @@ export const getEquipmentRentals = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   try {
     const supabase = getSupabaseUserClient(req.token!);
+    
+    // Buscar em rental_invoice_equipments
+    const { data: itemData, error: itemError } = await supabase
+      .from('rental_invoice_equipments')
+      .select('*, invoice:rental_invoices(*)')
+      .eq('equipment_id', id)
+      .order('billing_period_start', { ascending: false });
+
+    if (!itemError && itemData && itemData.length > 0) {
+      const formatted = itemData.map(item => ({
+        ...(item.invoice || {}),
+        billing_period_start: item.billing_period_start,
+        billing_period_end: item.billing_period_end,
+        return_date: item.return_date,
+        cost_rental: item.cost_rental,
+        total_value: item.total_value,
+        equipment_id: item.equipment_id,
+        equipment_name: item.equipment_name,
+        asset_number: item.asset_number
+      }));
+      return res.json(formatted);
+    }
+
+    // Fallback legado para rental_invoices
     const { data, error } = await supabase
       .from('rental_invoices')
       .select('*')

@@ -980,7 +980,8 @@ const buildContractSnapshot = async (form: any, contractNumber: string) => {
     },
     equipment: {
       description: form.equipment_description,
-      model: form.equipment_model
+      model: form.equipment_model,
+      items: form.equipments || []
     },
     contract_duration_days: form.contract_duration_days,
     period_start: form.period_start,
@@ -1008,6 +1009,10 @@ export const saveContractForm = async (req: AuthRequest, res: Response) => {
     const dealId = req.params.id;
     const body = req.body;
     
+    // Extract equipments if sent by frontend
+    const equipments = body.equipments;
+    delete body.equipments;
+
     // Sanitize body
     delete body.id;
     delete body.created_at;
@@ -1052,6 +1057,10 @@ export const saveContractForm = async (req: AuthRequest, res: Response) => {
       savedForm = data;
       
       await supabase.from('crm_deals').update({ contract_form_id: data.id }).eq('id', dealId);
+    }
+
+    if (equipments) {
+      savedForm.equipments = equipments;
     }
 
     // If an existing contract already exists, update its snapshot in-place (preserving the contract number!)

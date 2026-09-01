@@ -2,6 +2,34 @@ import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient } from '../config/supabase';
 
+const updateEquipmentItemStatus = async (
+  supabase: any,
+  equipmentId: string,
+  billingPeriodEnd?: string | null,
+  returnDate?: string | null
+) => {
+  if (!equipmentId) return;
+  const todayStr = new Date().toISOString().split('T')[0];
+  const returnDateStr = returnDate ? String(returnDate).split('T')[0] : null;
+  const periodEndStr = billingPeriodEnd ? String(billingPeriodEnd).split('T')[0] : null;
+
+  if (returnDateStr) {
+    if (returnDateStr <= todayStr) {
+      await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', equipmentId);
+    } else {
+      await supabase.from('equipments').update({ status: 'Locado' }).eq('id', equipmentId);
+    }
+  } else if (periodEndStr) {
+    if (periodEndStr < todayStr) {
+      await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', equipmentId);
+    } else {
+      await supabase.from('equipments').update({ status: 'Locado' }).eq('id', equipmentId);
+    }
+  } else {
+    await supabase.from('equipments').update({ status: 'Locado' }).eq('id', equipmentId);
+  }
+};
+
 export const getAllInvoices = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
@@ -67,9 +95,9 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
 
     const statsData = statsResult.data || [];
     const pendingCount = statsData.filter(
-      item => item.reconciliation_status === 'No prazo' || item.reconciliation_status === 'Atrasado' || item.reconciliation_status === 'Pendente'
+      (item: any) => item.reconciliation_status === 'No prazo' || item.reconciliation_status === 'Atrasado' || item.reconciliation_status === 'Pendente'
     ).length;
-    const totalValue = statsData.reduce((acc, curr) => acc + Number(curr.total_value || 0), 0);
+    const totalValue = statsData.reduce((acc: number, curr: any) => acc + Number(curr.total_value || 0), 0);
 
     const total = dataResult.count ?? 0;
     const totalPages = Math.ceil(total / limit);
@@ -95,14 +123,52 @@ export const getInvoiceById = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const { data, error } = await supabase
+    const { data: invoice, error } = await supabase
       .from('rental_invoices')
       .select('*')
       .eq('id', id)
       .single();
 
     if (error) throw error;
-    return res.json(data);
+
+    // Buscar equipamentos vinculados na nova tabela rental_invoice_equipments
+    const { data: items } = await supabase
+      .from('rental_invoice_equipments')
+      .select('*')
+      .eq('rental_invoice_id', id)
+      .order('created_at', { ascending: true });
+
+    if (items && items.length > 0) {
+      invoice.equipments = items;
+    } else if (invoice.equipment_id) {
+      // Fallback para locações legadas
+      invoice.equipments = [
+        {
+          id: invoice.id,
+          rental_invoice_id: invoice.id,
+          equipment_id: invoice.equipment_id,
+          equipment_name: invoice.equipment_name,
+          equipment_type: invoice.equipment_type,
+          equipment_size: invoice.equipment_size,
+          asset_number: invoice.asset_number,
+          billing_period_start: invoice.billing_period_start,
+          billing_period_end: invoice.billing_period_end,
+          return_date: invoice.return_date,
+          cost_rental: Number(invoice.cost_rental) || 0,
+          cost_insurance: Number(invoice.cost_insurance) || 0,
+          cost_freight: Number(invoice.cost_freight) || 0,
+          cost_rcd: Number(invoice.cost_rcd) || 0,
+          cost_third_party: Number(invoice.cost_third_party) || 0,
+          cost_training: Number(invoice.cost_training) || 0,
+          total_value: Number(invoice.total_value) || 0,
+          notes: invoice.notes
+        }
+      ];
+    } else {
+      invoice.equipments = [];
+    }
+
+    return res.json(invoice);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
@@ -111,32 +177,82 @@ export const getInvoiceById = async (req: AuthRequest, res: Response) => {
 export const createInvoice = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    
-    // Business logic: Calculate total value if provided individual costs
-    const { 
-      cost_rental = 0, 
-      cost_insurance = 0, 
-      cost_freight = 0, 
-      cost_rcd = 0, 
-      cost_third_party = 0, 
-      cost_training = 0 
-    } = req.body;
+    const rawEquipments = Array.isArray(req.body.equipments) ? req.body.equipments : [];
 
-    const total_value = 
-      Number(cost_rental) + 
-      Number(cost_insurance) + 
-      Number(cost_freight) + 
-      Number(cost_rcd) + 
-      Number(cost_third_party) + 
-      Number(cost_training);
+    // Validar obrigatoriedade de pelo menos um equipamento
+    if (rawEquipments.length === 0 && !req.body.equipment_id) {
+      return res.status(400).json({ error: 'A locação deve conter obrigatoriamente um ou mais equipamentos atrelados.' });
+    }
+
+    let cost_rental = 0;
+    let cost_insurance = 0;
+    let cost_freight = 0;
+    let cost_rcd = 0;
+    let cost_third_party = 0;
+    let cost_training = 0;
+    let total_value = 0;
+    let billing_period_start = req.body.billing_period_start || '';
+    let billing_period_end = req.body.billing_period_end || '';
+    let return_date = req.body.return_date || null;
+    let equipment_id = req.body.equipment_id || null;
+    let equipment_name = req.body.equipment_name || '';
+    let equipment_type = req.body.equipment_type || '';
+    let asset_number = req.body.asset_number || '';
+
+    if (rawEquipments.length > 0) {
+      cost_rental = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_rental) || 0), 0);
+      cost_insurance = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_insurance) || 0), 0);
+      cost_freight = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_freight) || 0), 0);
+      cost_rcd = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_rcd) || 0), 0);
+      cost_third_party = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_third_party) || 0), 0);
+      cost_training = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_training) || 0), 0);
+      total_value = cost_rental + cost_insurance + cost_freight + cost_rcd + cost_third_party + cost_training;
+
+      // Calcular períodos consolidados (mínimo start, máximo end)
+      const starts = rawEquipments.map((e: any) => e.billing_period_start).filter(Boolean).sort();
+      const ends = rawEquipments.map((e: any) => e.billing_period_end).filter(Boolean).sort();
+      if (starts.length > 0) billing_period_start = starts[0];
+      if (ends.length > 0) billing_period_end = ends[ends.length - 1];
+
+      // Representação consolidada do primeiro / múltiplos equipamentos
+      equipment_id = rawEquipments[0].equipment_id;
+      equipment_name = rawEquipments.length === 1 
+        ? rawEquipments[0].equipment_name 
+        : `${rawEquipments[0].equipment_name || 'Equipamento'} (+${rawEquipments.length - 1} itens)`;
+      equipment_type = rawEquipments[0].equipment_type || '';
+      asset_number = rawEquipments.map((e: any) => e.asset_number).filter(Boolean).join(', ');
+    } else {
+      cost_rental = Number(req.body.cost_rental) || 0;
+      cost_insurance = Number(req.body.cost_insurance) || 0;
+      cost_freight = Number(req.body.cost_freight) || 0;
+      cost_rcd = Number(req.body.cost_rcd) || 0;
+      cost_third_party = Number(req.body.cost_third_party) || 0;
+      cost_training = Number(req.body.cost_training) || 0;
+      total_value = cost_rental + cost_insurance + cost_freight + cost_rcd + cost_third_party + cost_training;
+    }
+
+    const { equipments: _eq, ...restBody } = req.body;
 
     const invoiceData = {
+      ...restBody,
       billing_method: req.body.billing_method || 'MANUAL',
-      ...req.body,
-      total_value: total_value
+      equipment_id,
+      equipment_name,
+      equipment_type,
+      asset_number,
+      billing_period_start,
+      billing_period_end,
+      return_date,
+      cost_rental,
+      cost_insurance,
+      cost_freight,
+      cost_rcd,
+      cost_third_party,
+      cost_training,
+      total_value
     };
 
-    const { data, error } = await supabase
+    const { data: createdInvoice, error } = await supabase
       .from('rental_invoices')
       .insert([invoiceData])
       .select()
@@ -144,53 +260,74 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
 
     if (error) throw error;
 
-    // Side effect: Logic for equipment status
-    let warningMessage: string | null = null;
-    const todayStr = new Date().toISOString().split('T')[0];
-    const returnDateStr = invoiceData.return_date ? String(invoiceData.return_date).split('T')[0] : null;
-    const periodEndStr = invoiceData.billing_period_end ? String(invoiceData.billing_period_end).split('T')[0] : null;
+    // Inserir cada equipamento na tabela rental_invoice_equipments e atualizar status
+    if (rawEquipments.length > 0) {
+      const itemsToInsert = rawEquipments.map((item: any) => {
+        const itemRental = Number(item.cost_rental) || 0;
+        const itemInsurance = Number(item.cost_insurance) || 0;
+        const itemFreight = Number(item.cost_freight) || 0;
+        const itemRcd = Number(item.cost_rcd) || 0;
+        const itemThirdParty = Number(item.cost_third_party) || 0;
+        const itemTraining = Number(item.cost_training) || 0;
+        const itemTotal = itemRental + itemInsurance + itemFreight + itemRcd + itemThirdParty + itemTraining;
 
-    if (returnDateStr && invoiceData.equipment_id) {
-        if (returnDateStr <= todayStr) {
-            // Data de retorno preenchida e menor ou igual a hoje -> 'Disponível'
-            await supabase
-                .from('equipments')
-                .update({ status: 'Disponível' })
-                .eq('id', invoiceData.equipment_id);
-        } else {
-            // Data de retorno futura -> permanece 'Locado'
-            await supabase
-                .from('equipments')
-                .update({ status: 'Locado' })
-                .eq('id', invoiceData.equipment_id);
-        }
-    } else if (invoiceData.equipment_id) {
-        if (periodEndStr && periodEndStr < todayStr) {
-            // Sem data de retorno e período final no passado -> 'Disponível' com aviso
-            await supabase
-                .from('equipments')
-                .update({ status: 'Disponível' })
-                .eq('id', invoiceData.equipment_id);
+        return {
+          rental_invoice_id: createdInvoice.id,
+          equipment_id: item.equipment_id,
+          equipment_name: item.equipment_name || null,
+          equipment_type: item.equipment_type || null,
+          equipment_size: item.equipment_size || null,
+          asset_number: item.asset_number || null,
+          billing_period_start: item.billing_period_start || billing_period_start,
+          billing_period_end: item.billing_period_end || billing_period_end,
+          return_date: item.return_date || null,
+          cost_rental: itemRental,
+          cost_insurance: itemInsurance,
+          cost_freight: itemFreight,
+          cost_rcd: itemRcd,
+          cost_third_party: itemThirdParty,
+          cost_training: itemTraining,
+          total_value: itemTotal,
+          notes: item.notes || null
+        };
+      });
 
-            warningMessage = 'A locação foi cadastrada sem data de retorno mesmo sendo no passado, por isso o equipamento ficará disponível no estoque.';
-        } else {
-            // Sem data de retorno no presente/futuro -> 'Locado'
-            await supabase
-                .from('equipments')
-                .update({ status: 'Locado' })
-                .eq('id', invoiceData.equipment_id);
-        }
+      await supabase.from('rental_invoice_equipments').insert(itemsToInsert);
+
+      for (const eq of rawEquipments) {
+        await updateEquipmentItemStatus(supabase, eq.equipment_id, eq.billing_period_end, eq.return_date);
+      }
+    } else if (createdInvoice.equipment_id) {
+      // Inserção para caso legado de 1 item
+      await supabase.from('rental_invoice_equipments').insert([{
+        rental_invoice_id: createdInvoice.id,
+        equipment_id: createdInvoice.equipment_id,
+        equipment_name: createdInvoice.equipment_name,
+        equipment_type: createdInvoice.equipment_type,
+        equipment_size: createdInvoice.equipment_size,
+        asset_number: createdInvoice.asset_number,
+        billing_period_start: createdInvoice.billing_period_start,
+        billing_period_end: createdInvoice.billing_period_end,
+        return_date: createdInvoice.return_date,
+        cost_rental: createdInvoice.cost_rental,
+        cost_insurance: createdInvoice.cost_insurance,
+        cost_freight: createdInvoice.cost_freight,
+        cost_rcd: createdInvoice.cost_rcd,
+        cost_third_party: createdInvoice.cost_third_party,
+        cost_training: createdInvoice.cost_training,
+        total_value: createdInvoice.total_value
+      }]);
+      await updateEquipmentItemStatus(supabase, createdInvoice.equipment_id, createdInvoice.billing_period_end, createdInvoice.return_date);
     }
 
     // Disparar lançamento correspondente em `bills` (tipo receivable)
-    if (data && data.client_id && data.due_date && total_value > 0) {
-      const dueDate = String(data.due_date).split('T')[0];
+    if (createdInvoice && createdInvoice.client_id && createdInvoice.due_date && total_value > 0) {
+      const dueDate = String(createdInvoice.due_date).split('T')[0];
 
-      // Verifica se já existe um lançamento com o mesmo valor, mesma data e mesmo cliente
       const { data: existingBills, error: checkError } = await supabase
         .from('bills')
         .select('id')
-        .eq('client_id', data.client_id)
+        .eq('client_id', createdInvoice.client_id)
         .eq('due_date', dueDate)
         .eq('gross_value', total_value);
 
@@ -199,16 +336,16 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
       }
 
       if (!checkError && (!existingBills || existingBills.length === 0)) {
-        const billStatus = data.reconciliation_status || 'Pendente';
-        const { error: billError } = await supabase
+        const billStatus = createdInvoice.reconciliation_status || 'Pendente';
+        await supabase
           .from('bills')
           .insert({
             origin: 'MANUAL',
             type: 'receivable',
-            rental_invoice_id: data.id,
-            client_id: data.client_id,
-            counterparty_name: data.client_name || invoiceData.client_name || null,
-            description: data.invoice_number ? `Fatura de Locação #${data.invoice_number}` : 'Fatura de Locação',
+            rental_invoice_id: createdInvoice.id,
+            client_id: createdInvoice.client_id,
+            counterparty_name: createdInvoice.client_name || invoiceData.client_name || null,
+            description: createdInvoice.invoice_number ? `Fatura de Locação #${createdInvoice.invoice_number}` : 'Fatura de Locação',
             gross_value: total_value,
             fee_amount: 0,
             net_value: total_value,
@@ -217,17 +354,10 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
             reconciled_at: billStatus === 'Recebido' ? new Date().toISOString() : null,
             created_by: req.user?.id || null,
           });
-
-        if (billError) {
-          console.error('[rentalController] Erro ao criar lançamento em bills:', billError);
-        }
       }
     }
 
-    return res.status(201).json({
-      ...data,
-      ...(warningMessage ? { warning: warningMessage } : {})
-    });
+    return res.status(201).json(createdInvoice);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
@@ -237,35 +367,101 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    
-    // Recalculate total if costs changed
-    const { 
-      cost_rental, 
-      cost_insurance, 
-      cost_freight, 
-      cost_rcd, 
-      cost_third_party, 
-      cost_training 
-    } = req.body;
+    const rawEquipments = Array.isArray(req.body.equipments) ? req.body.equipments : null;
 
-    let updateData = { ...req.body };
-
-    if (cost_rental !== undefined || cost_insurance !== undefined || cost_freight !== undefined) {
-        // Fetch current values for missing ones
-        const { data: current } = await supabase.from('rental_invoices').select('*').eq('id', id).single();
-        if (current) {
-            const total_value = 
-              Number(cost_rental ?? current.cost_rental ?? 0) + 
-              Number(cost_insurance ?? current.cost_insurance ?? 0) + 
-              Number(cost_freight ?? current.cost_freight ?? 0) + 
-              Number(cost_rcd ?? current.cost_rcd ?? 0) + 
-              Number(cost_third_party ?? current.cost_third_party ?? 0) + 
-              Number(cost_training ?? current.cost_training ?? 0);
-            updateData.total_value = total_value;
-        }
+    if (rawEquipments !== null && rawEquipments.length === 0) {
+      return res.status(400).json({ error: 'A locação deve conter obrigatoriamente um ou mais equipamentos atrelados.' });
     }
 
-    const { data, error } = await supabase
+    let updateData = { ...req.body };
+    delete updateData.equipments;
+
+    if (rawEquipments && rawEquipments.length > 0) {
+      const cost_rental = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_rental) || 0), 0);
+      const cost_insurance = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_insurance) || 0), 0);
+      const cost_freight = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_freight) || 0), 0);
+      const cost_rcd = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_rcd) || 0), 0);
+      const cost_third_party = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_third_party) || 0), 0);
+      const cost_training = rawEquipments.reduce((acc: number, eq: any) => acc + (Number(eq.cost_training) || 0), 0);
+      const total_value = cost_rental + cost_insurance + cost_freight + cost_rcd + cost_third_party + cost_training;
+
+      const starts = rawEquipments.map((e: any) => e.billing_period_start).filter(Boolean).sort();
+      const ends = rawEquipments.map((e: any) => e.billing_period_end).filter(Boolean).sort();
+
+      updateData.cost_rental = cost_rental;
+      updateData.cost_insurance = cost_insurance;
+      updateData.cost_freight = cost_freight;
+      updateData.cost_rcd = cost_rcd;
+      updateData.cost_third_party = cost_third_party;
+      updateData.cost_training = cost_training;
+      updateData.total_value = total_value;
+      if (starts.length > 0) updateData.billing_period_start = starts[0];
+      if (ends.length > 0) updateData.billing_period_end = ends[ends.length - 1];
+
+      updateData.equipment_id = rawEquipments[0].equipment_id;
+      updateData.equipment_name = rawEquipments.length === 1 
+        ? rawEquipments[0].equipment_name 
+        : `${rawEquipments[0].equipment_name || 'Equipamento'} (+${rawEquipments.length - 1} itens)`;
+      updateData.equipment_type = rawEquipments[0].equipment_type || '';
+      updateData.asset_number = rawEquipments.map((e: any) => e.asset_number).filter(Boolean).join(', ');
+
+      // Sincronizar itens na tabela rental_invoice_equipments
+      const { data: previousItems } = await supabase
+        .from('rental_invoice_equipments')
+        .select('equipment_id')
+        .eq('rental_invoice_id', id);
+
+      const previousEquipIds = (previousItems || []).map((p: any) => p.equipment_id);
+      const newEquipIds = rawEquipments.map((e: any) => e.equipment_id);
+
+      // Equipamentos removidos voltam a ficar 'Disponível'
+      const removedEquipIds = previousEquipIds.filter((prevId: string) => !newEquipIds.includes(prevId));
+      for (const remId of removedEquipIds) {
+        await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', remId);
+      }
+
+      // Deletar anteriores e inserir novos
+      await supabase.from('rental_invoice_equipments').delete().eq('rental_invoice_id', id);
+
+      const itemsToInsert = rawEquipments.map((item: any) => {
+        const itemRental = Number(item.cost_rental) || 0;
+        const itemInsurance = Number(item.cost_insurance) || 0;
+        const itemFreight = Number(item.cost_freight) || 0;
+        const itemRcd = Number(item.cost_rcd) || 0;
+        const itemThirdParty = Number(item.cost_third_party) || 0;
+        const itemTraining = Number(item.cost_training) || 0;
+        const itemTotal = itemRental + itemInsurance + itemFreight + itemRcd + itemThirdParty + itemTraining;
+
+        return {
+          rental_invoice_id: id,
+          equipment_id: item.equipment_id,
+          equipment_name: item.equipment_name || null,
+          equipment_type: item.equipment_type || null,
+          equipment_size: item.equipment_size || null,
+          asset_number: item.asset_number || null,
+          billing_period_start: item.billing_period_start || updateData.billing_period_start,
+          billing_period_end: item.billing_period_end || updateData.billing_period_end,
+          return_date: item.return_date || null,
+          cost_rental: itemRental,
+          cost_insurance: itemInsurance,
+          cost_freight: itemFreight,
+          cost_rcd: itemRcd,
+          cost_third_party: itemThirdParty,
+          cost_training: itemTraining,
+          total_value: itemTotal,
+          notes: item.notes || null
+        };
+      });
+
+      await supabase.from('rental_invoice_equipments').insert(itemsToInsert);
+
+      // Atualizar status de cada equipamento atual
+      for (const eq of rawEquipments) {
+        await updateEquipmentItemStatus(supabase, eq.equipment_id, eq.billing_period_end, eq.return_date);
+      }
+    }
+
+    const { data: updatedInvoice, error } = await supabase
       .from('rental_invoices')
       .update(updateData)
       .eq('id', id)
@@ -274,41 +470,7 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
 
     if (error) throw error;
 
-    // Side effect logic for equipment status
-    const todayStr = new Date().toISOString().split('T')[0];
-    const returnDate = updateData.return_date !== undefined ? updateData.return_date : data.return_date;
-    const returnDateStr = returnDate ? String(returnDate).split('T')[0] : null;
-    const periodEnd = updateData.billing_period_end !== undefined ? updateData.billing_period_end : data.billing_period_end;
-    const periodEndStr = periodEnd ? String(periodEnd).split('T')[0] : null;
-    const targetEquipId = updateData.equipment_id || data.equipment_id;
-
-    if (returnDateStr && targetEquipId) {
-        if (returnDateStr <= todayStr) {
-            await supabase
-                .from('equipments')
-                .update({ status: 'Disponível' })
-                .eq('id', targetEquipId);
-        } else {
-            await supabase
-                .from('equipments')
-                .update({ status: 'Locado' })
-                .eq('id', targetEquipId);
-        }
-    } else if (targetEquipId) {
-        if (periodEndStr && periodEndStr < todayStr) {
-            await supabase
-                .from('equipments')
-                .update({ status: 'Disponível' })
-                .eq('id', targetEquipId);
-        } else {
-            await supabase
-                .from('equipments')
-                .update({ status: 'Locado' })
-                .eq('id', targetEquipId);
-        }
-    }
-
-    return res.json(data);
+    return res.json(updatedInvoice);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
@@ -318,6 +480,31 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   try {
     const supabase = getSupabaseUserClient(req.token!);
+
+    // Buscar equipamentos vinculados para liberá-los no estoque
+    const { data: items } = await supabase
+      .from('rental_invoice_equipments')
+      .select('equipment_id')
+      .eq('rental_invoice_id', id);
+
+    const { data: currentInvoice } = await supabase
+      .from('rental_invoices')
+      .select('equipment_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    const equipIdsToFree = new Set<string>();
+    if (items) {
+      items.forEach((i: any) => { if (i.equipment_id) equipIdsToFree.add(i.equipment_id); });
+    }
+    if (currentInvoice?.equipment_id) {
+      equipIdsToFree.add(currentInvoice.equipment_id);
+    }
+
+    for (const eqId of equipIdsToFree) {
+      await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', eqId);
+    }
+
     const { error } = await supabase
       .from('rental_invoices')
       .delete()
@@ -466,6 +653,25 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
         }
       }
 
+      // Buscar equipamentos da locação
+      const { data: rentalEquips } = await supabase
+        .from('rental_invoice_equipments')
+        .select('*')
+        .eq('rental_invoice_id', rental.id)
+        .order('created_at', { ascending: true });
+
+      let equipDescription = '';
+      let equipModel = '';
+      if (rentalEquips && rentalEquips.length > 0) {
+        equipDescription = rentalEquips
+          .map((e: any) => `${e.equipment_name || 'Equipamento'} (${e.asset_number || ''})`.trim())
+          .join(', ');
+        equipModel = Array.from(new Set(rentalEquips.map((e: any) => e.equipment_type).filter(Boolean))).join(', ');
+      } else {
+        equipDescription = rental.equipment_name ? `${rental.equipment_name} (${rental.asset_number || ''})`.trim() : '';
+        equipModel = rental.equipment_type || '';
+      }
+
       let durationDays = 30;
       if (rental.billing_period_start && rental.billing_period_end) {
         const start = new Date(rental.billing_period_start).getTime();
@@ -481,8 +687,8 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
         locatario_cnpj: rental.cnpj || '',
         locatario_state_registration: clientStateReg,
         locatario_address_full: clientAddressFull,
-        equipment_description: rental.equipment_name ? `${rental.equipment_name} (${rental.asset_number || ''})`.trim() : '',
-        equipment_model: rental.equipment_type || '',
+        equipment_description: equipDescription,
+        equipment_model: equipModel,
         contract_duration_days: durationDays,
         period_start: rental.billing_period_start ? rental.billing_period_start.split('T')[0] : null,
         period_end: rental.billing_period_end ? rental.billing_period_end.split('T')[0] : null,
@@ -493,7 +699,7 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
         cost_third_party: Number(rental.cost_third_party) || 0,
         cost_training: Number(rental.cost_training) || 0,
         cost_total: Number(rental.total_value) || 0,
-        billing_interval_days: 28,
+        billing_interval_days: '28 dias',
         work_site: rental.work_site || '',
         site_contact_name: clientContactName,
         site_contact_phone: clientPhone,
@@ -521,4 +727,3 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
     return res.status(500).json({ error: error.message });
   }
 };
-
