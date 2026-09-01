@@ -861,6 +861,70 @@ export const getContractForm = async (req: AuthRequest, res: Response) => {
     const supabase = getSupabaseUserClient(req.token!);
     const dealId = req.params.id;
 
+    // Helper to fetch individual equipments associated with deal
+    const fetchDealEquipments = async (): Promise<any[]> => {
+      // 1. Check if the latest contract snapshot has individual equipments
+      const { data: lastContract } = await supabase
+        .from('crm_deal_contracts')
+        .select('snapshot')
+        .eq('deal_id', dealId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (lastContract?.snapshot?.equipments && Array.isArray(lastContract.snapshot.equipments) && lastContract.snapshot.equipments.length > 0) {
+        return lastContract.snapshot.equipments;
+      }
+      if (lastContract?.snapshot?.equipment?.items && Array.isArray(lastContract.snapshot.equipment.items) && lastContract.snapshot.equipment.items.length > 0) {
+        return lastContract.snapshot.equipment.items;
+      }
+
+      // 2. Check if linked to rental invoice via crm_deals or rental_invoices
+      const { data: deal } = await supabase
+        .from('crm_deals')
+        .select('id, rental_invoice_id')
+        .eq('id', dealId)
+        .maybeSingle();
+
+      let rentalInvoiceId = deal?.rental_invoice_id;
+      if (!rentalInvoiceId) {
+        const { data: rental } = await supabase
+          .from('rental_invoices')
+          .select('id')
+          .eq('deal_id', dealId)
+          .maybeSingle();
+        rentalInvoiceId = rental?.id;
+      }
+
+      if (rentalInvoiceId) {
+        const { data: invEquips } = await supabase
+          .from('rental_invoice_equipments')
+          .select('*')
+          .eq('rental_invoice_id', rentalInvoiceId)
+          .order('created_at', { ascending: true });
+
+        if (invEquips && invEquips.length > 0) {
+          return invEquips.map((e: any) => ({
+            tempId: e.id,
+            equipment_id: e.equipment_id,
+            equipment_name: e.equipment_name || '',
+            equipment_size: e.equipment_size || '',
+            billing_period_start: e.billing_period_start ? String(e.billing_period_start).split('T')[0] : '',
+            billing_period_end: e.billing_period_end ? String(e.billing_period_end).split('T')[0] : '',
+            cost_rental: Number(e.cost_rental) || 0,
+            cost_insurance: Number(e.cost_insurance) || 0,
+            cost_freight: Number(e.cost_freight) || 0,
+            cost_rcd: Number(e.cost_rcd) || 0,
+            cost_third_party: Number(e.cost_third_party) || 0,
+            cost_training: Number(e.cost_training) || 0,
+            total_value: Number(e.total_value) || 0
+          }));
+        }
+      }
+
+      return [];
+    };
+
     const { data: form, error } = await supabase
       .from('crm_deal_contract_forms')
       .select('*')
@@ -871,8 +935,13 @@ export const getContractForm = async (req: AuthRequest, res: Response) => {
 
     if (error) throw error;
 
+    const equipments = await fetchDealEquipments();
+
     if (form) {
-      return res.json(form);
+      return res.json({
+        ...form,
+        equipments: equipments.length > 0 ? equipments : (form.equipments || [])
+      });
     }
 
     // Se não tem form na tabela, tenta buscar do último contrato gerado (snapshot)
@@ -910,7 +979,8 @@ export const getContractForm = async (req: AuthRequest, res: Response) => {
         site_contact_name: s.site_contact_name || '',
         site_contact_phone: s.site_contact_phone || '',
         notes: s.notes || '',
-        form_status: 'Pronto para Gerar'
+        form_status: 'Pronto para Gerar',
+        equipments: equipments.length > 0 ? equipments : (s.equipments || s.equipment?.items || [])
       });
     }
 
@@ -948,7 +1018,8 @@ export const getContractForm = async (req: AuthRequest, res: Response) => {
       site_contact_name: entity.contact_name || '',
       site_contact_phone: entity.phone || '',
       notes: '',
-      form_status: 'Rascunho'
+      form_status: 'Rascunho',
+      equipments: equipments
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
