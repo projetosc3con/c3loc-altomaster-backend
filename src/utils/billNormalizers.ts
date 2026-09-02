@@ -15,7 +15,8 @@ export function normalizeBill(row: any): BillStatementItem {
     client_id: row.client_id,
     client_name: row.client?.company_name ?? null,
     counterparty_name: row.counterparty_name,
-    invoice_number: row.invoice?.invoice_number ?? null,
+    invoice_number: row.invoice?.invoice_number ?? (row.bank_raw_snapshot?.invoice_number ? `NF-e ${row.bank_raw_snapshot.invoice_number}` : null),
+    rental_invoice_id: row.rental_invoice_id ?? null,
     description: row.description,
     invoice_url: row.payment?.invoice_url ?? null,
     bank_slip_url: row.payment?.bank_slip_url ?? null,
@@ -24,6 +25,7 @@ export function normalizeBill(row: any): BillStatementItem {
     created_by_photo: row.creator?.photo_url ?? null,
     created_at: row.created_at ?? null,
     updated_at: row.updated_at ?? null,
+    access_key: row.barcode || row.bank_raw_snapshot?.access_key || null,
     raw: row,
   };
 }
@@ -44,6 +46,7 @@ export function normalizePendingPayment(row: any): BillStatementItem {
     client_name: row.invoice?.client_name ?? null,
     counterparty_name: null,
     invoice_number: row.invoice?.invoice_number ?? null,
+    rental_invoice_id: row.invoice_id ?? row.rental_invoice_id ?? null,
     description: null,
     invoice_url: row.invoice_url ?? null,
     bank_slip_url: row.bank_slip_url ?? null,

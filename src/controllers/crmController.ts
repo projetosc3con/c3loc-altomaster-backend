@@ -856,74 +856,110 @@ export const checkCnpj = async (req: AuthRequest, res: Response) => {
 };
 
 // --- CONTRACTS ---
+// Helper to parse JSON equipments
+const parseEquipments = (modelOrJson: any): any[] => {
+  if (!modelOrJson || typeof modelOrJson !== 'string') return [];
+  try {
+    if (modelOrJson.startsWith('[EQUIPMENTS_JSON]:')) {
+      const parsed = JSON.parse(modelOrJson.replace('[EQUIPMENTS_JSON]:', ''));
+      if (Array.isArray(parsed)) return parsed;
+    }
+    if (modelOrJson.startsWith('[') && modelOrJson.endsWith(']')) {
+      const parsed = JSON.parse(modelOrJson);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch (e) {
+    // Ignore JSON parse error
+  }
+  return [];
+};
+
+// Helper to fetch individual equipments associated with deal
+const fetchDealEquipments = async (supabase: any, dealId: string): Promise<any[]> => {
+  // 1. Check if linked to rental invoice via crm_deals or rental_invoices (GROUND TRUTH)
+  const { data: deal } = await supabase
+    .from('crm_deals')
+    .select('id, rental_invoice_id')
+    .eq('id', dealId)
+    .maybeSingle();
+
+  let rentalInvoiceId = deal?.rental_invoice_id;
+  if (!rentalInvoiceId) {
+    const { data: rental } = await supabase
+      .from('rental_invoices')
+      .select('id')
+      .eq('deal_id', dealId)
+      .maybeSingle();
+    rentalInvoiceId = rental?.id;
+  }
+
+  if (rentalInvoiceId) {
+    const { data: invEquips } = await supabase
+      .from('rental_invoice_equipments')
+      .select('*')
+      .eq('rental_invoice_id', rentalInvoiceId)
+      .order('created_at', { ascending: true });
+
+    if (invEquips && invEquips.length > 0) {
+      return invEquips.map((e: any) => ({
+        tempId: e.id,
+        equipment_id: e.equipment_id,
+        equipment_name: e.equipment_name || '',
+        equipment_size: e.equipment_size || '',
+        asset_number: e.asset_number || '',
+        billing_period_start: e.billing_period_start ? String(e.billing_period_start).split('T')[0] : '',
+        billing_period_end: e.billing_period_end ? String(e.billing_period_end).split('T')[0] : '',
+        cost_rental: Number(e.cost_rental) || 0,
+        cost_insurance: Number(e.cost_insurance) || 0,
+        cost_freight: Number(e.cost_freight) || 0,
+        cost_rcd: Number(e.cost_rcd) || 0,
+        cost_third_party: Number(e.cost_third_party) || 0,
+        cost_training: Number(e.cost_training) || 0,
+        total_value: Number(e.total_value) || 0
+      }));
+    }
+  }
+
+  // 2. Check if the latest contract snapshot has individual equipments
+  const { data: lastContract } = await supabase
+    .from('crm_deal_contracts')
+    .select('snapshot')
+    .eq('deal_id', dealId)
+    .neq('status', 'Cancelado')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (lastContract?.snapshot?.equipments && Array.isArray(lastContract.snapshot.equipments) && lastContract.snapshot.equipments.length > 0) {
+    return lastContract.snapshot.equipments;
+  }
+  if (lastContract?.snapshot?.equipment?.items && Array.isArray(lastContract.snapshot.equipment.items) && lastContract.snapshot.equipment.items.length > 0) {
+    return lastContract.snapshot.equipment.items;
+  }
+
+  // 3. Check if crm_deal_contract_forms has equipment_model with encoded JSON
+  const { data: form } = await supabase
+    .from('crm_deal_contract_forms')
+    .select('equipment_model')
+    .eq('deal_id', dealId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (form?.equipment_model) {
+    const parsed = parseEquipments(form.equipment_model);
+    if (parsed.length > 0) return parsed;
+  }
+
+  return [];
+};
+
 export const getContractForm = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const dealId = req.params.id;
+    const dealId = String(req.params.id);
 
-    // Helper to fetch individual equipments associated with deal
-    const fetchDealEquipments = async (): Promise<any[]> => {
-      // 1. Check if the latest contract snapshot has individual equipments
-      const { data: lastContract } = await supabase
-        .from('crm_deal_contracts')
-        .select('snapshot')
-        .eq('deal_id', dealId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (lastContract?.snapshot?.equipments && Array.isArray(lastContract.snapshot.equipments) && lastContract.snapshot.equipments.length > 0) {
-        return lastContract.snapshot.equipments;
-      }
-      if (lastContract?.snapshot?.equipment?.items && Array.isArray(lastContract.snapshot.equipment.items) && lastContract.snapshot.equipment.items.length > 0) {
-        return lastContract.snapshot.equipment.items;
-      }
-
-      // 2. Check if linked to rental invoice via crm_deals or rental_invoices
-      const { data: deal } = await supabase
-        .from('crm_deals')
-        .select('id, rental_invoice_id')
-        .eq('id', dealId)
-        .maybeSingle();
-
-      let rentalInvoiceId = deal?.rental_invoice_id;
-      if (!rentalInvoiceId) {
-        const { data: rental } = await supabase
-          .from('rental_invoices')
-          .select('id')
-          .eq('deal_id', dealId)
-          .maybeSingle();
-        rentalInvoiceId = rental?.id;
-      }
-
-      if (rentalInvoiceId) {
-        const { data: invEquips } = await supabase
-          .from('rental_invoice_equipments')
-          .select('*')
-          .eq('rental_invoice_id', rentalInvoiceId)
-          .order('created_at', { ascending: true });
-
-        if (invEquips && invEquips.length > 0) {
-          return invEquips.map((e: any) => ({
-            tempId: e.id,
-            equipment_id: e.equipment_id,
-            equipment_name: e.equipment_name || '',
-            equipment_size: e.equipment_size || '',
-            billing_period_start: e.billing_period_start ? String(e.billing_period_start).split('T')[0] : '',
-            billing_period_end: e.billing_period_end ? String(e.billing_period_end).split('T')[0] : '',
-            cost_rental: Number(e.cost_rental) || 0,
-            cost_insurance: Number(e.cost_insurance) || 0,
-            cost_freight: Number(e.cost_freight) || 0,
-            cost_rcd: Number(e.cost_rcd) || 0,
-            cost_third_party: Number(e.cost_third_party) || 0,
-            cost_training: Number(e.cost_training) || 0,
-            total_value: Number(e.total_value) || 0
-          }));
-        }
-      }
-
-      return [];
-    };
+    const equipments = await fetchDealEquipments(supabase, dealId);
 
     const { data: form, error } = await supabase
       .from('crm_deal_contract_forms')
@@ -935,12 +971,15 @@ export const getContractForm = async (req: AuthRequest, res: Response) => {
 
     if (error) throw error;
 
-    const equipments = await fetchDealEquipments();
-
     if (form) {
+      let finalEquipments = equipments;
+      if (finalEquipments.length === 0 && form.equipment_model) {
+        finalEquipments = parseEquipments(form.equipment_model);
+      }
       return res.json({
         ...form,
-        equipments: equipments.length > 0 ? equipments : (form.equipments || [])
+        equipment_model: form.equipment_model?.startsWith('[EQUIPMENTS_JSON]:') ? '' : form.equipment_model,
+        equipments: finalEquipments.length > 0 ? finalEquipments : (form.equipments || [])
       });
     }
 
@@ -1028,6 +1067,8 @@ export const getContractForm = async (req: AuthRequest, res: Response) => {
 
 const buildContractSnapshot = async (form: any, contractNumber: string) => {
   const { data: settings } = await supabaseAdmin.from('erp_company_settings').select('*').eq('active', true).single();
+  const equipments = Array.isArray(form.equipments) ? form.equipments : [];
+  const modelClean = form.equipment_model?.startsWith('[EQUIPMENTS_JSON]:') ? '' : (form.equipment_model || '');
   return {
     contract_number: contractNumber,
     contract_date: form.contract_date,
@@ -1051,9 +1092,10 @@ const buildContractSnapshot = async (form: any, contractNumber: string) => {
     },
     equipment: {
       description: form.equipment_description,
-      model: form.equipment_model,
-      items: form.equipments || []
+      model: modelClean,
+      items: equipments
     },
+    equipments: equipments,
     contract_duration_days: form.contract_duration_days,
     period_start: form.period_start,
     period_end: form.period_end,
@@ -1070,6 +1112,8 @@ const buildContractSnapshot = async (form: any, contractNumber: string) => {
     work_site: form.work_site,
     site_contact_name: form.site_contact_name,
     site_contact_phone: form.site_contact_phone,
+    notes: form.notes || '',
+    observations: form.notes || form.observations || '',
     clauses: settings?.contract_clauses || {}
   };
 };
@@ -1077,11 +1121,11 @@ const buildContractSnapshot = async (form: any, contractNumber: string) => {
 export const saveContractForm = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const dealId = req.params.id;
+    const dealId = String(req.params.id);
     const body = req.body;
     
     // Extract equipments if sent by frontend
-    const equipments = body.equipments;
+    const equipments = Array.isArray(body.equipments) ? body.equipments : null;
     delete body.equipments;
 
     // Sanitize body
@@ -1097,6 +1141,10 @@ export const saveContractForm = async (req: AuthRequest, res: Response) => {
     if (!body.contract_date) body.contract_date = new Date().toISOString().split('T')[0];
     if (body.period_start === '') body.period_start = null;
     if (body.period_end === '') body.period_end = null;
+
+    if (equipments && equipments.length > 0) {
+      body.equipment_model = `[EQUIPMENTS_JSON]:${JSON.stringify(equipments)}`;
+    }
 
     // Check if there is an existing active contract
     const { data: existingContract } = await supabase
@@ -1130,20 +1178,76 @@ export const saveContractForm = async (req: AuthRequest, res: Response) => {
       await supabase.from('crm_deals').update({ contract_form_id: data.id }).eq('id', dealId);
     }
 
-    if (equipments) {
+    if (equipments && equipments.length > 0) {
       savedForm.equipments = equipments;
+
+      // Sync with rental_invoice_equipments if linked
+      const { data: deal } = await supabase
+        .from('crm_deals')
+        .select('id, rental_invoice_id')
+        .eq('id', dealId)
+        .maybeSingle();
+
+      let rentalInvoiceId = deal?.rental_invoice_id;
+      if (!rentalInvoiceId) {
+        const { data: rental } = await supabase
+          .from('rental_invoices')
+          .select('id')
+          .eq('deal_id', dealId)
+          .maybeSingle();
+        rentalInvoiceId = rental?.id;
+      }
+
+      if (rentalInvoiceId) {
+        await supabase.from('rental_invoice_equipments').delete().eq('rental_invoice_id', rentalInvoiceId);
+        await supabase.from('rental_invoice_equipments').insert(
+          equipments.map((eq: any) => ({
+            rental_invoice_id: rentalInvoiceId,
+            equipment_id: eq.equipment_id || null,
+            equipment_name: eq.equipment_name || null,
+            equipment_type: eq.equipment_type || null,
+            equipment_size: eq.equipment_size || null,
+            asset_number: eq.asset_number || null,
+            billing_period_start: eq.billing_period_start || body.period_start,
+            billing_period_end: eq.billing_period_end || body.period_end,
+            return_date: eq.return_date || null,
+            cost_rental: Number(eq.cost_rental) || 0,
+            cost_insurance: Number(eq.cost_insurance) || 0,
+            cost_freight: Number(eq.cost_freight) || 0,
+            cost_rcd: Number(eq.cost_rcd) || 0,
+            cost_third_party: Number(eq.cost_third_party) || 0,
+            cost_training: Number(eq.cost_training) || 0,
+            total_value: Number(eq.total_value) || 0,
+            notes: eq.notes || null
+          }))
+        );
+      }
     }
 
     // If an existing contract already exists, update its snapshot in-place (preserving the contract number!)
     if (existingContract) {
+      let rentalInvoiceId = body.rental_invoice_id;
+      if (!rentalInvoiceId) {
+        const { data: deal } = await supabase.from('crm_deals').select('rental_invoice_id').eq('id', dealId).maybeSingle();
+        rentalInvoiceId = deal?.rental_invoice_id;
+      }
+      if (!rentalInvoiceId) {
+        const { data: rental } = await supabase.from('rental_invoices').select('id').eq('deal_id', dealId).maybeSingle();
+        rentalInvoiceId = rental?.id;
+      }
       const updatedSnapshot = await buildContractSnapshot(savedForm, existingContract.contract_number);
       await supabase
         .from('crm_deal_contracts')
         .update({
           snapshot: updatedSnapshot,
+          rental_invoice_id: rentalInvoiceId || existingContract.rental_invoice_id || null,
           updated_at: new Date().toISOString()
         })
         .eq('id', existingContract.id);
+    }
+
+    if (savedForm.equipment_model?.startsWith('[EQUIPMENTS_JSON]:')) {
+      savedForm.equipment_model = '';
     }
 
     res.json(savedForm);
@@ -1156,11 +1260,53 @@ export const saveContractForm = async (req: AuthRequest, res: Response) => {
 export const generateContractRecord = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const dealId = req.params.id;
+    const dealId = String(req.params.id);
 
     const { data: form, error: formError } = await supabase.from('crm_deal_contract_forms').select('*').eq('deal_id', dealId).single();
     if (formError || !form) throw new Error('Formulário não encontrado');
     if (form.form_status === 'Rascunho') throw new Error('Preencha os campos obrigatórios');
+
+    // Fetch individual equipments (from req.body, from equipment_model JSON, or from rental_invoice_equipments)
+    let equipments = Array.isArray(req.body?.equipments) && req.body.equipments.length > 0
+      ? req.body.equipments
+      : await fetchDealEquipments(supabase, dealId);
+
+    if (equipments.length === 0 && form.equipment_model) {
+      equipments = parseEquipments(form.equipment_model);
+    }
+
+    if (equipments && equipments.length > 0) {
+      form.equipments = equipments;
+    }
+
+    if (form.equipment_model?.startsWith('[EQUIPMENTS_JSON]:')) {
+      form.equipment_model = '';
+    }
+
+    // Fetch rental_invoice_id if linked
+    let rentalInvoiceId = req.body?.rental_invoice_id;
+    if (!rentalInvoiceId) {
+      const { data: deal } = await supabase
+        .from('crm_deals')
+        .select('id, rental_invoice_id')
+        .eq('id', dealId)
+        .maybeSingle();
+      rentalInvoiceId = deal?.rental_invoice_id;
+    }
+    if (!rentalInvoiceId) {
+      const { data: rental } = await supabase
+        .from('rental_invoices')
+        .select('id')
+        .eq('deal_id', dealId)
+        .maybeSingle();
+      rentalInvoiceId = rental?.id;
+    }
+
+    // Ensure crm_deals and rental_invoices are synced with mutual ids
+    if (rentalInvoiceId) {
+      await supabase.from('crm_deals').update({ rental_invoice_id: rentalInvoiceId }).eq('id', dealId);
+      await supabase.from('rental_invoices').update({ deal_id: dealId }).eq('id', rentalInvoiceId);
+    }
 
     // Check if an existing active contract already exists for this deal
     const { data: existingContract } = await supabase
@@ -1185,6 +1331,7 @@ export const generateContractRecord = async (req: AuthRequest, res: Response) =>
         .from('crm_deal_contracts')
         .update({
           snapshot,
+          rental_invoice_id: rentalInvoiceId || existingContract.rental_invoice_id || null,
           status: existingContract.status === 'Assinado' ? 'Assinado' : 'Gerado',
           generated_by: req.user?.id,
           updated_at: new Date().toISOString()
@@ -1205,6 +1352,7 @@ export const generateContractRecord = async (req: AuthRequest, res: Response) =>
         .from('crm_deal_contracts')
         .insert({
           deal_id: dealId,
+          rental_invoice_id: rentalInvoiceId || null,
           contract_form_id: form.id,
           contract_number: contractNumber,
           version: 1,
@@ -1220,7 +1368,7 @@ export const generateContractRecord = async (req: AuthRequest, res: Response) =>
 
       await supabase
         .from('crm_deals')
-        .update({ active_contract_id: record.id })
+        .update({ active_contract_id: record.id, rental_invoice_id: rentalInvoiceId || null })
         .eq('id', dealId);
     }
 

@@ -542,7 +542,36 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
         .maybeSingle();
 
       if (existingDeal) {
-        return res.json({ deal: existingDeal });
+        if (!existingDeal.rental_invoice_id) {
+          await supabase.from('crm_deals').update({ rental_invoice_id: rental.id }).eq('id', existingDeal.id);
+          existingDeal.rental_invoice_id = rental.id;
+        }
+        await supabase
+          .from('crm_deal_contracts')
+          .update({ rental_invoice_id: rental.id })
+          .eq('deal_id', existingDeal.id)
+          .is('rental_invoice_id', null);
+
+        const { data: contracts } = await supabase
+          .from('crm_deal_contracts')
+          .select('*')
+          .eq('deal_id', existingDeal.id)
+          .neq('status', 'Cancelado')
+          .order('created_at', { ascending: false });
+
+        const { data: contractForm } = await supabase
+          .from('crm_deal_contract_forms')
+          .select('*')
+          .eq('deal_id', existingDeal.id)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        return res.json({
+          deal: existingDeal,
+          contracts: contracts || [],
+          contract_form: contractForm || null
+        });
       }
     }
 
@@ -559,7 +588,32 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
           .update({ deal_id: dealByInvoice.id })
           .eq('id', rental.id);
       }
-      return res.json({ deal: dealByInvoice });
+      await supabase
+        .from('crm_deal_contracts')
+        .update({ rental_invoice_id: rental.id })
+        .eq('deal_id', dealByInvoice.id)
+        .is('rental_invoice_id', null);
+
+      const { data: contracts } = await supabase
+        .from('crm_deal_contracts')
+        .select('*')
+        .eq('deal_id', dealByInvoice.id)
+        .neq('status', 'Cancelado')
+        .order('created_at', { ascending: false });
+
+      const { data: contractForm } = await supabase
+        .from('crm_deal_contract_forms')
+        .select('*')
+        .eq('deal_id', dealByInvoice.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      return res.json({
+        deal: dealByInvoice,
+        contracts: contracts || [],
+        contract_form: contractForm || null
+      });
     }
 
     // 3. Find the "Fechado Ganho" stage in the CRM pipelines
@@ -623,9 +677,11 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
     // 6. Pre-populate contract form for this deal if not already created
     const { data: existingForm } = await supabase
       .from('crm_deal_contract_forms')
-      .select('id')
+      .select('*')
       .eq('deal_id', newDeal.id)
       .maybeSingle();
+
+    let finalForm = existingForm;
 
     if (!existingForm) {
       let clientAddressFull = '';
@@ -715,6 +771,7 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
         .single();
 
       if (createdForm) {
+        finalForm = createdForm;
         await supabase
           .from('crm_deals')
           .update({ contract_form_id: createdForm.id })
@@ -722,7 +779,7 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
       }
     }
 
-    return res.json({ deal: newDeal });
+    return res.json({ deal: newDeal, contracts: [], contract_form: finalForm || null });
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }

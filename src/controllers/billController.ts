@@ -23,7 +23,108 @@ import { normalizeBill, normalizePendingPayment } from '../utils/billNormalizers
 // Um payment só some daqui quando o bill correspondente é criado de fato
 // (não quando payments.status muda pra RECEIVED), porque o pedido de
 // repasse ao Asaas pode falhar entre as duas coisas — nesse caso o payment
-// deve continuar aparecendo até o bill existir.
+function groupNfeBills(items: BillStatementItem[]): BillStatementItem[] {
+  const result: BillStatementItem[] = [];
+  const nfeGroups = new Map<string, BillStatementItem[]>();
+
+  for (const item of items) {
+    if (item.origin === 'NFE' && item.type === 'payable') {
+      const accessKey =
+        item.access_key ||
+        (item.raw as any)?.barcode ||
+        (item.raw as any)?.bank_raw_snapshot?.access_key ||
+        (item.raw as any)?.bank_raw_snapshot?.invoice_number ||
+        item.id;
+
+      const groupKey = `nfe_${accessKey}`;
+      if (!nfeGroups.has(groupKey)) {
+        nfeGroups.set(groupKey, []);
+      }
+      nfeGroups.get(groupKey)!.push(item);
+    } else {
+      result.push(item);
+    }
+  }
+
+  for (const [, installments] of nfeGroups.entries()) {
+    // Ordenar parcelas por installment_number ou due_date crescente
+    installments.sort((a, b) => {
+      const numA = Number((a.raw as any)?.bank_raw_snapshot?.installment_number) || 0;
+      const numB = Number((b.raw as any)?.bank_raw_snapshot?.installment_number) || 0;
+      if (numA && numB && numA !== numB) return numA - numB;
+      if (a.due_date && b.due_date) return a.due_date.localeCompare(b.due_date);
+      return 0;
+    });
+
+    if (installments.length === 1) {
+      const single = installments[0];
+      result.push({
+        ...single,
+        installments: [single],
+        installments_count: 1,
+        paid_installments_count: single.status === 'Recebido' || single.status === 'No prazo' ? 1 : 0,
+      });
+      continue;
+    }
+
+    const first = installments[0];
+    const rawSnap = (first.raw as any)?.bank_raw_snapshot || {};
+    const invoiceNum = rawSnap.invoice_number ? `NF-e ${rawSnap.invoice_number}` : (first.invoice_number || 'NF-e');
+    const totalCount = installments.length;
+
+    const rawTotalInvoice = Number(rawSnap.total_invoice);
+    const sumGross = installments.reduce((acc, curr) => acc + (Number(curr.gross_value) || 0), 0);
+    const totalGross = (!isNaN(rawTotalInvoice) && rawTotalInvoice > 0) ? rawTotalInvoice : Math.round(sumGross * 100) / 100;
+    const sumNet = installments.reduce((acc, curr) => acc + (Number(curr.net_value ?? curr.gross_value) || 0), 0);
+    const totalNet = Math.round(sumNet * 100) / 100;
+    const sumFee = installments.reduce((acc, curr) => acc + (Number(curr.fee_amount) || 0), 0);
+    const totalFee = Math.round(sumFee * 100) / 100;
+
+    const paidCount = installments.filter((i) => i.status === 'Recebido' || i.status === 'No prazo').length;
+    const allReconciled = installments.every((i) => i.is_reconciled);
+
+    // Próximo vencimento pendente (ou o último se todos quitados)
+    const pendingInst = installments.find((i) => i.status !== 'Recebido' && i.status !== 'No prazo');
+    const targetDueDate = pendingInst?.due_date || installments[installments.length - 1]?.due_date || first.due_date;
+
+    let consolidatedStatus = 'Pendente';
+    if (paidCount === totalCount) {
+      consolidatedStatus = 'Recebido';
+    } else if (paidCount > 0) {
+      consolidatedStatus = `Parcial (${paidCount}/${totalCount})`;
+    } else {
+      const anyOverdue = installments.some((i) => i.status === 'Atrasado');
+      if (anyOverdue) {
+        consolidatedStatus = 'Atrasado';
+      }
+    }
+
+    const counterparty = first.counterparty_name || first.client_name || rawSnap.issuer_name || 'Fornecedor NF-e';
+
+    const groupedItem: BillStatementItem = {
+      ...first,
+      id: first.id,
+      description: `${invoiceNum} (${totalCount} parcelas) - ${counterparty}`,
+      invoice_number: invoiceNum,
+      counterparty_name: counterparty,
+      gross_value: totalGross,
+      net_value: totalNet,
+      fee_amount: totalFee,
+      due_date: targetDueDate,
+      status: consolidatedStatus,
+      is_reconciled: allReconciled,
+      installments: installments,
+      installments_count: totalCount,
+      paid_installments_count: paidCount,
+      access_key: first.access_key || (first.raw as any)?.barcode || rawSnap.access_key || null,
+    };
+
+    result.push(groupedItem);
+  }
+
+  return result;
+}
+
 export const listBills = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
@@ -41,8 +142,12 @@ export const listBills = async (req: AuthRequest, res: Response) => {
       .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
       .order('created_at', { ascending: false });
 
+    const shouldGroupNfe =
+      unreconciled !== 'true' &&
+      (req.query.group_nfe === 'true' || (type === 'payable' && req.query.group_nfe !== 'false'));
+
     if (client_id) billsQuery = billsQuery.eq('client_id', client_id as string);
-    if (status) billsQuery = billsQuery.eq('status', status as string);
+    if (status && !shouldGroupNfe) billsQuery = billsQuery.eq('status', status as string);
     if (origin) billsQuery = billsQuery.eq('origin', origin as string);
     if (type) billsQuery = billsQuery.eq('type', type as string);
     if (from) billsQuery = billsQuery.gte('due_date', from as string);
@@ -93,7 +198,17 @@ export const listBills = async (req: AuthRequest, res: Response) => {
       items.push(...pending.map(normalizePendingPayment));
     }
 
-    items.sort((a, b) => {
+    let finalItems = shouldGroupNfe ? groupNfeBills(items) : items;
+
+    if (status && shouldGroupNfe) {
+      finalItems = finalItems.filter((item) => {
+        if (item.status === status) return true;
+        if (item.status.startsWith('Parcial') && status === 'Pendente') return true;
+        return false;
+      });
+    }
+
+    finalItems.sort((a, b) => {
       if (!a.due_date) return 1;
       if (!b.due_date) return -1;
       return b.due_date.localeCompare(a.due_date);
@@ -101,14 +216,14 @@ export const listBills = async (req: AuthRequest, res: Response) => {
 
     // Se a rota foi chamada especificamente para o modal de conciliação (unreconciled === 'true'), retorna array simples
     if (unreconciled === 'true') {
-      return res.json(items);
+      return res.json(finalItems);
     }
 
     // Retorno paginado padrão para a tabela do extrato
-    const total = items.length;
+    const total = finalItems.length;
     const totalPages = Math.max(1, Math.ceil(total / limit));
     const start = (page - 1) * limit;
-    const paginated = items.slice(start, start + limit);
+    const paginated = finalItems.slice(start, start + limit);
 
     return res.json({ data: paginated, total, page, limit, totalPages });
   } catch (error: any) {
@@ -207,10 +322,6 @@ export const updateBill = async (req: AuthRequest, res: Response) => {
 
     if (fetchError || !currentBill) {
       return res.status(404).json({ error: 'Lançamento não encontrado' });
-    }
-
-    if (currentBill.origin !== 'MANUAL') {
-      return res.status(400).json({ error: 'Apenas lançamentos de origem MANUAL podem ser editados diretamente.' });
     }
 
     const updatePayload: Record<string, any> = {

@@ -62,6 +62,35 @@ describe('normalizeBill', () => {
     expect(result.is_reconciled).toBe(false);
     expect(result.counterparty_name).toBe('Fornecedor Y');
   });
+
+  it('mapeia NF-e com access_key do barcode ou snapshot e extrai número de fatura', () => {
+    const row = {
+      id: 'bill-nfe-1',
+      type: 'payable',
+      status: 'Pendente',
+      origin: 'NFE',
+      gross_value: 659.93,
+      net_value: 659.93,
+      fee_amount: 0,
+      due_date: '2026-10-01',
+      barcode: '51260913164401000129550010000285101639814554',
+      bank_raw_snapshot: {
+        access_key: '51260913164401000129550010000285101639814554',
+        invoice_number: '28510',
+        installment_number: 1,
+        total_installments: 3,
+        total_invoice: 1980,
+      },
+      counterparty_name: 'M K EMPILHADEIRAS',
+    };
+
+    const result = normalizeBill(row);
+
+    expect(result.origin).toBe('NFE');
+    expect(result.access_key).toBe('51260913164401000129550010000285101639814554');
+    expect(result.invoice_number).toBe('NF-e 28510');
+    expect(result.counterparty_name).toBe('M K EMPILHADEIRAS');
+  });
 });
 
 describe('normalizePendingPayment', () => {
