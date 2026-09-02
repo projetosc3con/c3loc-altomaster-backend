@@ -564,7 +564,7 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
         const { data: contracts } = await supabase
           .from('crm_deal_contracts')
           .select('*')
-          .eq('deal_id', existingDeal.id)
+          .or(`rental_invoice_id.eq.${rental.id},deal_id.eq.${existingDeal.id}`)
           .neq('status', 'Cancelado')
           .order('created_at', { ascending: false });
 
@@ -606,7 +606,7 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
       const { data: contracts } = await supabase
         .from('crm_deal_contracts')
         .select('*')
-        .eq('deal_id', dealByInvoice.id)
+        .or(`rental_invoice_id.eq.${rental.id},deal_id.eq.${dealByInvoice.id}`)
         .neq('status', 'Cancelado')
         .order('created_at', { ascending: false });
 
@@ -915,5 +915,52 @@ export const createRentalServiceOrder = async (req: AuthRequest, res: Response) 
   } catch (error: any) {
     console.error('[createRentalServiceOrder] Erro:', error);
     return res.status(500).json({ error: error.message || 'Erro ao gerar ordem de serviço da locação.' });
+  }
+};
+
+export const getRentalContracts = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+
+    // Buscar a locação para obter deal_id
+    const { data: rental, error: rentErr } = await supabase
+      .from('rental_invoices')
+      .select('id, deal_id')
+      .eq('id', id)
+      .single();
+
+    if (rentErr || !rental) {
+      return res.status(404).json({ error: 'Locação não encontrada.' });
+    }
+
+    // Se a locação tiver deal_id, sincronizar quaisquer contratos desse deal com a locação
+    if (rental.deal_id) {
+      await supabase
+        .from('crm_deal_contracts')
+        .update({ rental_invoice_id: rental.id })
+        .eq('deal_id', rental.deal_id)
+        .is('rental_invoice_id', null);
+    }
+
+    let query = supabase
+      .from('crm_deal_contracts')
+      .select('*')
+      .neq('status', 'Cancelado')
+      .order('created_at', { ascending: false });
+
+    if (rental.deal_id) {
+      query = query.or(`rental_invoice_id.eq.${rental.id},deal_id.eq.${rental.deal_id}`);
+    } else {
+      query = query.eq('rental_invoice_id', rental.id);
+    }
+
+    const { data: contracts, error } = await query;
+    if (error) throw error;
+
+    return res.json(contracts || []);
+  } catch (error: any) {
+    console.error('[getRentalContracts] Erro:', error);
+    return res.status(500).json({ error: error.message || 'Erro ao carregar contratos da locação.' });
   }
 };
