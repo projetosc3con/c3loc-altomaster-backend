@@ -5,6 +5,7 @@ const router = Router();
 
 router.get('/', rentalController.getAllInvoices);
 router.get('/:id/contract-deal', rentalController.getOrCreateRentalContractDeal);
+router.post('/:id/service-orders', rentalController.createRentalServiceOrder);
 router.get('/:id', rentalController.getInvoiceById);
 router.post('/', rentalController.createInvoice);
 router.put('/:id', rentalController.updateInvoice);

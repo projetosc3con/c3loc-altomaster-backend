@@ -63,6 +63,51 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
         }
     }
 
+    // 0.1 Validate equipment status: if "Locado", OS can only be opened with a valid rental_invoice_id
+    if (osData.equipment_id) {
+      const { data: equip, error: eqErr } = await supabase
+        .from('equipments')
+        .select('id, name, asset_number, status')
+        .eq('id', osData.equipment_id)
+        .single();
+
+      if (eqErr || !equip) {
+        return res.status(404).json({ error: 'Equipamento não encontrado.' });
+      }
+
+      if (equip.status === 'Locado') {
+        if (!osData.rental_invoice_id) {
+          return res.status(400).json({
+            error: `O equipamento "${equip.asset_number || equip.name}" está com status "Locado". Ordens de serviço para equipamentos locados só podem ser abertas diretamente a partir da respectiva locação.`
+          });
+        }
+
+        // Validar se o equipamento pertence à locação informada
+        const { data: mainRental } = await supabase
+          .from('rental_invoices')
+          .select('id, equipment_id')
+          .eq('id', osData.rental_invoice_id)
+          .single();
+
+        let isLinked = mainRental?.equipment_id === equip.id;
+        if (!isLinked) {
+          const { data: childEquip } = await supabase
+            .from('rental_invoice_equipments')
+            .select('id')
+            .eq('rental_invoice_id', osData.rental_invoice_id)
+            .eq('equipment_id', equip.id)
+            .maybeSingle();
+          isLinked = Boolean(childEquip);
+        }
+
+        if (!isLinked) {
+          return res.status(400).json({
+            error: `O equipamento locado "${equip.asset_number || equip.name}" não pertence à locação informada.`
+          });
+        }
+      }
+    }
+
     // 1. Create the Service Order
     const { data: os, error: osError } = await supabase
       .from('service_orders')
@@ -72,8 +117,8 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
 
     if (osError) throw osError;
 
-    // 2. Update equipment status based on OS status
-    if (osData.equipment_id) {
+    // 2. Update equipment status based on OS status (only for equipment not linked to active rental)
+    if (osData.equipment_id && !osData.rental_invoice_id) {
         const isAvailable = osData.status === 'Concluída' || osData.status === 'Encerrada com pendências' || osData.status === 'Cancelada';
         await supabase
             .from('equipments')
@@ -247,8 +292,8 @@ export const updateServiceOrder = async (req: AuthRequest, res: Response) => {
 
         if (osError) throw osError;
 
-        // 2. Update equipment status based on OS status
-        if (os.equipment_id) {
+        // 2. Update equipment status based on OS status (only for equipment not linked to active rental)
+        if (os.equipment_id && !os.rental_invoice_id) {
             if (os.status === 'Concluída' || os.status === 'Encerrada com pendências' || os.status === 'Cancelada') {
                 await supabase
                     .from('equipments')

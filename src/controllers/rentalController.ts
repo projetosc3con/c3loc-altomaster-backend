@@ -168,6 +168,15 @@ export const getInvoiceById = async (req: AuthRequest, res: Response) => {
       invoice.equipments = [];
     }
 
+    // Buscar ordens de serviço vinculadas a esta locação
+    const { data: serviceOrders } = await supabase
+      .from('service_orders')
+      .select('id, os_number, equipment_id, equipment_asset_number, equipment_name, equipment_model, status, order_type, execution_date, execution_location, created_at')
+      .eq('rental_invoice_id', id)
+      .order('created_at', { ascending: false });
+
+    invoice.service_orders = serviceOrders || [];
+
     return res.json(invoice);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
@@ -782,5 +791,129 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
     return res.json({ deal: newDeal, contracts: [], contract_form: finalForm || null });
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
+  }
+};
+
+export const createRentalServiceOrder = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  const { equipment_id } = req.body;
+
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+
+    // 1. Carregar a locação e dados do cliente
+    const { data: rental, error: rentalError } = await supabase
+      .from('rental_invoices')
+      .select('*, client:clients(*)')
+      .eq('id', id)
+      .single();
+
+    if (rentalError || !rental) {
+      return res.status(404).json({ error: 'Locação não encontrada.' });
+    }
+
+    // 2. Identificar e validar o equipamento alvo
+    let targetEquipmentId = equipment_id;
+
+    if (!targetEquipmentId) {
+      if (rental.equipment_id) {
+        targetEquipmentId = rental.equipment_id;
+      } else {
+        const { data: firstEquip } = await supabase
+          .from('rental_invoice_equipments')
+          .select('equipment_id')
+          .eq('rental_invoice_id', id)
+          .limit(1)
+          .maybeSingle();
+
+        if (firstEquip) {
+          targetEquipmentId = firstEquip.equipment_id;
+        }
+      }
+    }
+
+    if (!targetEquipmentId) {
+      return res.status(400).json({ error: 'Nenhum equipamento foi especificado para a Ordem de Serviço.' });
+    }
+
+    // 3. Validar se o equipamento pertence à locação
+    const isMainEquip = rental.equipment_id === targetEquipmentId;
+    let isChildEquip = false;
+    if (!isMainEquip) {
+      const { data: checkChild } = await supabase
+        .from('rental_invoice_equipments')
+        .select('id')
+        .eq('rental_invoice_id', id)
+        .eq('equipment_id', targetEquipmentId)
+        .maybeSingle();
+      isChildEquip = Boolean(checkChild);
+    }
+
+    if (!isMainEquip && !isChildEquip) {
+      return res.status(400).json({ error: 'O equipamento informado não pertence a esta locação.' });
+    }
+
+    // 4. Buscar dados completos do equipamento
+    const { data: equipment, error: equipError } = await supabase
+      .from('equipments')
+      .select('*')
+      .eq('id', targetEquipmentId)
+      .single();
+
+    if (equipError || !equipment) {
+      return res.status(404).json({ error: 'Equipamento não encontrado no cadastro.' });
+    }
+
+    // 5. Montar endereço e dados de contato do cliente / obra
+    const client = rental.client || {};
+    const addressParts = [
+      client.address_street,
+      client.address_number,
+      client.address_complement,
+      client.address_city,
+      client.address_state,
+      client.address_zip
+    ].filter(Boolean).join(', ');
+
+    const fullLocation = rental.work_site
+      ? (addressParts ? `${rental.work_site} (${addressParts})` : rental.work_site)
+      : (addressParts || '');
+
+    const shortInvoiceRef = rental.invoice_number ? `Locação #${rental.invoice_number}` : `Locação`;
+
+    const osPayload = {
+      rental_invoice_id: rental.id,
+      equipment_id: equipment.id,
+      equipment_asset_number: equipment.asset_number,
+      equipment_name: equipment.name,
+      equipment_model: equipment.model,
+      equipment_serial_number: equipment.serial_number,
+      order_type: 'Externa', // Ordens de serviço abertas direto da locação são externas por padrão
+      status: 'Aberta',
+      execution_date: new Date().toISOString().split('T')[0],
+      execution_location: rental.work_site || addressParts || '',
+      client_name: client.company_name || rental.client_name || '',
+      client_address: fullLocation,
+      client_contact_name: client.contact_name || '',
+      client_phone: client.phone || '',
+      client_request: `Manutenção preventiva/corretiva em campo para o equipamento ${equipment.asset_number || ''} atrelado à ${shortInvoiceRef}.`,
+      description: `Ordem de serviço externa gerada a partir da ${shortInvoiceRef}. Obra/Local: ${rental.work_site || 'Não especificado'}.`,
+    };
+
+    const { data: newOs, error: osInsertError } = await supabase
+      .from('service_orders')
+      .insert(osPayload)
+      .select()
+      .single();
+
+    if (osInsertError) {
+      console.error('[createRentalServiceOrder] Erro ao criar OS:', osInsertError);
+      throw osInsertError;
+    }
+
+    return res.status(201).json(newOs);
+  } catch (error: any) {
+    console.error('[createRentalServiceOrder] Erro:', error);
+    return res.status(500).json({ error: error.message || 'Erro ao gerar ordem de serviço da locação.' });
   }
 };
