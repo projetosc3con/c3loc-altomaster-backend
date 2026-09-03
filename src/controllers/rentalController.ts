@@ -742,7 +742,7 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
         const start = new Date(rental.billing_period_start).getTime();
         const end = new Date(rental.billing_period_end).getTime();
         const diff = Math.round((end - start) / (1000 * 60 * 60 * 24));
-        if (diff > 0) durationDays = diff;
+        if (diff >= 0) durationDays = diff + 1;
       }
 
       const formPayload = {
