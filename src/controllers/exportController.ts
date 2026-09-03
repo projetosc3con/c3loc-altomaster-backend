@@ -134,7 +134,23 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
     if (valueMin > 0) query = query.gte('total_value', valueMin);
     if (valueMax > 0) query = query.lte('total_value', valueMax);
 
+    // Sorting
+    const sortBy = (req.query.sort_by as string) || 'billing_period_end';
+    const sortOrder = (req.query.sort_order as string)?.toLowerCase() === 'asc' ? 'asc' : 'desc';
+    const allowedSortFields: Record<string, string> = {
+      billing_period_end: 'billing_period_end',
+      billing_period_start: 'billing_period_start',
+      client_name: 'client_name',
+      equipment_name: 'equipment_name',
+      total_value: 'total_value',
+      billing_status: 'billing_status',
+      created_at: 'created_at',
+      invoice_number: 'invoice_number'
+    };
+    const orderColumn = allowedSortFields[sortBy] || 'billing_period_end';
+
     const { data: rentals, error: fetchError } = await query
+      .order(orderColumn, { ascending: sortOrder === 'asc', nullsFirst: false })
       .order('created_at', { ascending: false });
 
     if (fetchError) throw fetchError;

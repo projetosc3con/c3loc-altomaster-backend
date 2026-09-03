@@ -13,17 +13,25 @@ const updateEquipmentItemStatus = async (
   const returnDateStr = returnDate ? String(returnDate).split('T')[0] : null;
   const periodEndStr = billingPeriodEnd ? String(billingPeriodEnd).split('T')[0] : null;
 
-  if (returnDateStr) {
-    if (returnDateStr <= todayStr) {
-      await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', equipmentId);
-    } else {
-      await supabase.from('equipments').update({ status: 'Locado' }).eq('id', equipmentId);
-    }
-  } else if (periodEndStr) {
-    if (periodEndStr < todayStr) {
-      await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', equipmentId);
-    } else {
-      await supabase.from('equipments').update({ status: 'Locado' }).eq('id', equipmentId);
+  const isPast = (returnDateStr && returnDateStr <= todayStr) || (periodEndStr && periodEndStr < todayStr);
+
+  if (isPast) {
+    // Verificar se o equipamento possui alguma outra locação atualmente ativa
+    const { data: activeRentals } = await supabase
+      .from('rental_invoice_equipments')
+      .select('id, billing_period_end, return_date')
+      .eq('equipment_id', equipmentId);
+
+    const hasCurrentActive = (activeRentals || []).some((item: any) => {
+      const end = (item.return_date || item.billing_period_end || '').split('T')[0];
+      return end && end >= todayStr;
+    });
+
+    if (!hasCurrentActive) {
+      const { data: currentEq } = await supabase.from('equipments').select('status').eq('id', equipmentId).single();
+      if (currentEq && currentEq.status === 'Locado') {
+        await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', equipmentId);
+      }
     }
   } else {
     await supabase.from('equipments').update({ status: 'Locado' }).eq('id', equipmentId);
@@ -85,8 +93,29 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
       .select('reconciliation_status, total_value');
     statsQuery = applyFilters(statsQuery);
 
+    // Sorting
+    const sortBy = (req.query.sort_by as string) || 'billing_period_end';
+    const sortOrder = (req.query.sort_order as string)?.toLowerCase() === 'asc' ? 'asc' : 'desc';
+
+    const allowedSortFields: Record<string, string> = {
+      billing_period_end: 'billing_period_end',
+      billing_period_start: 'billing_period_start',
+      client_name: 'client_name',
+      equipment_name: 'equipment_name',
+      total_value: 'total_value',
+      billing_status: 'billing_status',
+      created_at: 'created_at',
+      invoice_number: 'invoice_number'
+    };
+
+    const orderColumn = allowedSortFields[sortBy] || 'billing_period_end';
+    const isAscending = sortOrder === 'asc';
+
     const [dataResult, statsResult] = await Promise.all([
-      dataQuery.order('created_at', { ascending: false }).range(from, to),
+      dataQuery
+        .order(orderColumn, { ascending: isAscending, nullsFirst: false })
+        .order('created_at', { ascending: false })
+        .range(from, to),
       statsQuery
     ]);
 
@@ -191,6 +220,45 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
     // Validar obrigatoriedade de pelo menos um equipamento
     if (rawEquipments.length === 0 && !req.body.equipment_id) {
       return res.status(400).json({ error: 'A locação deve conter obrigatoriamente um ou mais equipamentos atrelados.' });
+    }
+
+    const todayStr = new Date().toISOString().split('T')[0];
+
+    // Validar se equipamentos não disponíveis estão sendo vinculados a períodos que não sejam estritamente no passado
+    if (rawEquipments.length > 0) {
+      for (const eq of rawEquipments) {
+        if (eq.equipment_id) {
+          const { data: dbEq } = await supabase
+            .from('equipments')
+            .select('id, name, asset_number, status')
+            .eq('id', eq.equipment_id)
+            .single();
+
+          if (dbEq && dbEq.status !== 'Disponível') {
+            const effectiveEnd = (eq.return_date || eq.billing_period_end || '').split('T')[0];
+            if (!effectiveEnd || effectiveEnd >= todayStr) {
+              return res.status(400).json({
+                error: `O equipamento "${dbEq.name}" (${dbEq.asset_number || 'S/N'}) está com status "${dbEq.status}". Só é permitido cadastrar locação para equipamentos não disponíveis se o período for retroativo (já finalizado no passado).`
+              });
+            }
+          }
+        }
+      }
+    } else if (req.body.equipment_id) {
+      const { data: dbEq } = await supabase
+        .from('equipments')
+        .select('id, name, asset_number, status')
+        .eq('id', req.body.equipment_id)
+        .single();
+
+      if (dbEq && dbEq.status !== 'Disponível') {
+        const effectiveEnd = (req.body.return_date || req.body.billing_period_end || '').split('T')[0];
+        if (!effectiveEnd || effectiveEnd >= todayStr) {
+          return res.status(400).json({
+            error: `O equipamento "${dbEq.name}" (${dbEq.asset_number || 'S/N'}) está com status "${dbEq.status}". Só é permitido cadastrar locação para equipamentos não disponíveis se o período for retroativo (já finalizado no passado).`
+          });
+        }
+      }
     }
 
     let cost_rental = 0;
