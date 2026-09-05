@@ -69,8 +69,10 @@ app.use('/api/fiscal', authenticate, fiscalRoutes);
 // TODO(SECURITY): ver aviso em billController.ts — `bills` ainda não tem RLS/policies.
 app.use('/api/bills', authenticate, billRoutes);
 
-app.listen(PORT, () => {
-  console.log(`RentDesk Backend running on http://localhost:${PORT}`);
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`RentDesk Backend running on http://localhost:${PORT}`);
+  });
+}
 
 export default app;

@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
-import { getSupabaseUserClient } from '../config/supabase';
+import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
+import { buildContractSnapshot } from './crmController';
 
 const updateEquipmentItemStatus = async (
   supabase: any,
@@ -1030,5 +1031,397 @@ export const getRentalContracts = async (req: AuthRequest, res: Response) => {
   } catch (error: any) {
     console.error('[getRentalContracts] Erro:', error);
     return res.status(500).json({ error: error.message || 'Erro ao carregar contratos da locação.' });
+  }
+};
+
+export const extendInvoice = async (req: AuthRequest, res: Response) => {
+  const id = String(req.params.id);
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+
+    // 1. Obter locação existente
+    const { data: rental, error: rentalError } = await supabase
+      .from('rental_invoices')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (rentalError || !rental) {
+      return res.status(404).json({ error: 'Locação não encontrada.' });
+    }
+
+    // 2. Validar que a locação não possui data de devolução já finalizada
+    if (rental.return_date) {
+      return res.status(400).json({ error: 'Locações que já possuem data de devolução não podem ser prorrogadas.' });
+    }
+
+    // 3. Obter lista de equipamentos do payload
+    const rawEquipments = Array.isArray(req.body.equipments) ? req.body.equipments : [];
+    if (rawEquipments.length === 0) {
+      return res.status(400).json({ error: 'A prorrogação deve conter pelo menos um equipamento.' });
+    }
+
+    // 4. Calcular o valor anterior e o novo valor
+    const previousTotal = Number(rental.total_value) || 0;
+
+    let newCostRental = 0;
+    let newCostInsurance = 0;
+    let newCostFreight = 0;
+    let newCostRcd = 0;
+    let newCostThirdParty = 0;
+    let newCostTraining = 0;
+
+    for (const eq of rawEquipments) {
+      newCostRental += Number(eq.cost_rental) || 0;
+      newCostInsurance += Number(eq.cost_insurance) || 0;
+      newCostFreight += Number(eq.cost_freight) || 0;
+      newCostRcd += Number(eq.cost_rcd) || 0;
+      newCostThirdParty += Number(eq.cost_third_party) || 0;
+      newCostTraining += Number(eq.cost_training) || 0;
+    }
+
+    const newTotalValue = Math.round((newCostRental + newCostInsurance + newCostFreight + newCostRcd + newCostThirdParty + newCostTraining) * 100) / 100;
+
+    // 5. Validação rigorosa: Não permitir diminuir o valor da locação
+    if (newTotalValue < previousTotal) {
+      return res.status(400).json({
+        error: `O valor total da prorrogação (R$ ${newTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}) não pode ser inferior ao valor anterior da locação (R$ ${previousTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}).`
+      });
+    }
+
+    // 6. Diferença financeira a lançar em contas a receber
+    const diff = Math.round((newTotalValue - previousTotal) * 100) / 100;
+
+    // 7. Determinar novo período final consolidado
+    const ends = rawEquipments.map((e: any) => e.billing_period_end).filter(Boolean).sort();
+    const maxBillingPeriodEnd = ends.length > 0 ? ends[ends.length - 1] : rental.billing_period_end;
+
+    // 8. Atualizar itens em rental_invoice_equipments
+    for (const eq of rawEquipments) {
+      const itemRental = Number(eq.cost_rental) || 0;
+      const itemInsurance = Number(eq.cost_insurance) || 0;
+      const itemFreight = Number(eq.cost_freight) || 0;
+      const itemRcd = Number(eq.cost_rcd) || 0;
+      const itemThirdParty = Number(eq.cost_third_party) || 0;
+      const itemTraining = Number(eq.cost_training) || 0;
+      const itemTotal = itemRental + itemInsurance + itemFreight + itemRcd + itemThirdParty + itemTraining;
+
+      const updateItemPayload: any = {
+        billing_period_end: eq.billing_period_end || maxBillingPeriodEnd,
+        cost_rental: itemRental,
+        cost_insurance: itemInsurance,
+        cost_freight: itemFreight,
+        cost_rcd: itemRcd,
+        cost_third_party: itemThirdParty,
+        cost_training: itemTraining,
+        total_value: itemTotal,
+        updated_at: new Date().toISOString()
+      };
+      if (eq.notes !== undefined) {
+        updateItemPayload.notes = eq.notes;
+      }
+
+      if (eq.id) {
+        await supabase
+          .from('rental_invoice_equipments')
+          .update(updateItemPayload)
+          .eq('id', eq.id);
+      } else if (eq.equipment_id) {
+        await supabase
+          .from('rental_invoice_equipments')
+          .update(updateItemPayload)
+          .eq('rental_invoice_id', id)
+          .eq('equipment_id', eq.equipment_id);
+      }
+
+      // Atualizar status do equipamento no inventário
+      if (eq.equipment_id) {
+        await updateEquipmentItemStatus(supabase, eq.equipment_id, eq.billing_period_end || maxBillingPeriodEnd, null);
+      }
+    }
+
+    // 9. Atualizar cabeçalho da locação em rental_invoices
+    const { data: updatedInvoice, error: updateInvoiceError } = await supabase
+      .from('rental_invoices')
+      .update({
+        billing_period_end: maxBillingPeriodEnd,
+        cost_rental: newCostRental,
+        cost_insurance: newCostInsurance,
+        cost_freight: newCostFreight,
+        cost_rcd: newCostRcd,
+        cost_third_party: newCostThirdParty,
+        cost_training: newCostTraining,
+        total_value: newTotalValue,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateInvoiceError) throw updateInvoiceError;
+
+    // 10. Lançar conta a receber em bills caso haja diferença de valor
+    let createdBill = null;
+    if (diff > 0) {
+      const todayStr = new Date().toISOString().split('T')[0];
+      const billDescription = updatedInvoice.invoice_number
+        ? `Prorrogação de Locação #${updatedInvoice.invoice_number}`
+        : 'Prorrogação de Locação';
+
+      const { data: billData, error: billError } = await supabase
+        .from('bills')
+        .insert({
+          origin: 'MANUAL',
+          type: 'receivable',
+          rental_invoice_id: updatedInvoice.id,
+          client_id: updatedInvoice.client_id || null,
+          counterparty_name: updatedInvoice.client_name || null,
+          description: billDescription,
+          gross_value: diff,
+          fee_amount: 0,
+          net_value: diff,
+          due_date: todayStr,
+          status: 'Pendente',
+          reconciled_at: null,
+          created_by: req.user?.id || null,
+        })
+        .select()
+        .single();
+
+      if (billError) {
+        console.error('[extendInvoice] Erro ao lançar conta a receber em bills:', billError);
+      } else {
+        createdBill = billData;
+      }
+    }
+
+    // 11. Gerar nova versão do contrato de locação (deal_contracts)
+    let dealId = updatedInvoice.deal_id;
+    if (!dealId) {
+      const { data: existingDeal } = await supabase
+        .from('crm_deals')
+        .select('id')
+        .eq('rental_invoice_id', id)
+        .maybeSingle();
+
+      if (existingDeal) {
+        dealId = existingDeal.id;
+        await supabase.from('rental_invoices').update({ deal_id: dealId }).eq('id', id);
+      }
+    }
+
+    if (!dealId) {
+      const { data: wonStage } = await supabase
+        .from('crm_pipeline_stages')
+        .select('id, pipeline_id')
+        .eq('is_won', true)
+        .order('position', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const titleParts = [updatedInvoice.equipment_name, updatedInvoice.asset_number].filter(Boolean);
+      const title = titleParts.length > 0 ? titleParts.join(' - ') : `Locação Nº ${updatedInvoice.invoice_number || updatedInvoice.id.substring(0, 8)}`;
+
+      const { data: newDeal } = await supabase
+        .from('crm_deals')
+        .insert({
+          pipeline_id: wonStage?.pipeline_id || null,
+          stage_id: wonStage?.id || null,
+          client_id: updatedInvoice.client_id || null,
+          rental_invoice_id: updatedInvoice.id,
+          title: title,
+          value: newTotalValue,
+          expected_close_date: updatedInvoice.billing_period_start ? updatedInvoice.billing_period_start.split('T')[0] : new Date().toISOString().split('T')[0],
+          closed_at: new Date().toISOString(),
+          owner_id: req.user?.id || updatedInvoice.created_by || null,
+          description: `Locação Nº ${updatedInvoice.invoice_number || updatedInvoice.id.substring(0, 8)}`,
+        })
+        .select()
+        .single();
+
+      if (newDeal) {
+        dealId = newDeal.id;
+        await supabase.from('rental_invoices').update({ deal_id: dealId }).eq('id', id);
+      }
+    } else {
+      await supabase.from('crm_deals').update({ value: newTotalValue }).eq('id', dealId);
+    }
+
+    // Buscar contratos existentes para determinar o número e a próxima versão
+    let contractQuery = supabase
+      .from('crm_deal_contracts')
+      .select('*')
+      .neq('status', 'Cancelado')
+      .order('created_at', { ascending: false });
+
+    if (dealId) {
+      contractQuery = contractQuery.or(`rental_invoice_id.eq.${id},deal_id.eq.${dealId}`);
+    } else {
+      contractQuery = contractQuery.eq('rental_invoice_id', id);
+    }
+
+    const { data: existingContracts } = await contractQuery;
+    const latestContract = existingContracts && existingContracts.length > 0 ? existingContracts[0] : null;
+
+    let contractNumber = latestContract?.contract_number;
+    if (!contractNumber) {
+      const { data: nextNum } = await supabase.rpc('get_next_contract_number');
+      contractNumber = nextNum || `${new Date().getFullYear()}-${id.substring(0, 4).toUpperCase()}`;
+    }
+
+    // Próxima versão
+    let maxVersion = 1;
+    if (existingContracts && existingContracts.length > 0) {
+      for (const c of existingContracts) {
+        const v = Number(c.version);
+        if (!isNaN(v) && v >= maxVersion) maxVersion = v + 1;
+      }
+    }
+    const newVersion = maxVersion;
+
+    // Buscar crm_deal_contract_forms e dados do cliente para compor snapshot
+    let formRecord: any = null;
+    if (dealId) {
+      const { data: cf } = await supabase
+        .from('crm_deal_contract_forms')
+        .select('*')
+        .eq('deal_id', dealId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      formRecord = cf;
+    }
+
+    let clientData: any = null;
+    if (updatedInvoice.client_id) {
+      const { data: cd } = await supabase
+        .from('clients')
+        .select('*')
+        .eq('id', updatedInvoice.client_id)
+        .maybeSingle();
+      clientData = cd;
+    }
+
+    const clientAddress = clientData ? [
+      clientData.address_street,
+      clientData.address_number,
+      clientData.address_complement,
+      clientData.address_city && clientData.address_state ? `${clientData.address_city}/${clientData.address_state}` : clientData.address_city,
+      clientData.address_zip ? `CEP: ${clientData.address_zip}` : ''
+    ].filter(Boolean).join(', ') : (formRecord?.locatario_address_full || '');
+
+    const equipDescription = rawEquipments
+      .map((e: any) => `${e.equipment_name || 'Equipamento'} (${e.asset_number || ''})`.trim())
+      .join(', ');
+    const equipModel = Array.from(new Set(rawEquipments.map((e: any) => e.equipment_type).filter(Boolean))).join(', ');
+
+    let durationDays = 30;
+    if (updatedInvoice.billing_period_start && maxBillingPeriodEnd) {
+      const start = new Date(updatedInvoice.billing_period_start).getTime();
+      const end = new Date(maxBillingPeriodEnd).getTime();
+      const dayDiff = Math.round((end - start) / (1000 * 60 * 60 * 24));
+      if (dayDiff >= 0) durationDays = dayDiff + 1;
+    }
+
+    const updatedFormData = {
+      deal_id: dealId || null,
+      contract_date: new Date().toISOString().split('T')[0],
+      locatario_company_name: updatedInvoice.client_name || clientData?.company_name || formRecord?.locatario_company_name || '',
+      locatario_cnpj: updatedInvoice.cnpj || clientData?.cnpj || formRecord?.locatario_cnpj || '',
+      locatario_state_registration: clientData?.state_subscription || formRecord?.locatario_state_registration || '',
+      locatario_address_full: clientAddress,
+      equipment_description: equipDescription,
+      equipment_model: equipModel,
+      contract_duration_days: durationDays,
+      period_start: updatedInvoice.billing_period_start ? String(updatedInvoice.billing_period_start).split('T')[0] : null,
+      period_end: maxBillingPeriodEnd ? String(maxBillingPeriodEnd).split('T')[0] : null,
+      cost_rental: newCostRental,
+      cost_insurance: newCostInsurance,
+      cost_freight: newCostFreight,
+      cost_rcd: newCostRcd,
+      cost_third_party: newCostThirdParty,
+      cost_training: newCostTraining,
+      cost_total: newTotalValue,
+      billing_interval_days: formRecord?.billing_interval_days || '28 dias',
+      work_site: updatedInvoice.work_site || formRecord?.work_site || '',
+      site_contact_name: clientData?.contact_name || formRecord?.site_contact_name || '',
+      site_contact_phone: clientData?.phone || formRecord?.site_contact_phone || '',
+      notes: updatedInvoice.notes || formRecord?.notes || '',
+      observations: updatedInvoice.notes || formRecord?.observations || '',
+      equipments: rawEquipments
+    };
+
+    if (dealId) {
+      if (formRecord) {
+        await supabase
+          .from('crm_deal_contract_forms')
+          .update({
+            contract_duration_days: durationDays,
+            period_end: updatedFormData.period_end,
+            cost_rental: newCostRental,
+            cost_insurance: newCostInsurance,
+            cost_freight: newCostFreight,
+            cost_rcd: newCostRcd,
+            cost_third_party: newCostThirdParty,
+            cost_training: newCostTraining,
+            cost_total: newTotalValue,
+            equipment_model: `[EQUIPMENTS_JSON]:${JSON.stringify(rawEquipments)}`,
+            updated_by: req.user?.id
+          })
+          .eq('id', formRecord.id);
+      } else {
+        const { data: createdCf } = await supabase
+          .from('crm_deal_contract_forms')
+          .insert({
+            ...updatedFormData,
+            form_status: 'Pronto para Gerar',
+            equipment_model: `[EQUIPMENTS_JSON]:${JSON.stringify(rawEquipments)}`,
+            created_by: req.user?.id
+          })
+          .select()
+          .single();
+        formRecord = createdCf;
+      }
+    }
+
+    const snapshot = await buildContractSnapshot(updatedFormData, contractNumber);
+
+    const { data: newContractRecord, error: newContractError } = await supabase
+      .from('crm_deal_contracts')
+      .insert({
+        deal_id: dealId || null,
+        rental_invoice_id: updatedInvoice.id,
+        contract_form_id: formRecord?.id || null,
+        contract_number: contractNumber,
+        version: newVersion,
+        status: 'Gerado',
+        generated_by: req.user?.id || null,
+        snapshot
+      })
+      .select()
+      .single();
+
+    if (newContractError) {
+      console.error('[extendInvoice] Erro ao criar nova versão do contrato:', newContractError);
+      throw newContractError;
+    }
+
+    if (dealId && newContractRecord) {
+      await supabase.from('crm_deals').update({ active_contract_id: newContractRecord.id }).eq('id', dealId);
+    }
+
+    return res.json({
+      success: true,
+      message: diff > 0
+        ? `Locação prorrogada com sucesso! Nova versão do contrato (v${newVersion}) gerada e Conta a Receber de R$ ${diff.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} lançada.`
+        : `Locação prorrogada com sucesso! Nova versão do contrato (v${newVersion}) gerada.`,
+      rental: updatedInvoice,
+      bill: createdBill,
+      contract: newContractRecord,
+      difference: diff
+    });
+  } catch (error: any) {
+    console.error('[extendInvoice] Erro:', error);
+    return res.status(500).json({ error: error.message || 'Erro ao prorrogar fatura de locação.' });
   }
 };

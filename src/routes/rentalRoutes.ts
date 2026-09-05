@@ -7,6 +7,7 @@ router.get('/', rentalController.getAllInvoices);
 router.get('/:id/contract-deal', rentalController.getOrCreateRentalContractDeal);
 router.get('/:id/contracts', rentalController.getRentalContracts);
 router.post('/:id/service-orders', rentalController.createRentalServiceOrder);
+router.post('/:id/extend', rentalController.extendInvoice);
 router.get('/:id', rentalController.getInvoiceById);
 router.post('/', rentalController.createInvoice);
 router.put('/:id', rentalController.updateInvoice);

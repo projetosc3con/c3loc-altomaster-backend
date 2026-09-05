@@ -65,9 +65,11 @@ export const processImport = async (req: AuthRequest, res: Response) => {
       .eq('access_key', accessKey)
       .maybeSingle();
 
+    const docLabel = parsed_data.document_type === 'nfse' ? 'NFS-e' : 'NF-e';
+
     if (existingImport) {
       return res.status(400).json({
-        error: `A NF-e nº ${invoiceNumber} (Chave: ${accessKey}) já foi importada anteriormente no sistema.`
+        error: `A ${docLabel} nº ${invoiceNumber} (Identificador: ${accessKey}) já foi importada anteriormente no sistema.`
       });
     }
 
@@ -384,7 +386,7 @@ export const processImport = async (req: AuthRequest, res: Response) => {
 
     return res.status(201).json({
       success: true,
-      message: `NF-e nº ${invoiceNumber} importada e processada com sucesso!`,
+      message: `${docLabel} nº ${invoiceNumber} importada e processada com sucesso!`,
       summary: destinationSummary,
       import_id: insertedImport?.id || null,
     });

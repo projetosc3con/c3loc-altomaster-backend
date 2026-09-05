@@ -70,6 +70,8 @@ export interface ParsedNfeData {
   };
   installments: ParsedNfeInstallment[];
   additional_info?: string;
+  document_type?: 'nfe' | 'nfse';
+  verification_code?: string;
 }
 
 export function inferSuggestedDestination(item: {

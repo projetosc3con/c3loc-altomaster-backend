@@ -1065,7 +1065,7 @@ export const getContractForm = async (req: AuthRequest, res: Response) => {
   }
 };
 
-const buildContractSnapshot = async (form: any, contractNumber: string) => {
+export const buildContractSnapshot = async (form: any, contractNumber: string) => {
   const { data: settings } = await supabaseAdmin.from('erp_company_settings').select('*').eq('active', true).single();
   const equipments = Array.isArray(form.equipments) ? form.equipments : [];
   const modelClean = form.equipment_model?.startsWith('[EQUIPMENTS_JSON]:') ? '' : (form.equipment_model || '');

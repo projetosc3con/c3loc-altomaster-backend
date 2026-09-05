@@ -1,4 +1,4 @@
-import { PDFParse } from 'pdf-parse';
+import { extractText } from 'unpdf';
 import {
   ParsedNfeData,
   ParsedNfeItem,
@@ -6,6 +6,7 @@ import {
   inferSuggestedDestination,
   normalizeUnit,
 } from './nfeParserService';
+import { isNfseDocument, parseNfsePdf } from './nfseParserService';
 
 function parseMoney(raw?: string | null): number {
   if (!raw) return 0;
@@ -39,14 +40,17 @@ function formatCnpj(digits: string): string {
 }
 
 export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
-  const parser = new PDFParse({ data: pdfBuffer });
-  const parseResult = await parser.getText();
-  const text = parseResult?.text || '';
+  const { text } = await extractText(new Uint8Array(pdfBuffer), { mergePages: true });
 
   if (!text || text.trim().length === 0) {
     throw new Error(
-      'Não foi possível extrair texto do arquivo PDF. Certifique-se de que o documento é uma DANFE digital e não uma imagem escaneada.'
+      'Não foi possível extrair texto do arquivo PDF. Certifique-se de que o documento é um PDF fiscal digital e não uma imagem escaneada.'
     );
+  }
+
+  // Se for Nota Fiscal de Serviços (NFS-e), direciona para o parser especializado de NFS-e
+  if (isNfseDocument(text)) {
+    return parseNfsePdf(pdfBuffer, text);
   }
 
   // 1. Extração da Chave de Acesso (44 dígitos numéricos)
@@ -396,5 +400,6 @@ export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
     },
     installments,
     additional_info: additionalInfo,
+    document_type: 'nfe',
   };
 }
