@@ -200,7 +200,7 @@ export const getInvoiceById = async (req: AuthRequest, res: Response) => {
     // Buscar ordens de serviço vinculadas a esta locação
     const { data: serviceOrders } = await supabase
       .from('service_orders')
-      .select('id, os_number, equipment_id, equipment_asset_number, equipment_name, equipment_model, status, order_type, execution_date, execution_location, created_at')
+      .select('id, os_number, equipment_id, equipment_asset_number, equipment_name, equipment_model, equipment_serial_number, status, order_type, execution_date, execution_location, created_at')
       .eq('rental_invoice_id', id)
       .order('created_at', { ascending: false });
 
@@ -556,9 +556,18 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
 export const deleteInvoice = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   try {
+    // Validação de permissão: Apenas Administrador e Diretoria
+    const allowedRoles = ['Administrador', 'Diretoria'];
+    const userRole = req.profile?.access_level;
+    if (!userRole || !allowedRoles.includes(userRole)) {
+      return res.status(403).json({
+        error: 'Acesso negado: apenas usuários do tipo Administrador e Diretoria têm permissão para excluir locações.'
+      });
+    }
+
     const supabase = getSupabaseUserClient(req.token!);
 
-    // Buscar equipamentos vinculados para liberá-los no estoque
+    // 1. Buscar equipamentos vinculados para liberá-los no estoque
     const { data: items } = await supabase
       .from('rental_invoice_equipments')
       .select('equipment_id')
@@ -579,17 +588,65 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
     }
 
     for (const eqId of equipIdsToFree) {
-      await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', eqId);
+      await supabase.from('equipments').update({
+        status: 'Disponível',
+        rental_client_name: null,
+        rental_period_start: null,
+        rental_period_end: null,
+        rental_work_site: null,
+        rental_contract_number: null
+      }).eq('id', eqId);
     }
 
-    const { error } = await supabase
+    // 2. Excluir contas a receber atreladas à locação em bills
+    const { error: billsDeleteError } = await supabase
+      .from('bills')
+      .delete()
+      .eq('rental_invoice_id', id);
+
+    if (billsDeleteError) {
+      console.error('[deleteInvoice] Erro ao excluir contas atreladas em bills:', billsDeleteError);
+      throw billsDeleteError;
+    }
+
+    // 3. Desvincular contratos do CRM atrelados a esta locação
+    await supabase
+      .from('crm_deal_contracts')
+      .update({ rental_invoice_id: null })
+      .eq('rental_invoice_id', id);
+
+    // 4. Desvincular negociações do CRM atreladas a esta locação
+    await supabase
+      .from('crm_deals')
+      .update({ rental_invoice_id: null })
+      .eq('rental_invoice_id', id);
+
+    // 5. Desvincular Ordens de Serviço atreladas a esta locação
+    await supabase
+      .from('service_orders')
+      .update({ rental_invoice_id: null })
+      .eq('rental_invoice_id', id);
+
+    // 6. Excluir itens da locação em rental_invoice_equipments
+    await supabase
+      .from('rental_invoice_equipments')
+      .delete()
+      .eq('rental_invoice_id', id);
+
+    // 7. Excluir a locação em rental_invoices
+    const { error: invoiceDeleteError } = await supabase
       .from('rental_invoices')
       .delete()
       .eq('id', id);
 
-    if (error) throw error;
-    return res.status(204).send();
+    if (invoiceDeleteError) throw invoiceDeleteError;
+
+    return res.status(200).json({
+      success: true,
+      message: 'Locação e contas a receber atreladas foram excluídas com sucesso.'
+    });
   } catch (error: any) {
+    console.error('[deleteInvoice] Erro ao excluir locação:', error);
     return res.status(500).json({ error: error.message });
   }
 };
@@ -1054,59 +1111,44 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: 'Locações que já possuem data de devolução não podem ser prorrogadas.' });
     }
 
-    // 3. Obter lista de equipamentos do payload
-    const rawEquipments = Array.isArray(req.body.equipments) ? req.body.equipments : [];
-    if (rawEquipments.length === 0) {
-      return res.status(400).json({ error: 'A prorrogação deve conter pelo menos um equipamento.' });
+    // 3. Obter lista de extensões/novos períodos do payload
+    const rawExtensions = Array.isArray(req.body.extensions)
+      ? req.body.extensions
+      : Array.isArray(req.body.equipments)
+        ? req.body.equipments
+        : [];
+
+    if (rawExtensions.length === 0) {
+      return res.status(400).json({ error: 'A prorrogação deve conter pelo menos um período de equipamento a adicionar.' });
     }
 
-    // 4. Calcular o valor anterior e o novo valor
-    const previousTotal = Number(rental.total_value) || 0;
+    // 4. Validar e preparar itens para inserção em rental_invoice_equipments
+    const itemsToInsert: any[] = [];
+    for (const ext of rawExtensions) {
+      if (!ext.billing_period_start || !ext.billing_period_end) {
+        return res.status(400).json({ error: 'Data de início e fim são obrigatórias para todos os períodos de prorrogação.' });
+      }
+      if (ext.billing_period_start > ext.billing_period_end) {
+        return res.status(400).json({ error: 'A data de início do período não pode ser posterior à data de término.' });
+      }
 
-    let newCostRental = 0;
-    let newCostInsurance = 0;
-    let newCostFreight = 0;
-    let newCostRcd = 0;
-    let newCostThirdParty = 0;
-    let newCostTraining = 0;
+      const itemRental = Number(ext.cost_rental) || 0;
+      const itemInsurance = Number(ext.cost_insurance) || 0;
+      const itemFreight = Number(ext.cost_freight) || 0;
+      const itemRcd = Number(ext.cost_rcd) || 0;
+      const itemThirdParty = Number(ext.cost_third_party) || 0;
+      const itemTraining = Number(ext.cost_training) || 0;
+      const itemTotal = Math.round((itemRental + itemInsurance + itemFreight + itemRcd + itemThirdParty + itemTraining) * 100) / 100;
 
-    for (const eq of rawEquipments) {
-      newCostRental += Number(eq.cost_rental) || 0;
-      newCostInsurance += Number(eq.cost_insurance) || 0;
-      newCostFreight += Number(eq.cost_freight) || 0;
-      newCostRcd += Number(eq.cost_rcd) || 0;
-      newCostThirdParty += Number(eq.cost_third_party) || 0;
-      newCostTraining += Number(eq.cost_training) || 0;
-    }
-
-    const newTotalValue = Math.round((newCostRental + newCostInsurance + newCostFreight + newCostRcd + newCostThirdParty + newCostTraining) * 100) / 100;
-
-    // 5. Validação rigorosa: Não permitir diminuir o valor da locação
-    if (newTotalValue < previousTotal) {
-      return res.status(400).json({
-        error: `O valor total da prorrogação (R$ ${newTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}) não pode ser inferior ao valor anterior da locação (R$ ${previousTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}).`
-      });
-    }
-
-    // 6. Diferença financeira a lançar em contas a receber
-    const diff = Math.round((newTotalValue - previousTotal) * 100) / 100;
-
-    // 7. Determinar novo período final consolidado
-    const ends = rawEquipments.map((e: any) => e.billing_period_end).filter(Boolean).sort();
-    const maxBillingPeriodEnd = ends.length > 0 ? ends[ends.length - 1] : rental.billing_period_end;
-
-    // 8. Atualizar itens em rental_invoice_equipments
-    for (const eq of rawEquipments) {
-      const itemRental = Number(eq.cost_rental) || 0;
-      const itemInsurance = Number(eq.cost_insurance) || 0;
-      const itemFreight = Number(eq.cost_freight) || 0;
-      const itemRcd = Number(eq.cost_rcd) || 0;
-      const itemThirdParty = Number(eq.cost_third_party) || 0;
-      const itemTraining = Number(eq.cost_training) || 0;
-      const itemTotal = itemRental + itemInsurance + itemFreight + itemRcd + itemThirdParty + itemTraining;
-
-      const updateItemPayload: any = {
-        billing_period_end: eq.billing_period_end || maxBillingPeriodEnd,
+      itemsToInsert.push({
+        rental_invoice_id: id,
+        equipment_id: ext.equipment_id || null,
+        equipment_name: ext.equipment_name || null,
+        equipment_type: ext.equipment_type || null,
+        equipment_size: ext.equipment_size || null,
+        asset_number: ext.asset_number || null,
+        billing_period_start: ext.billing_period_start,
+        billing_period_end: ext.billing_period_end,
         cost_rental: itemRental,
         cost_insurance: itemInsurance,
         cost_freight: itemFreight,
@@ -1114,43 +1156,62 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
         cost_third_party: itemThirdParty,
         cost_training: itemTraining,
         total_value: itemTotal,
-        updated_at: new Date().toISOString()
-      };
-      if (eq.notes !== undefined) {
-        updateItemPayload.notes = eq.notes;
-      }
+        notes: ext.notes || 'Prorrogação de locação',
+      });
+    }
 
-      if (eq.id) {
-        await supabase
-          .from('rental_invoice_equipments')
-          .update(updateItemPayload)
-          .eq('id', eq.id);
-      } else if (eq.equipment_id) {
-        await supabase
-          .from('rental_invoice_equipments')
-          .update(updateItemPayload)
-          .eq('rental_invoice_id', id)
-          .eq('equipment_id', eq.equipment_id);
-      }
+    // 5. Inserir novos períodos como novos registros em rental_invoice_equipments
+    const { data: insertedItems, error: insertError } = await supabase
+      .from('rental_invoice_equipments')
+      .insert(itemsToInsert)
+      .select();
 
-      // Atualizar status do equipamento no inventário
-      if (eq.equipment_id) {
-        await updateEquipmentItemStatus(supabase, eq.equipment_id, eq.billing_period_end || maxBillingPeriodEnd, null);
+    if (insertError) {
+      console.error('[extendInvoice] Erro ao inserir novo período em rental_invoice_equipments:', insertError);
+      throw insertError;
+    }
+
+    // 6. Atualizar status dos equipamentos no inventário para 'Locado'
+    for (const ext of rawExtensions) {
+      if (ext.equipment_id) {
+        await updateEquipmentItemStatus(supabase, ext.equipment_id, ext.billing_period_end, null);
       }
     }
+
+    // 7. Calcular total deste novo período / prorrogação
+    const extensionTotal = Math.round(itemsToInsert.reduce((acc, it) => acc + (Number(it.total_value) || 0), 0) * 100) / 100;
+
+    // 8. Buscar TODOS os itens da locação para consolidar totais atualizados em rental_invoices
+    const { data: allItems, error: allItemsError } = await supabase
+      .from('rental_invoice_equipments')
+      .select('*')
+      .eq('rental_invoice_id', id);
+
+    if (allItemsError) throw allItemsError;
+
+    const consolidatedCostRental = (allItems || []).reduce((acc: number, it: any) => acc + (Number(it.cost_rental) || 0), 0);
+    const consolidatedCostInsurance = (allItems || []).reduce((acc: number, it: any) => acc + (Number(it.cost_insurance) || 0), 0);
+    const consolidatedCostFreight = (allItems || []).reduce((acc: number, it: any) => acc + (Number(it.cost_freight) || 0), 0);
+    const consolidatedCostRcd = (allItems || []).reduce((acc: number, it: any) => acc + (Number(it.cost_rcd) || 0), 0);
+    const consolidatedCostThirdParty = (allItems || []).reduce((acc: number, it: any) => acc + (Number(it.cost_third_party) || 0), 0);
+    const consolidatedCostTraining = (allItems || []).reduce((acc: number, it: any) => acc + (Number(it.cost_training) || 0), 0);
+    const consolidatedTotalValue = Math.round((consolidatedCostRental + consolidatedCostInsurance + consolidatedCostFreight + consolidatedCostRcd + consolidatedCostThirdParty + consolidatedCostTraining) * 100) / 100;
+
+    const allEnds = (allItems || []).map((it: any) => it.billing_period_end).filter(Boolean).sort();
+    const maxBillingPeriodEnd = allEnds.length > 0 ? allEnds[allEnds.length - 1] : rental.billing_period_end;
 
     // 9. Atualizar cabeçalho da locação em rental_invoices
     const { data: updatedInvoice, error: updateInvoiceError } = await supabase
       .from('rental_invoices')
       .update({
         billing_period_end: maxBillingPeriodEnd,
-        cost_rental: newCostRental,
-        cost_insurance: newCostInsurance,
-        cost_freight: newCostFreight,
-        cost_rcd: newCostRcd,
-        cost_third_party: newCostThirdParty,
-        cost_training: newCostTraining,
-        total_value: newTotalValue,
+        cost_rental: consolidatedCostRental,
+        cost_insurance: consolidatedCostInsurance,
+        cost_freight: consolidatedCostFreight,
+        cost_rcd: consolidatedCostRcd,
+        cost_third_party: consolidatedCostThirdParty,
+        cost_training: consolidatedCostTraining,
+        total_value: consolidatedTotalValue,
         updated_at: new Date().toISOString()
       })
       .eq('id', id)
@@ -1159,10 +1220,10 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
 
     if (updateInvoiceError) throw updateInvoiceError;
 
-    // 10. Lançar conta a receber em bills caso haja diferença de valor
+    // 10. Lançar registro correspondente em bills com o valor deste novo período
     let createdBill = null;
-    if (diff > 0) {
-      const todayStr = new Date().toISOString().split('T')[0];
+    if (extensionTotal > 0) {
+      const dueDate = req.body.due_date || new Date().toISOString().split('T')[0];
       const billDescription = updatedInvoice.invoice_number
         ? `Prorrogação de Locação #${updatedInvoice.invoice_number}`
         : 'Prorrogação de Locação';
@@ -1176,10 +1237,10 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
           client_id: updatedInvoice.client_id || null,
           counterparty_name: updatedInvoice.client_name || null,
           description: billDescription,
-          gross_value: diff,
+          gross_value: extensionTotal,
           fee_amount: 0,
-          net_value: diff,
-          due_date: todayStr,
+          net_value: extensionTotal,
+          due_date: dueDate,
           status: 'Pendente',
           reconciled_at: null,
           created_by: req.user?.id || null,
@@ -1210,7 +1271,7 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
     }
 
     if (dealId) {
-      await supabase.from('crm_deals').update({ value: newTotalValue }).eq('id', dealId);
+      await supabase.from('crm_deals').update({ value: consolidatedTotalValue }).eq('id', dealId);
 
       const { data: formRecord } = await supabase
         .from('crm_deal_contract_forms')
@@ -1234,14 +1295,13 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
           .update({
             contract_duration_days: durationDays,
             period_end: maxBillingPeriodEnd ? String(maxBillingPeriodEnd).split('T')[0] : null,
-            cost_rental: newCostRental,
-            cost_insurance: newCostInsurance,
-            cost_freight: newCostFreight,
-            cost_rcd: newCostRcd,
-            cost_third_party: newCostThirdParty,
-            cost_training: newCostTraining,
-            cost_total: newTotalValue,
-            equipment_model: `[EQUIPMENTS_JSON]:${JSON.stringify(rawEquipments)}`,
+            cost_rental: consolidatedCostRental,
+            cost_insurance: consolidatedCostInsurance,
+            cost_freight: consolidatedCostFreight,
+            cost_rcd: consolidatedCostRcd,
+            cost_third_party: consolidatedCostThirdParty,
+            cost_training: consolidatedCostTraining,
+            cost_total: consolidatedTotalValue,
             updated_by: req.user?.id
           })
           .eq('id', formRecord.id);
@@ -1250,12 +1310,13 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
 
     return res.json({
       success: true,
-      message: diff > 0
-        ? `Locação prorrogada com sucesso! Conta a Receber de R$ ${diff.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} lançada.`
-        : `Locação prorrogada com sucesso!`,
+      message: extensionTotal > 0
+        ? `Prorrogação realizada com sucesso! Novo período registrado e Conta a Receber de R$ ${extensionTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} lançada.`
+        : `Prorrogação realizada com sucesso! Novo período registrado na locação.`,
       rental: updatedInvoice,
       bill: createdBill,
-      difference: diff
+      insertedItems,
+      extensionTotal
     });
   } catch (error: any) {
     console.error('[extendInvoice] Erro:', error);

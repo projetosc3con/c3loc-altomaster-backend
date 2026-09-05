@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import * as rentalController from '../controllers/rentalController';
+import { authorize } from '../middleware/auth';
 
 const router = Router();
 
@@ -11,6 +12,6 @@ router.post('/:id/extend', rentalController.extendInvoice);
 router.get('/:id', rentalController.getInvoiceById);
 router.post('/', rentalController.createInvoice);
 router.put('/:id', rentalController.updateInvoice);
-router.delete('/:id', rentalController.deleteInvoice);
+router.delete('/:id', authorize(['Administrador', 'Diretoria']), rentalController.deleteInvoice);
 
 export default router;
