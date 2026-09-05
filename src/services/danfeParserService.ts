@@ -247,8 +247,8 @@ export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
 
     const lines = prodSection.split('\n').map((l) => l.trim()).filter(Boolean);
 
-    // Linha de produto típica: [CÓDIGO] [DESCRIÇÃO] [NCM 8 dig] [CST] [CFOP 4 dig] [UN] [QTD] [VLR UNIT] [VLR TOT]
-    const itemRegex = /^(?:(\S+)\s+)?(.+?)\s+(\d{8}|\d{4}\.\d{2}\.\d{2})\s+(\d{3,4})\s+([1-7]\d{3})\s+([A-Za-z]{1,4})\s+([0-9.,]+)\s+([0-9.,]+)\s+([0-9.,]+)/;
+    // Linha de produto típica: [CÓDIGO] [DESCRIÇÃO] [NCM 8 dig] [CST] [CFOP 4 dig] [UN] [QTD] [VLR UNIT] [VLR DESC (opcional)] [VLR TOT]
+    const itemRegex = /^(?:(\S+)\s+)?(.+?)\s+(\d{8}|\d{4}\.\d{2}\.\d{2})\s+(\d{3,4})\s+([1-7]\d{3})\s+([A-Za-z0-9/²³º°]{1,10})\s+([0-9.,]+)\s+([0-9.,]+)(?:\s+([0-9.,]+))?(?:\s+([0-9.,]+))?/;
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
@@ -260,10 +260,35 @@ export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
         const ncm = match[3].replace(/\D/g, '');
         const cst = match[4];
         const cfop = match[5];
-        const unit = normalizeUnit(match[6]);
+        const rawUnit = match[6];
+        const unit = normalizeUnit(rawUnit);
         const quantity = parseMoney(match[7]);
         const unitValue = parseMoney(match[8]);
-        const totalValue = parseMoney(match[9]);
+
+        const num3 = match[9] ? parseMoney(match[9]) : null;
+        const num4 = match[10] ? parseMoney(match[10]) : null;
+
+        let discountValue = 0;
+        let totalValue = 0;
+
+        const calcExpected = Number((quantity * unitValue).toFixed(2));
+
+        if (num4 !== null && num3 !== null) {
+          // Layout com coluna de desconto: QTDE, VLR_UNIT, VLR_DESC, VLR_TOT
+          if (Math.abs((calcExpected - num3) - num4) <= 0.05 || (num3 === 0 && Math.abs(calcExpected - num4) <= 0.05)) {
+            discountValue = num3;
+            totalValue = num4;
+          } else if (Math.abs(calcExpected - num3) <= 0.05) {
+            // Se num3 for o total líquido
+            totalValue = num3;
+          } else {
+            totalValue = num4 > 0 ? num4 : calcExpected;
+          }
+        } else if (num3 !== null) {
+          totalValue = num3 > 0 ? num3 : calcExpected;
+        } else {
+          totalValue = calcExpected;
+        }
 
         const inference = inferSuggestedDestination({
           description,
@@ -282,9 +307,9 @@ export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
           unit,
           quantity: quantity > 0 ? quantity : 1,
           unit_value: unitValue > 0 ? unitValue : totalValue,
-          total_value: totalValue > 0 ? totalValue : unitValue * (quantity || 1),
-          discount_value: 0,
-          net_item_value: totalValue > 0 ? totalValue : unitValue * (quantity || 1),
+          total_value: totalValue > 0 ? totalValue : Number((unitValue * (quantity || 1)).toFixed(2)),
+          discount_value: discountValue,
+          net_item_value: totalValue > 0 ? totalValue : Number((unitValue * (quantity || 1)).toFixed(2)),
           tax_details: {},
           suggested_destination: inference.destination,
           extracted_serial_number: inference.serial_number,
