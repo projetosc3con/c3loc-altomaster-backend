@@ -1,7 +1,6 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
-import { buildContractSnapshot } from './crmController';
 
 const updateEquipmentItemStatus = async (
   supabase: any,
@@ -1195,7 +1194,7 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
       }
     }
 
-    // 11. Gerar nova versão do contrato de locação (deal_contracts)
+    // 11. Sincronizar CRM Deal e Form (se existirem) com os novos valores e prazos
     let dealId = updatedInvoice.deal_id;
     if (!dealId) {
       const { data: existingDeal } = await supabase
@@ -1210,154 +1209,31 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
       }
     }
 
-    if (!dealId) {
-      const { data: wonStage } = await supabase
-        .from('crm_pipeline_stages')
-        .select('id, pipeline_id')
-        .eq('is_won', true)
-        .order('position', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      const titleParts = [updatedInvoice.equipment_name, updatedInvoice.asset_number].filter(Boolean);
-      const title = titleParts.length > 0 ? titleParts.join(' - ') : `Locação Nº ${updatedInvoice.invoice_number || updatedInvoice.id.substring(0, 8)}`;
-
-      const { data: newDeal } = await supabase
-        .from('crm_deals')
-        .insert({
-          pipeline_id: wonStage?.pipeline_id || null,
-          stage_id: wonStage?.id || null,
-          client_id: updatedInvoice.client_id || null,
-          rental_invoice_id: updatedInvoice.id,
-          title: title,
-          value: newTotalValue,
-          expected_close_date: updatedInvoice.billing_period_start ? updatedInvoice.billing_period_start.split('T')[0] : new Date().toISOString().split('T')[0],
-          closed_at: new Date().toISOString(),
-          owner_id: req.user?.id || updatedInvoice.created_by || null,
-          description: `Locação Nº ${updatedInvoice.invoice_number || updatedInvoice.id.substring(0, 8)}`,
-        })
-        .select()
-        .single();
-
-      if (newDeal) {
-        dealId = newDeal.id;
-        await supabase.from('rental_invoices').update({ deal_id: dealId }).eq('id', id);
-      }
-    } else {
+    if (dealId) {
       await supabase.from('crm_deals').update({ value: newTotalValue }).eq('id', dealId);
-    }
 
-    // Buscar contratos existentes para determinar o número e a próxima versão
-    let contractQuery = supabase
-      .from('crm_deal_contracts')
-      .select('*')
-      .neq('status', 'Cancelado')
-      .order('created_at', { ascending: false });
-
-    if (dealId) {
-      contractQuery = contractQuery.or(`rental_invoice_id.eq.${id},deal_id.eq.${dealId}`);
-    } else {
-      contractQuery = contractQuery.eq('rental_invoice_id', id);
-    }
-
-    const { data: existingContracts } = await contractQuery;
-    const latestContract = existingContracts && existingContracts.length > 0 ? existingContracts[0] : null;
-
-    let contractNumber = latestContract?.contract_number;
-    if (!contractNumber) {
-      const { data: nextNum } = await supabase.rpc('get_next_contract_number');
-      contractNumber = nextNum || `${new Date().getFullYear()}-${id.substring(0, 4).toUpperCase()}`;
-    }
-
-    // Próxima versão
-    let maxVersion = 1;
-    if (existingContracts && existingContracts.length > 0) {
-      for (const c of existingContracts) {
-        const v = Number(c.version);
-        if (!isNaN(v) && v >= maxVersion) maxVersion = v + 1;
-      }
-    }
-    const newVersion = maxVersion;
-
-    // Buscar crm_deal_contract_forms e dados do cliente para compor snapshot
-    let formRecord: any = null;
-    if (dealId) {
-      const { data: cf } = await supabase
+      const { data: formRecord } = await supabase
         .from('crm_deal_contract_forms')
-        .select('*')
+        .select('id')
         .eq('deal_id', dealId)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
-      formRecord = cf;
-    }
 
-    let clientData: any = null;
-    if (updatedInvoice.client_id) {
-      const { data: cd } = await supabase
-        .from('clients')
-        .select('*')
-        .eq('id', updatedInvoice.client_id)
-        .maybeSingle();
-      clientData = cd;
-    }
-
-    const clientAddress = clientData ? [
-      clientData.address_street,
-      clientData.address_number,
-      clientData.address_complement,
-      clientData.address_city && clientData.address_state ? `${clientData.address_city}/${clientData.address_state}` : clientData.address_city,
-      clientData.address_zip ? `CEP: ${clientData.address_zip}` : ''
-    ].filter(Boolean).join(', ') : (formRecord?.locatario_address_full || '');
-
-    const equipDescription = rawEquipments
-      .map((e: any) => `${e.equipment_name || 'Equipamento'} (${e.asset_number || ''})`.trim())
-      .join(', ');
-    const equipModel = Array.from(new Set(rawEquipments.map((e: any) => e.equipment_type).filter(Boolean))).join(', ');
-
-    let durationDays = 30;
-    if (updatedInvoice.billing_period_start && maxBillingPeriodEnd) {
-      const start = new Date(updatedInvoice.billing_period_start).getTime();
-      const end = new Date(maxBillingPeriodEnd).getTime();
-      const dayDiff = Math.round((end - start) / (1000 * 60 * 60 * 24));
-      if (dayDiff >= 0) durationDays = dayDiff + 1;
-    }
-
-    const updatedFormData = {
-      deal_id: dealId || null,
-      contract_date: new Date().toISOString().split('T')[0],
-      locatario_company_name: updatedInvoice.client_name || clientData?.company_name || formRecord?.locatario_company_name || '',
-      locatario_cnpj: updatedInvoice.cnpj || clientData?.cnpj || formRecord?.locatario_cnpj || '',
-      locatario_state_registration: clientData?.state_subscription || formRecord?.locatario_state_registration || '',
-      locatario_address_full: clientAddress,
-      equipment_description: equipDescription,
-      equipment_model: equipModel,
-      contract_duration_days: durationDays,
-      period_start: updatedInvoice.billing_period_start ? String(updatedInvoice.billing_period_start).split('T')[0] : null,
-      period_end: maxBillingPeriodEnd ? String(maxBillingPeriodEnd).split('T')[0] : null,
-      cost_rental: newCostRental,
-      cost_insurance: newCostInsurance,
-      cost_freight: newCostFreight,
-      cost_rcd: newCostRcd,
-      cost_third_party: newCostThirdParty,
-      cost_training: newCostTraining,
-      cost_total: newTotalValue,
-      billing_interval_days: formRecord?.billing_interval_days || '28 dias',
-      work_site: updatedInvoice.work_site || formRecord?.work_site || '',
-      site_contact_name: clientData?.contact_name || formRecord?.site_contact_name || '',
-      site_contact_phone: clientData?.phone || formRecord?.site_contact_phone || '',
-      notes: updatedInvoice.notes || formRecord?.notes || '',
-      observations: updatedInvoice.notes || formRecord?.observations || '',
-      equipments: rawEquipments
-    };
-
-    if (dealId) {
       if (formRecord) {
+        let durationDays = 30;
+        if (updatedInvoice.billing_period_start && maxBillingPeriodEnd) {
+          const start = new Date(updatedInvoice.billing_period_start).getTime();
+          const end = new Date(maxBillingPeriodEnd).getTime();
+          const dayDiff = Math.round((end - start) / (1000 * 60 * 60 * 24));
+          if (dayDiff >= 0) durationDays = dayDiff + 1;
+        }
+
         await supabase
           .from('crm_deal_contract_forms')
           .update({
             contract_duration_days: durationDays,
-            period_end: updatedFormData.period_end,
+            period_end: maxBillingPeriodEnd ? String(maxBillingPeriodEnd).split('T')[0] : null,
             cost_rental: newCostRental,
             cost_insurance: newCostInsurance,
             cost_freight: newCostFreight,
@@ -1369,55 +1245,16 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
             updated_by: req.user?.id
           })
           .eq('id', formRecord.id);
-      } else {
-        const { data: createdCf } = await supabase
-          .from('crm_deal_contract_forms')
-          .insert({
-            ...updatedFormData,
-            form_status: 'Pronto para Gerar',
-            equipment_model: `[EQUIPMENTS_JSON]:${JSON.stringify(rawEquipments)}`,
-            created_by: req.user?.id
-          })
-          .select()
-          .single();
-        formRecord = createdCf;
       }
-    }
-
-    const snapshot = await buildContractSnapshot(updatedFormData, contractNumber);
-
-    const { data: newContractRecord, error: newContractError } = await supabase
-      .from('crm_deal_contracts')
-      .insert({
-        deal_id: dealId || null,
-        rental_invoice_id: updatedInvoice.id,
-        contract_form_id: formRecord?.id || null,
-        contract_number: contractNumber,
-        version: newVersion,
-        status: 'Gerado',
-        generated_by: req.user?.id || null,
-        snapshot
-      })
-      .select()
-      .single();
-
-    if (newContractError) {
-      console.error('[extendInvoice] Erro ao criar nova versão do contrato:', newContractError);
-      throw newContractError;
-    }
-
-    if (dealId && newContractRecord) {
-      await supabase.from('crm_deals').update({ active_contract_id: newContractRecord.id }).eq('id', dealId);
     }
 
     return res.json({
       success: true,
       message: diff > 0
-        ? `Locação prorrogada com sucesso! Nova versão do contrato (v${newVersion}) gerada e Conta a Receber de R$ ${diff.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} lançada.`
-        : `Locação prorrogada com sucesso! Nova versão do contrato (v${newVersion}) gerada.`,
+        ? `Locação prorrogada com sucesso! Conta a Receber de R$ ${diff.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} lançada.`
+        : `Locação prorrogada com sucesso!`,
       rental: updatedInvoice,
       bill: createdBill,
-      contract: newContractRecord,
       difference: diff
     });
   } catch (error: any) {
