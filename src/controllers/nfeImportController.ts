@@ -2,17 +2,25 @@ import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient } from '../config/supabase';
 import { parseNfeXml, ParsedNfeData, normalizeUnit } from '../services/nfeParserService';
+import { parseDanfePdf } from '../services/danfeParserService';
 import { recordStockMovement } from '../services/stockMovementService';
 import { getCategoryPrefix } from './partController';
 
 export const parseXml = async (req: AuthRequest, res: Response) => {
   try {
-    const { xml } = req.body;
-    if (!xml || typeof xml !== 'string') {
-      return res.status(400).json({ error: 'Conteúdo XML não fornecido ou inválido.' });
-    }
+    const { xml, pdf_base64 } = req.body;
 
-    const parsedData = parseNfeXml(xml);
+    let parsedData: ParsedNfeData;
+
+    if (pdf_base64 && typeof pdf_base64 === 'string') {
+      const cleanBase64 = pdf_base64.replace(/^data:application\/pdf;base64,/, '');
+      const pdfBuffer = Buffer.from(cleanBase64, 'base64');
+      parsedData = await parseDanfePdf(pdfBuffer);
+    } else if (xml && typeof xml === 'string') {
+      parsedData = parseNfeXml(xml);
+    } else {
+      return res.status(400).json({ error: 'Nenhum arquivo XML ou PDF fornecido ou formato inválido.' });
+    }
 
     // Check if access_key is already in nfe_imports
     const supabase = getSupabaseUserClient(req.token!);
@@ -28,8 +36,8 @@ export const parseXml = async (req: AuthRequest, res: Response) => {
       existing_import: existingImport || null,
     });
   } catch (error: any) {
-    console.error('[parseXml] Erro ao analisar XML da NF-e:', error);
-    return res.status(400).json({ error: error.message || 'Erro ao processar o arquivo XML da NF-e.' });
+    console.error('[parseXml] Erro ao analisar documento da NF-e:', error);
+    return res.status(400).json({ error: error.message || 'Erro ao processar o arquivo da NF-e.' });
   }
 };
 
@@ -70,9 +78,15 @@ export const processImport = async (req: AuthRequest, res: Response) => {
 
     const items = parsed_data.items || [];
     const itemsConfigMap = new Map();
-    (items_config || []).forEach((ic: any) => {
-      itemsConfigMap.set(ic.item_index, ic);
-    });
+    if (Array.isArray(items_config)) {
+      items_config.forEach((ic: any) => {
+        itemsConfigMap.set(ic.item_index, ic);
+      });
+    } else if (req.body.destinations && typeof req.body.destinations === 'object') {
+      Object.entries(req.body.destinations).forEach(([idxStr, destConfig]: [string, any]) => {
+        itemsConfigMap.set(Number(idxStr), { item_index: Number(idxStr), ...destConfig });
+      });
+    }
 
     // 1. Process Items
     for (const item of items) {

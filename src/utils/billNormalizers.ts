@@ -19,7 +19,7 @@ export function normalizeBill(row: any): BillStatementItem {
     rental_invoice_id: row.rental_invoice_id ?? null,
     description: row.description,
     invoice_url: row.payment?.invoice_url ?? null,
-    bank_slip_url: row.payment?.bank_slip_url ?? null,
+    bank_slip_url: row.bank_slip_url ?? row.payment?.bank_slip_url ?? row.bank_raw_snapshot?.bank_slip_url ?? null,
     is_reconciled: row.reconciled_at != null || row.bank_transaction_date != null,
     created_by_name: row.creator?.full_name ?? null,
     created_by_photo: row.creator?.photo_url ?? null,

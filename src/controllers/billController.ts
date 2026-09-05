@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { Response } from 'express';
 import { getSupabaseUserClient } from '../config/supabase';
 import { AuthRequest } from '../middleware/auth';
@@ -23,9 +24,9 @@ import { normalizeBill, normalizePendingPayment } from '../utils/billNormalizers
 // Um payment só some daqui quando o bill correspondente é criado de fato
 // (não quando payments.status muda pra RECEIVED), porque o pedido de
 // repasse ao Asaas pode falhar entre as duas coisas — nesse caso o payment
-function groupNfeBills(items: BillStatementItem[]): BillStatementItem[] {
+function groupBillsWithInstallments(items: BillStatementItem[]): BillStatementItem[] {
   const result: BillStatementItem[] = [];
-  const nfeGroups = new Map<string, BillStatementItem[]>();
+  const groups = new Map<string, BillStatementItem[]>();
 
   for (const item of items) {
     if (item.origin === 'NFE' && item.type === 'payable') {
@@ -37,16 +38,23 @@ function groupNfeBills(items: BillStatementItem[]): BillStatementItem[] {
         item.id;
 
       const groupKey = `nfe_${accessKey}`;
-      if (!nfeGroups.has(groupKey)) {
-        nfeGroups.set(groupKey, []);
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, []);
       }
-      nfeGroups.get(groupKey)!.push(item);
+      groups.get(groupKey)!.push(item);
+    } else if (item.origin === 'MANUAL' && item.type === 'payable' && (item.raw as any)?.bank_raw_snapshot?.group_id) {
+      const groupId = (item.raw as any).bank_raw_snapshot.group_id;
+      const groupKey = `manual_${groupId}`;
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, []);
+      }
+      groups.get(groupKey)!.push(item);
     } else {
       result.push(item);
     }
   }
 
-  for (const [, installments] of nfeGroups.entries()) {
+  for (const [groupKey, installments] of groups.entries()) {
     // Ordenar parcelas por installment_number ou due_date crescente
     installments.sort((a, b) => {
       const numA = Number((a.raw as any)?.bank_raw_snapshot?.installment_number) || 0;
@@ -69,10 +77,10 @@ function groupNfeBills(items: BillStatementItem[]): BillStatementItem[] {
 
     const first = installments[0];
     const rawSnap = (first.raw as any)?.bank_raw_snapshot || {};
-    const invoiceNum = rawSnap.invoice_number ? `NF-e ${rawSnap.invoice_number}` : (first.invoice_number || 'NF-e');
+    const isNfe = groupKey.startsWith('nfe_');
     const totalCount = installments.length;
 
-    const rawTotalInvoice = Number(rawSnap.total_invoice);
+    const rawTotalInvoice = Number(rawSnap.total_value || rawSnap.total_invoice);
     const sumGross = installments.reduce((acc, curr) => acc + (Number(curr.gross_value) || 0), 0);
     const totalGross = (!isNaN(rawTotalInvoice) && rawTotalInvoice > 0) ? rawTotalInvoice : Math.round(sumGross * 100) / 100;
     const sumNet = installments.reduce((acc, curr) => acc + (Number(curr.net_value ?? curr.gross_value) || 0), 0);
@@ -99,12 +107,25 @@ function groupNfeBills(items: BillStatementItem[]): BillStatementItem[] {
       }
     }
 
-    const counterparty = first.counterparty_name || first.client_name || rawSnap.issuer_name || 'Fornecedor NF-e';
+    let invoiceNum: string;
+    let counterparty: string;
+    let descriptionText: string;
+
+    if (isNfe) {
+      invoiceNum = rawSnap.invoice_number ? `NF-e ${rawSnap.invoice_number}` : (first.invoice_number || 'NF-e');
+      counterparty = first.counterparty_name || first.client_name || rawSnap.issuer_name || 'Fornecedor NF-e';
+      descriptionText = `${invoiceNum} (${totalCount} parcelas) - ${counterparty}`;
+    } else {
+      const baseDesc = rawSnap.original_description || first.description?.replace(/ - Parcela \d+\/\d+.*$/, '') || 'Lançamento Manual';
+      invoiceNum = baseDesc;
+      counterparty = first.counterparty_name || first.client_name || 'Fornecedor';
+      descriptionText = `${baseDesc} (${totalCount} parcelas)${counterparty ? ' - ' + counterparty : ''}`;
+    }
 
     const groupedItem: BillStatementItem = {
       ...first,
       id: first.id,
-      description: `${invoiceNum} (${totalCount} parcelas) - ${counterparty}`,
+      description: descriptionText,
       invoice_number: invoiceNum,
       counterparty_name: counterparty,
       gross_value: totalGross,
@@ -117,6 +138,7 @@ function groupNfeBills(items: BillStatementItem[]): BillStatementItem[] {
       installments_count: totalCount,
       paid_installments_count: paidCount,
       access_key: first.access_key || (first.raw as any)?.barcode || rawSnap.access_key || null,
+      bank_slip_url: first.bank_slip_url || (first.raw as any)?.bank_slip_url || installments.find((i) => i.bank_slip_url)?.bank_slip_url || null,
     };
 
     result.push(groupedItem);
@@ -124,6 +146,8 @@ function groupNfeBills(items: BillStatementItem[]): BillStatementItem[] {
 
   return result;
 }
+
+const groupNfeBills = groupBillsWithInstallments;
 
 export const listBills = async (req: AuthRequest, res: Response) => {
   try {
@@ -244,7 +268,8 @@ export const createBill = async (req: AuthRequest, res: Response) => {
     const {
       type, counterparty_name, description, barcode,
       gross_value, due_date, status, is_reconciled, already_settled, settled_date,
-      bank_transaction_date, bank_raw_snapshot,
+      bank_transaction_date, bank_raw_snapshot, payment_type, installments,
+      bank_slip_url,
     } = req.body as CreateBillPayload;
 
     if (type !== 'receivable' && type !== 'payable') {
@@ -270,6 +295,57 @@ export const createBill = async (req: AuthRequest, res: Response) => {
       reconciledAt = settled_date ? new Date(settled_date as string).toISOString() : new Date().toISOString();
     }
 
+    // MULTI-PARCELAS MANUAL
+    if (payment_type === 'parcelado' && Array.isArray(installments) && installments.length > 1) {
+      const groupId = crypto.randomUUID();
+      const totalCount = installments.length;
+      const baseDesc = description?.trim() || 'Lançamento Manual';
+
+      const billsToInsert = installments.map((inst, index) => {
+        const instNum = inst.installment_number || (index + 1);
+        const instGross = Number(inst.gross_value) || 0;
+        const instDueDate = inst.due_date ? inst.due_date.split('T')[0] : due_date;
+        const instDesc = `${baseDesc} - Parcela ${instNum}/${totalCount}${counterparty_name ? ' - ' + counterparty_name.trim() : ''}`;
+
+        return {
+          origin: 'MANUAL' as const,
+          type,
+          client_id: null,
+          counterparty_name: counterparty_name?.trim() || null,
+          description: instDesc,
+          gross_value: instGross,
+          fee_amount: 0,
+          net_value: instGross,
+          due_date: instDueDate,
+          status: resolvedStatus,
+          reconciled_at: reconciledAt,
+          bank_transaction_date: bank_transaction_date || null,
+          bank_slip_url: bank_slip_url || null,
+          bank_raw_snapshot: {
+            source: 'MANUAL_INSTALLMENT',
+            group_id: groupId,
+            installment_number: instNum,
+            total_installments: totalCount,
+            total_value: gross_value,
+            original_description: baseDesc,
+            ...(bank_raw_snapshot || {}),
+          },
+          created_by: req.user?.id || req.body.created_by || null,
+          ...(barcode ? { barcode: barcode.trim() } : {}),
+        };
+      });
+
+      const { data: insertedBills, error: insertError } = await supabase
+        .from('bills')
+        .insert(billsToInsert)
+        .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
+        .order('due_date', { ascending: true });
+
+      if (insertError) throw insertError;
+
+      return res.status(201).json(normalizeBill(insertedBills[0]));
+    }
+
     // Lançamento manual não vincula a um cliente cadastrado — apenas um
     // nome livre (counterparty_name), tanto pra conta a pagar (fornecedor)
     // quanto a receber (quem vai pagar).
@@ -288,13 +364,14 @@ export const createBill = async (req: AuthRequest, res: Response) => {
         status: resolvedStatus,
         reconciled_at: reconciledAt,
         bank_transaction_date: bank_transaction_date || null,
+        bank_slip_url: bank_slip_url || null,
         bank_raw_snapshot: bank_raw_snapshot || null,
         created_by: req.user?.id || req.body.created_by || null,
         // Coluna `barcode` só existe depois da migração
         // `ALTER TABLE bills ADD COLUMN barcode text;` — incluída apenas
         // quando informada pra não quebrar lançamentos sem código de barras
         // caso a migração ainda não tenha rodado.
-        ...(barcode ? { barcode } : {}),
+        ...(barcode ? { barcode: barcode.trim() } : {}),
       })
       .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
       .single();
@@ -311,7 +388,7 @@ export const updateBill = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const { status, is_reconciled } = req.body;
+    const { status, is_reconciled, bank_slip_url } = req.body;
 
     // Buscar bill atual para validar existência e origem
     const { data: currentBill, error: fetchError } = await supabase
@@ -330,6 +407,10 @@ export const updateBill = async (req: AuthRequest, res: Response) => {
 
     if (status !== undefined) {
       updatePayload.status = status;
+    }
+
+    if (bank_slip_url !== undefined) {
+      updatePayload.bank_slip_url = bank_slip_url;
     }
 
     if (is_reconciled !== undefined) {
@@ -352,6 +433,26 @@ export const updateBill = async (req: AuthRequest, res: Response) => {
 
     if (updateError) throw updateError;
 
+    // Se pertence a um grupo de parcelas manuais, atualizar bank_slip_url nas parcelas irmãs
+    const groupId = (currentBill.bank_raw_snapshot as any)?.group_id;
+    if (groupId && bank_slip_url !== undefined) {
+      const { data: siblingBills } = await supabase
+        .from('bills')
+        .select('id, bank_raw_snapshot')
+        .eq('origin', 'MANUAL');
+
+      const idsToUpdate = (siblingBills || [])
+        .filter((b: any) => b.bank_raw_snapshot?.group_id === groupId && b.id !== id)
+        .map((b: any) => b.id);
+
+      if (idsToUpdate.length > 0) {
+        await supabase
+          .from('bills')
+          .update({ bank_slip_url, updated_at: new Date().toISOString() })
+          .in('id', idsToUpdate);
+      }
+    }
+
     return res.json(normalizeBill(updated));
   } catch (error: any) {
     console.error('[updateBill] Erro:', error.message);
@@ -367,7 +468,7 @@ export const deleteBill = async (req: AuthRequest, res: Response) => {
     // Buscar bill atual para validar existência e origem
     const { data: currentBill, error: fetchError } = await supabase
       .from('bills')
-      .select('id, origin')
+      .select('id, origin, bank_raw_snapshot')
       .eq('id', id)
       .single();
 
@@ -379,12 +480,34 @@ export const deleteBill = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: 'Apenas lançamentos de origem MANUAL podem ser excluídos diretamente.' });
     }
 
-    const { error: deleteError } = await supabase
-      .from('bills')
-      .delete()
-      .eq('id', id);
+    const groupId = (currentBill.bank_raw_snapshot as any)?.group_id;
+    if (groupId) {
+      // Se pertence a um grupo de parcelas manuais, excluir todas as parcelas do grupo
+      const { data: siblingBills } = await supabase
+        .from('bills')
+        .select('id, bank_raw_snapshot')
+        .eq('origin', 'MANUAL');
 
-    if (deleteError) throw deleteError;
+      const idsToDelete = (siblingBills || [])
+        .filter((b: any) => b.bank_raw_snapshot?.group_id === groupId)
+        .map((b: any) => b.id);
+
+      if (idsToDelete.length > 0) {
+        const { error: deleteGroupError } = await supabase
+          .from('bills')
+          .delete()
+          .in('id', idsToDelete);
+
+        if (deleteGroupError) throw deleteGroupError;
+      }
+    } else {
+      const { error: deleteError } = await supabase
+        .from('bills')
+        .delete()
+        .eq('id', id);
+
+      if (deleteError) throw deleteError;
+    }
 
     return res.json({ success: true, message: 'Lançamento excluído com sucesso.' });
   } catch (error: any) {

@@ -72,7 +72,7 @@ export interface ParsedNfeData {
   additional_info?: string;
 }
 
-function inferSuggestedDestination(item: {
+export function inferSuggestedDestination(item: {
   description: string;
   ncm: string;
   cfop: string;
