@@ -164,7 +164,7 @@ export const listBills = async (req: AuthRequest, res: Response) => {
 
     let billsQuery = supabase
       .from('bills')
-      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
+      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url), fatura:rental_billing_invoices(id, invoice_number, sequence_number, pdf_url, invoice_type, total_amount)')
       .order('created_at', { ascending: false });
 
     const shouldGroupNfe =
@@ -251,8 +251,8 @@ export const listBills = async (req: AuthRequest, res: Response) => {
       return b.due_date.localeCompare(a.due_date);
     });
 
-    // Se a rota foi chamada especificamente para o modal de conciliação (unreconciled === 'true'), retorna array simples
-    if (unreconciled === 'true') {
+    // Se a rota foi chamada especificamente para uma locação (rental_invoice_id) ou conciliação (unreconciled === 'true'), retorna array simples
+    if (rental_invoice_id || unreconciled === 'true') {
       return res.json(finalItems);
     }
 

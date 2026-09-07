@@ -13,6 +13,7 @@ export function normalizeBankSlipUrls(val: any): string[] | null {
 }
 
 export function normalizeBill(row: any): BillStatementItem {
+  const faturaObj = Array.isArray(row.fatura) ? row.fatura[0] : row.fatura;
   return {
     source: 'bill',
     id: row.id,
@@ -28,10 +29,10 @@ export function normalizeBill(row: any): BillStatementItem {
     client_name: row.client?.company_name ?? null,
     counterparty_name: row.counterparty_name,
     invoice_number: row.invoice?.invoice_number ?? (row.bank_raw_snapshot?.invoice_number ? (String(row.bank_raw_snapshot.invoice_number).toUpperCase().startsWith('NF') ? String(row.bank_raw_snapshot.invoice_number) : `NF-e ${row.bank_raw_snapshot.invoice_number}`) : null) ?? null,
-    fatura_numero: row.bank_raw_snapshot?.fatura_numero ?? null,
+    fatura_numero: faturaObj?.invoice_number ?? row.bank_raw_snapshot?.fatura_numero ?? null,
     rental_invoice_id: row.rental_invoice_id ?? null,
     description: row.description,
-    invoice_url: row.bank_raw_snapshot?.fatura_pdf_url ?? row.payment?.invoice_url ?? null,
+    invoice_url: faturaObj?.pdf_url ?? row.bank_raw_snapshot?.fatura_pdf_url ?? row.payment?.invoice_url ?? null,
     bank_slip_url: normalizeBankSlipUrls(row.bank_slip_url)
       ?? normalizeBankSlipUrls(row.payment?.bank_slip_url)
       ?? normalizeBankSlipUrls(row.bank_raw_snapshot?.bank_slip_url)
