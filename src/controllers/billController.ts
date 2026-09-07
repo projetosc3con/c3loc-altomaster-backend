@@ -42,7 +42,7 @@ function groupBillsWithInstallments(items: BillStatementItem[]): BillStatementIt
         groups.set(groupKey, []);
       }
       groups.get(groupKey)!.push(item);
-    } else if (item.origin === 'MANUAL' && item.type === 'payable' && (item.raw as any)?.bank_raw_snapshot?.group_id) {
+    } else if (item.origin === 'MANUAL' && (item.raw as any)?.bank_raw_snapshot?.group_id) {
       const groupId = (item.raw as any).bank_raw_snapshot.group_id;
       const groupKey = `manual_${groupId}`;
       if (!groups.has(groupKey)) {
@@ -118,7 +118,7 @@ function groupBillsWithInstallments(items: BillStatementItem[]): BillStatementIt
     } else {
       const baseDesc = rawSnap.original_description || first.description?.replace(/ - Parcela \d+\/\d+.*$/, '') || 'Lançamento Manual';
       invoiceNum = first.invoice_number || (rawSnap.invoice_number ? (String(rawSnap.invoice_number).toUpperCase().startsWith('NF') ? String(rawSnap.invoice_number) : `NF-e ${rawSnap.invoice_number}`) : baseDesc);
-      counterparty = first.counterparty_name || first.client_name || 'Fornecedor';
+      counterparty = first.counterparty_name || first.client_name || (first.type === 'receivable' ? 'Cliente' : 'Fornecedor');
       descriptionText = `${baseDesc} (${totalCount} parcelas)${counterparty ? ' - ' + counterparty : ''}`;
     }
 
@@ -169,7 +169,7 @@ export const listBills = async (req: AuthRequest, res: Response) => {
 
     const shouldGroupNfe =
       unreconciled !== 'true' &&
-      (req.query.group_nfe === 'true' || (type === 'payable' && req.query.group_nfe !== 'false'));
+      (req.query.group_nfe === 'true' || req.query.group_nfe !== 'false');
 
     if (client_id) billsQuery = billsQuery.eq('client_id', client_id as string);
     if (rental_invoice_id) billsQuery = billsQuery.eq('rental_invoice_id', rental_invoice_id as string);
