@@ -3,7 +3,7 @@ import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient } from '../config/supabase';
 import { recordStockMovement } from '../services/stockMovementService';
 
-const SERVICE_ORDER_SELECT = '*, service_order_parts(*, parts(*)), service_order_labor(*)';
+const SERVICE_ORDER_SELECT = '*, service_order_parts(*, parts(*)), service_order_labor(*), executor:users_profiles!executed_by(id, full_name)';
 
 export const getAllServiceOrders = async (req: AuthRequest, res: Response) => {
   try {

@@ -1,5 +1,17 @@
 import { BillStatementItem } from '../types/bill';
 
+export function normalizeBankSlipUrls(val: any): string[] | null {
+  if (!val) return null;
+  if (Array.isArray(val)) {
+    const cleaned = val.map((s) => String(s).trim()).filter(Boolean);
+    return cleaned.length > 0 ? cleaned : null;
+  }
+  if (typeof val === 'string' && val.trim().length > 0) {
+    return [val.trim()];
+  }
+  return null;
+}
+
 export function normalizeBill(row: any): BillStatementItem {
   return {
     source: 'bill',
@@ -15,11 +27,15 @@ export function normalizeBill(row: any): BillStatementItem {
     client_id: row.client_id,
     client_name: row.client?.company_name ?? null,
     counterparty_name: row.counterparty_name,
-    invoice_number: row.invoice?.invoice_number ?? (row.bank_raw_snapshot?.invoice_number ? `NF-e ${row.bank_raw_snapshot.invoice_number}` : null),
+    invoice_number: row.invoice?.invoice_number ?? (row.bank_raw_snapshot?.invoice_number ? (String(row.bank_raw_snapshot.invoice_number).toUpperCase().startsWith('NF') ? String(row.bank_raw_snapshot.invoice_number) : `NF-e ${row.bank_raw_snapshot.invoice_number}`) : null) ?? null,
+    fatura_numero: row.bank_raw_snapshot?.fatura_numero ?? null,
     rental_invoice_id: row.rental_invoice_id ?? null,
     description: row.description,
-    invoice_url: row.payment?.invoice_url ?? null,
-    bank_slip_url: row.bank_slip_url ?? row.payment?.bank_slip_url ?? row.bank_raw_snapshot?.bank_slip_url ?? null,
+    invoice_url: row.bank_raw_snapshot?.fatura_pdf_url ?? row.payment?.invoice_url ?? null,
+    bank_slip_url: normalizeBankSlipUrls(row.bank_slip_url)
+      ?? normalizeBankSlipUrls(row.payment?.bank_slip_url)
+      ?? normalizeBankSlipUrls(row.bank_raw_snapshot?.bank_slip_url)
+      ?? null,
     is_reconciled: row.reconciled_at != null || row.bank_transaction_date != null,
     created_by_name: row.creator?.full_name ?? null,
     created_by_photo: row.creator?.photo_url ?? null,
@@ -49,7 +65,7 @@ export function normalizePendingPayment(row: any): BillStatementItem {
     rental_invoice_id: row.invoice_id ?? row.rental_invoice_id ?? null,
     description: null,
     invoice_url: row.invoice_url ?? null,
-    bank_slip_url: row.bank_slip_url ?? null,
+    bank_slip_url: normalizeBankSlipUrls(row.bank_slip_url),
     is_reconciled: false,
     raw: row,
   };

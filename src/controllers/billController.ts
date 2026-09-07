@@ -3,7 +3,7 @@ import { Response } from 'express';
 import { getSupabaseUserClient } from '../config/supabase';
 import { AuthRequest } from '../middleware/auth';
 import { BillStatementItem, CreateBillPayload } from '../types/bill';
-import { normalizeBill, normalizePendingPayment } from '../utils/billNormalizers';
+import { normalizeBill, normalizePendingPayment, normalizeBankSlipUrls } from '../utils/billNormalizers';
 
 // TODO(SECURITY): a tabela `bills` foi criada sem RLS/policies (confirmado
 // via introspecção do schema em 02/08/2026). Esta rota já usa o client
@@ -117,7 +117,7 @@ function groupBillsWithInstallments(items: BillStatementItem[]): BillStatementIt
       descriptionText = `${invoiceNum} (${totalCount} parcelas) - ${counterparty}`;
     } else {
       const baseDesc = rawSnap.original_description || first.description?.replace(/ - Parcela \d+\/\d+.*$/, '') || 'Lançamento Manual';
-      invoiceNum = baseDesc;
+      invoiceNum = first.invoice_number || (rawSnap.invoice_number ? (String(rawSnap.invoice_number).toUpperCase().startsWith('NF') ? String(rawSnap.invoice_number) : `NF-e ${rawSnap.invoice_number}`) : baseDesc);
       counterparty = first.counterparty_name || first.client_name || 'Fornecedor';
       descriptionText = `${baseDesc} (${totalCount} parcelas)${counterparty ? ' - ' + counterparty : ''}`;
     }
@@ -138,7 +138,7 @@ function groupBillsWithInstallments(items: BillStatementItem[]): BillStatementIt
       installments_count: totalCount,
       paid_installments_count: paidCount,
       access_key: first.access_key || (first.raw as any)?.barcode || rawSnap.access_key || null,
-      bank_slip_url: first.bank_slip_url || (first.raw as any)?.bank_slip_url || installments.find((i) => i.bank_slip_url)?.bank_slip_url || null,
+      bank_slip_url: normalizeBankSlipUrls(first.bank_slip_url || (first.raw as any)?.bank_slip_url) || normalizeBankSlipUrls(installments.find((i) => i.bank_slip_url)?.bank_slip_url) || null,
     };
 
     result.push(groupedItem);
@@ -152,14 +152,15 @@ const groupNfeBills = groupBillsWithInstallments;
 export const listBills = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const { client_id, status, origin, from, to, type, unreconciled } = req.query;
+    const { client_id, status, origin, from, to, type, unreconciled, invoice_number, rental_invoice_id } = req.query;
 
     // Paginação só se aplica ao ramo "merge completo" abaixo (bills +
     // payments pendentes) — é a única consulta que vira uma tabela grande
     // sem fim. O ramo com filtros (picker de "vincular a lançamento
     // existente") continua devolvendo array puro, sem paginar.
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
-    const limit = Math.min(20, Math.max(1, parseInt(req.query.limit as string) || 20));
+    const defaultLimit = rental_invoice_id ? 100 : 20;
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || defaultLimit));
 
     let billsQuery = supabase
       .from('bills')
@@ -171,6 +172,7 @@ export const listBills = async (req: AuthRequest, res: Response) => {
       (req.query.group_nfe === 'true' || (type === 'payable' && req.query.group_nfe !== 'false'));
 
     if (client_id) billsQuery = billsQuery.eq('client_id', client_id as string);
+    if (rental_invoice_id) billsQuery = billsQuery.eq('rental_invoice_id', rental_invoice_id as string);
     if (status && !shouldGroupNfe) billsQuery = billsQuery.eq('status', status as string);
     if (origin) billsQuery = billsQuery.eq('origin', origin as string);
     if (type) billsQuery = billsQuery.eq('type', type as string);
@@ -204,6 +206,7 @@ export const listBills = async (req: AuthRequest, res: Response) => {
         .order('created_at', { ascending: false });
 
       if (client_id) paymentsQuery = paymentsQuery.eq('client_id', client_id as string);
+      if (rental_invoice_id) paymentsQuery = paymentsQuery.eq('invoice_id', rental_invoice_id as string);
       if (from) paymentsQuery = paymentsQuery.gte('due_date', from as string);
       if (to) paymentsQuery = paymentsQuery.lte('due_date', to as string);
 
@@ -229,6 +232,16 @@ export const listBills = async (req: AuthRequest, res: Response) => {
         if (item.status === status) return true;
         if (item.status.startsWith('Parcial') && status === 'Pendente') return true;
         return false;
+      });
+    }
+
+    if (invoice_number && typeof invoice_number === 'string' && invoice_number.trim()) {
+      const searchInv = invoice_number.trim().toLowerCase();
+      finalItems = finalItems.filter((item) => {
+        const itemInv = item.invoice_number ? String(item.invoice_number).toLowerCase() : '';
+        const rawInv = (item.raw as any)?.invoice?.invoice_number ? String((item.raw as any).invoice.invoice_number).toLowerCase() : '';
+        const rawSnapInv = (item.raw as any)?.bank_raw_snapshot?.invoice_number ? String((item.raw as any).bank_raw_snapshot.invoice_number).toLowerCase() : '';
+        return itemInv.includes(searchInv) || rawInv.includes(searchInv) || rawSnapInv.includes(searchInv);
       });
     }
 
@@ -269,7 +282,7 @@ export const createBill = async (req: AuthRequest, res: Response) => {
       type, counterparty_name, description, barcode,
       gross_value, due_date, status, is_reconciled, already_settled, settled_date,
       bank_transaction_date, bank_raw_snapshot, payment_type, installments,
-      bank_slip_url,
+      bank_slip_url, invoice_number,
     } = req.body as CreateBillPayload;
 
     if (type !== 'receivable' && type !== 'payable') {
@@ -294,6 +307,13 @@ export const createBill = async (req: AuthRequest, res: Response) => {
     } else if (already_settled) {
       reconciledAt = settled_date ? new Date(settled_date as string).toISOString() : new Date().toISOString();
     }
+
+    const rawSnapshot: Record<string, unknown> = {
+      ...(bank_raw_snapshot || {}),
+      ...(invoice_number?.trim() ? { invoice_number: invoice_number.trim() } : {}),
+    };
+
+    const normalizedBankSlipUrls = normalizeBankSlipUrls(bank_slip_url);
 
     // MULTI-PARCELAS MANUAL
     if (payment_type === 'parcelado' && Array.isArray(installments) && installments.length > 1) {
@@ -320,7 +340,7 @@ export const createBill = async (req: AuthRequest, res: Response) => {
           status: resolvedStatus,
           reconciled_at: reconciledAt,
           bank_transaction_date: bank_transaction_date || null,
-          bank_slip_url: bank_slip_url || null,
+          bank_slip_url: normalizedBankSlipUrls,
           bank_raw_snapshot: {
             source: 'MANUAL_INSTALLMENT',
             group_id: groupId,
@@ -328,7 +348,7 @@ export const createBill = async (req: AuthRequest, res: Response) => {
             total_installments: totalCount,
             total_value: gross_value,
             original_description: baseDesc,
-            ...(bank_raw_snapshot || {}),
+            ...rawSnapshot,
           },
           created_by: req.user?.id || req.body.created_by || null,
           ...(barcode ? { barcode: barcode.trim() } : {}),
@@ -364,8 +384,8 @@ export const createBill = async (req: AuthRequest, res: Response) => {
         status: resolvedStatus,
         reconciled_at: reconciledAt,
         bank_transaction_date: bank_transaction_date || null,
-        bank_slip_url: bank_slip_url || null,
-        bank_raw_snapshot: bank_raw_snapshot || null,
+        bank_slip_url: normalizedBankSlipUrls,
+        bank_raw_snapshot: Object.keys(rawSnapshot).length > 0 ? rawSnapshot : null,
         created_by: req.user?.id || req.body.created_by || null,
         // Coluna `barcode` só existe depois da migração
         // `ALTER TABLE bills ADD COLUMN barcode text;` — incluída apenas
@@ -388,7 +408,7 @@ export const updateBill = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const { status, is_reconciled, bank_slip_url } = req.body;
+    const { status, is_reconciled, bank_slip_url, bank_raw_snapshot } = req.body;
 
     // Buscar bill atual para validar existência e origem
     const { data: currentBill, error: fetchError } = await supabase
@@ -410,7 +430,14 @@ export const updateBill = async (req: AuthRequest, res: Response) => {
     }
 
     if (bank_slip_url !== undefined) {
-      updatePayload.bank_slip_url = bank_slip_url;
+      updatePayload.bank_slip_url = normalizeBankSlipUrls(bank_slip_url);
+    }
+
+    if (bank_raw_snapshot !== undefined) {
+      updatePayload.bank_raw_snapshot = {
+        ...((currentBill.bank_raw_snapshot as Record<string, any>) || {}),
+        ...bank_raw_snapshot,
+      };
     }
 
     if (is_reconciled !== undefined) {
@@ -448,7 +475,7 @@ export const updateBill = async (req: AuthRequest, res: Response) => {
       if (idsToUpdate.length > 0) {
         await supabase
           .from('bills')
-          .update({ bank_slip_url, updated_at: new Date().toISOString() })
+          .update({ bank_slip_url: updatePayload.bank_slip_url, updated_at: new Date().toISOString() })
           .in('id', idsToUpdate);
       }
     }

@@ -9,6 +9,8 @@ router.get('/:id/contract-deal', rentalController.getOrCreateRentalContractDeal)
 router.get('/:id/contracts', rentalController.getRentalContracts);
 router.post('/:id/service-orders', rentalController.createRentalServiceOrder);
 router.post('/:id/extend', rentalController.extendInvoice);
+router.post('/faturas/generate', rentalController.generateFaturaLocacao);
+router.get('/:id/faturas', rentalController.getFaturasLocacaoByRental);
 router.get('/:id', rentalController.getInvoiceById);
 router.post('/', rentalController.createInvoice);
 router.put('/:id', rentalController.updateInvoice);

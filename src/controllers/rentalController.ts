@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
+import { deleteDealsAndSubDependencies } from './crmController';
 
 const updateEquipmentItemStatus = async (
   supabase: any,
@@ -430,6 +431,12 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
             status: billStatus,
             reconciled_at: billStatus === 'Recebido' ? new Date().toISOString() : null,
             created_by: req.user?.id || null,
+            bank_raw_snapshot: {
+              is_initial: true,
+              period_start: createdInvoice.billing_period_start,
+              period_end: createdInvoice.billing_period_end,
+              total_value: total_value,
+            },
           });
       }
     }
@@ -444,6 +451,12 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   try {
     const supabase = getSupabaseUserClient(req.token!);
+    const { data: existingInvoice } = await supabase
+      .from('rental_invoices')
+      .select('id, equipment_id, asset_number, equipment_name, equipment_type')
+      .eq('id', id)
+      .maybeSingle();
+
     const rawEquipments = Array.isArray(req.body.equipments) ? req.body.equipments : null;
 
     if (rawEquipments !== null && rawEquipments.length === 0) {
@@ -475,32 +488,30 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
       if (starts.length > 0) updateData.billing_period_start = starts[0];
       if (ends.length > 0) updateData.billing_period_end = ends[ends.length - 1];
 
-      updateData.equipment_id = rawEquipments[0].equipment_id;
+      updateData.equipment_id = rawEquipments[0].equipment_id || existingInvoice?.equipment_id || null;
       updateData.equipment_name = rawEquipments.length === 1 
         ? rawEquipments[0].equipment_name 
         : `${rawEquipments[0].equipment_name || 'Equipamento'} (+${rawEquipments.length - 1} itens)`;
-      updateData.equipment_type = rawEquipments[0].equipment_type || '';
-      updateData.asset_number = rawEquipments.map((e: any) => e.asset_number).filter(Boolean).join(', ');
+      updateData.equipment_type = rawEquipments[0].equipment_type || existingInvoice?.equipment_type || '';
+      updateData.asset_number = rawEquipments.map((e: any) => e.asset_number).filter(Boolean).join(', ') || existingInvoice?.asset_number || '';
 
       // Sincronizar itens na tabela rental_invoice_equipments
       const { data: previousItems } = await supabase
         .from('rental_invoice_equipments')
-        .select('equipment_id')
+        .select('*')
         .eq('rental_invoice_id', id);
 
-      const previousEquipIds = (previousItems || []).map((p: any) => p.equipment_id);
-      const newEquipIds = rawEquipments.map((e: any) => e.equipment_id);
+      const itemsToInsert = rawEquipments.map((item: any, index: number) => {
+        const matched = (previousItems || []).find((p: any) => 
+          (item.id && p.id === item.id) ||
+          (item.asset_number && p.asset_number === item.asset_number) ||
+          (item.equipment_id && p.equipment_id === item.equipment_id)
+        ) || (previousItems && previousItems[index]);
 
-      // Equipamentos removidos voltam a ficar 'Disponível'
-      const removedEquipIds = previousEquipIds.filter((prevId: string) => !newEquipIds.includes(prevId));
-      for (const remId of removedEquipIds) {
-        await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', remId);
-      }
+        const equipId = item.equipment_id || matched?.equipment_id || (index === 0 ? updateData.equipment_id || existingInvoice?.equipment_id : null) || null;
+        const assetNum = item.asset_number || matched?.asset_number || (index === 0 ? updateData.asset_number || existingInvoice?.asset_number : null) || null;
+        const equipType = item.equipment_type || matched?.equipment_type || (index === 0 ? updateData.equipment_type || existingInvoice?.equipment_type : null) || null;
 
-      // Deletar anteriores e inserir novos
-      await supabase.from('rental_invoice_equipments').delete().eq('rental_invoice_id', id);
-
-      const itemsToInsert = rawEquipments.map((item: any) => {
         const itemRental = Number(item.cost_rental) || 0;
         const itemInsurance = Number(item.cost_insurance) || 0;
         const itemFreight = Number(item.cost_freight) || 0;
@@ -511,14 +522,14 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
 
         return {
           rental_invoice_id: id,
-          equipment_id: item.equipment_id,
-          equipment_name: item.equipment_name || null,
-          equipment_type: item.equipment_type || null,
-          equipment_size: item.equipment_size || null,
-          asset_number: item.asset_number || null,
+          equipment_id: equipId,
+          equipment_name: item.equipment_name || matched?.equipment_name || null,
+          equipment_type: equipType,
+          equipment_size: item.equipment_size || matched?.equipment_size || null,
+          asset_number: assetNum,
           billing_period_start: item.billing_period_start || updateData.billing_period_start,
           billing_period_end: item.billing_period_end || updateData.billing_period_end,
-          return_date: item.return_date || null,
+          return_date: item.return_date || matched?.return_date || null,
           cost_rental: itemRental,
           cost_insurance: itemInsurance,
           cost_freight: itemFreight,
@@ -526,15 +537,28 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
           cost_third_party: itemThirdParty,
           cost_training: itemTraining,
           total_value: itemTotal,
-          notes: item.notes || null
+          notes: item.notes || matched?.notes || null
         };
       });
 
+      const previousEquipIds = (previousItems || []).map((p: any) => p.equipment_id).filter(Boolean);
+      const newEquipIds = itemsToInsert.map((e: any) => e.equipment_id).filter(Boolean);
+
+      // Equipamentos removidos voltam a ficar 'Disponível'
+      const removedEquipIds = previousEquipIds.filter((prevId: string) => !newEquipIds.includes(prevId));
+      for (const remId of removedEquipIds) {
+        await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', remId);
+      }
+
+      // Deletar anteriores e inserir novos
+      await supabase.from('rental_invoice_equipments').delete().eq('rental_invoice_id', id);
       await supabase.from('rental_invoice_equipments').insert(itemsToInsert);
 
       // Atualizar status de cada equipamento atual
-      for (const eq of rawEquipments) {
-        await updateEquipmentItemStatus(supabase, eq.equipment_id, eq.billing_period_end, eq.return_date);
+      for (const eq of itemsToInsert) {
+        if (eq.equipment_id) {
+          await updateEquipmentItemStatus(supabase, eq.equipment_id, eq.billing_period_end, eq.return_date);
+        }
       }
     }
 
@@ -575,7 +599,7 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
 
     const { data: currentInvoice } = await supabase
       .from('rental_invoices')
-      .select('equipment_id')
+      .select('equipment_id, deal_id')
       .eq('id', id)
       .maybeSingle();
 
@@ -609,17 +633,52 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
       throw billsDeleteError;
     }
 
-    // 3. Desvincular contratos do CRM atrelados a esta locação
-    await supabase
-      .from('crm_deal_contracts')
-      .update({ rental_invoice_id: null })
+    // 3. Excluir faturas de locação geradas (rental_billing_invoices)
+    const { error: faturasDeleteError } = await supabase
+      .from('rental_billing_invoices')
+      .delete()
       .eq('rental_invoice_id', id);
 
-    // 4. Desvincular negociações do CRM atreladas a esta locação
-    await supabase
+    if (faturasDeleteError) {
+      console.error('[deleteInvoice] Erro ao excluir faturas em rental_billing_invoices:', faturasDeleteError);
+      throw faturasDeleteError;
+    }
+
+    // 4. Identificar e excluir TODOS os crm_deals relacionados a esta locação e todas as suas subdependências
+    const { data: dealsByRental } = await supabase
       .from('crm_deals')
-      .update({ rental_invoice_id: null })
+      .select('id')
       .eq('rental_invoice_id', id);
+
+    const { data: contractsByRental } = await supabase
+      .from('crm_deal_contracts')
+      .select('id, deal_id')
+      .eq('rental_invoice_id', id);
+
+    const relatedDealIds = new Set<string>();
+    if (currentInvoice?.deal_id) {
+      relatedDealIds.add(currentInvoice.deal_id);
+    }
+    (dealsByRental || []).forEach((d: any) => {
+      if (d.id) relatedDealIds.add(d.id);
+    });
+    (contractsByRental || []).forEach((c: any) => {
+      if (c.deal_id) relatedDealIds.add(c.deal_id);
+    });
+
+    // Desvincular deal_id na locação para permitir exclusão sem restrições de FK
+    await supabase.from('rental_invoices').update({ deal_id: null }).eq('id', id);
+
+    // Excluir contratos atrelados diretamente a esta rental_invoice_id
+    await supabase
+      .from('crm_deal_contracts')
+      .delete()
+      .eq('rental_invoice_id', id);
+
+    // Excluir os crm_deals e todas as suas subdependências (contracts, forms, activities, tasks)
+    if (relatedDealIds.size > 0) {
+      await deleteDealsAndSubDependencies(supabase, Array.from(relatedDealIds));
+    }
 
     // 5. Desvincular Ordens de Serviço atreladas a esta locação
     await supabase
@@ -643,7 +702,7 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
 
     return res.status(200).json({
       success: true,
-      message: 'Locação e contas a receber atreladas foram excluídas com sucesso.'
+      message: 'Locação, contas financeiras e negociações do CRM vinculadas foram excluídas com sucesso.'
     });
   } catch (error: any) {
     console.error('[deleteInvoice] Erro ao excluir locação:', error);
@@ -878,7 +937,28 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
         locatario_state_registration: clientStateReg,
         locatario_address_full: clientAddressFull,
         equipment_description: equipDescription,
-        equipment_model: equipModel,
+        equipment_model: (rentalEquips && rentalEquips.length > 0)
+          ? `[EQUIPMENTS_JSON]:${JSON.stringify(rentalEquips.map((eq: any) => ({
+              tempId: eq.id || Math.random().toString(36).substring(2, 9),
+              id: eq.id,
+              equipment_id: eq.equipment_id || null,
+              asset_number: eq.asset_number || null,
+              equipment_type: eq.equipment_type || null,
+              equipment_name: eq.equipment_name || '',
+              equipment_size: eq.equipment_size || '',
+              billing_period_start: eq.billing_period_start ? String(eq.billing_period_start).split('T')[0] : (rental.billing_period_start ? String(rental.billing_period_start).split('T')[0] : ''),
+              billing_period_end: eq.billing_period_end ? String(eq.billing_period_end).split('T')[0] : (rental.billing_period_end ? String(rental.billing_period_end).split('T')[0] : ''),
+              return_date: eq.return_date ? String(eq.return_date).split('T')[0] : null,
+              cost_rental: Number(eq.cost_rental) || 0,
+              cost_insurance: Number(eq.cost_insurance) || 0,
+              cost_freight: Number(eq.cost_freight) || 0,
+              cost_rcd: Number(eq.cost_rcd) || 0,
+              cost_third_party: Number(eq.cost_third_party) || 0,
+              cost_training: Number(eq.cost_training) || 0,
+              total_value: Number(eq.total_value) || 0,
+              notes: eq.notes || null
+            })))}`
+          : equipModel,
         contract_duration_days: durationDays,
         period_start: rental.billing_period_start ? rental.billing_period_start.split('T')[0] : null,
         period_end: rental.billing_period_end ? rental.billing_period_end.split('T')[0] : null,
@@ -1228,6 +1308,9 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
         ? `Prorrogação de Locação #${updatedInvoice.invoice_number}`
         : 'Prorrogação de Locação';
 
+      const extStarts = itemsToInsert.map((it: any) => it.billing_period_start).filter(Boolean).sort();
+      const extEnds = itemsToInsert.map((it: any) => it.billing_period_end).filter(Boolean).sort();
+
       const { data: billData, error: billError } = await supabase
         .from('bills')
         .insert({
@@ -1244,6 +1327,13 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
           status: 'Pendente',
           reconciled_at: null,
           created_by: req.user?.id || null,
+          bank_raw_snapshot: {
+            is_extension: true,
+            extension_items: insertedItems || itemsToInsert,
+            period_start: extStarts[0] || null,
+            period_end: extEnds[extEnds.length - 1] || null,
+            total_value: extensionTotal,
+          },
         })
         .select()
         .single();
@@ -1321,5 +1411,89 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
   } catch (error: any) {
     console.error('[extendInvoice] Erro:', error);
     return res.status(500).json({ error: error.message || 'Erro ao prorrogar fatura de locação.' });
+  }
+};
+
+export const generateFaturaLocacao = async (req: AuthRequest, res: Response) => {
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+    const {
+      rental_invoice_id,
+      bill_id,
+      tipo = 'INITIAL',
+      pdf_url = null,
+      period_start = null,
+      period_end = null,
+      valor_total = 0,
+      dados_fatura = null
+    } = req.body;
+
+    if (!rental_invoice_id) {
+      return res.status(400).json({ error: 'rental_invoice_id é obrigatório.' });
+    }
+
+    const invoiceType = (tipo === 'PRORROGACAO' || tipo === 'EXTENSION') ? 'EXTENSION' : 'INITIAL';
+
+    const { data, error } = await supabase.rpc('generate_rental_billing_invoice', {
+      p_rental_invoice_id: rental_invoice_id,
+      p_bill_id: bill_id || null,
+      p_invoice_type: invoiceType,
+      p_pdf_url: pdf_url,
+      p_period_start: period_start,
+      p_period_end: period_end,
+      p_total_amount: Number(valor_total) || 0,
+      p_invoice_data: dados_fatura,
+      p_user_id: req.user?.id || null
+    });
+
+    if (error) {
+      console.error('[generateFaturaLocacao] Erro RPC:', error);
+      const { data: adminData, error: adminError } = await supabaseAdmin.rpc('generate_rental_billing_invoice', {
+        p_rental_invoice_id: rental_invoice_id,
+        p_bill_id: bill_id || null,
+        p_invoice_type: invoiceType,
+        p_pdf_url: pdf_url,
+        p_period_start: period_start,
+        p_period_end: period_end,
+        p_total_amount: Number(valor_total) || 0,
+        p_invoice_data: dados_fatura,
+        p_user_id: req.user?.id || null
+      });
+
+      if (adminError) throw adminError;
+      const rawFatura = Array.isArray(adminData) ? adminData[0] : adminData;
+      const fatura = rawFatura ? { ...rawFatura, numero: rawFatura.invoice_number } : rawFatura;
+      return res.json(fatura);
+    }
+
+    const rawFatura = Array.isArray(data) ? data[0] : data;
+    const fatura = rawFatura ? { ...rawFatura, numero: rawFatura.invoice_number } : rawFatura;
+    return res.json(fatura);
+  } catch (error: any) {
+    console.error('[generateFaturaLocacao] Erro:', error);
+    return res.status(500).json({ error: error.message || 'Erro ao gerar fatura de locação.' });
+  }
+};
+
+export const getFaturasLocacaoByRental = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+    const { data, error } = await supabase
+      .from('rental_billing_invoices')
+      .select('*')
+      .eq('rental_invoice_id', id)
+      .order('sequence_number', { ascending: true });
+
+    if (error) throw error;
+    const mapped = (data || []).map((row: any) => ({
+      ...row,
+      numero: row.invoice_number,
+      sequencial: row.sequence_number,
+    }));
+    return res.json(mapped);
+  } catch (error: any) {
+    console.error('[getFaturasLocacaoByRental] Erro:', error);
+    return res.status(500).json({ error: error.message });
   }
 };

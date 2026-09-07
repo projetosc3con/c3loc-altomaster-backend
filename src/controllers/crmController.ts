@@ -673,17 +673,83 @@ export const updateDeal = async (req: AuthRequest, res: Response) => {
   }
 };
 
+export const deleteDealsAndSubDependencies = async (supabase: any, dealIds: string[]) => {
+  if (!dealIds || dealIds.length === 0) return;
+
+  // 1. Fetch contracts of these deals to clean storage files if any
+  const { data: contracts } = await supabase
+    .from('crm_deal_contracts')
+    .select('id, signed_file_url')
+    .in('deal_id', dealIds);
+
+  const contractIds = (contracts || []).map((c: any) => c.id).filter(Boolean);
+
+  // Remove signed files from storage bucket 'crm-contracts'
+  for (const c of (contracts || [])) {
+    if (c.signed_file_url) {
+      try {
+        const match = c.signed_file_url.match(/crm-contracts\/([^?]+)/);
+        if (match && match[1]) {
+          await supabase.storage.from('crm-contracts').remove([decodeURIComponent(match[1])]);
+        }
+      } catch (storageErr) {
+        console.warn('[deleteDealsAndSubDependencies] Erro ao remover arquivo do storage:', storageErr);
+      }
+    }
+  }
+
+  // 2. Unlink any rental_invoices referencing these deals
+  await supabase
+    .from('rental_invoices')
+    .update({ deal_id: null })
+    .in('deal_id', dealIds);
+
+  // 3. Break circular references on crm_deals
+  await supabase
+    .from('crm_deals')
+    .update({
+      active_contract_id: null,
+      contract_form_id: null,
+      rental_invoice_id: null
+    })
+    .in('id', dealIds);
+
+  // 4. Delete tasks
+  await supabase.from('crm_tasks').delete().in('deal_id', dealIds);
+
+  // 5. Delete activities
+  await supabase.from('crm_deal_activities').delete().in('deal_id', dealIds);
+
+  // 6. Delete rental_invoice_equipments linked to these contracts if any
+  if (contractIds.length > 0) {
+    await supabase.from('rental_invoice_equipments').delete().in('deal_contract_id', contractIds);
+  }
+
+  // 7. Delete contracts
+  if (contractIds.length > 0) {
+    await supabase.from('crm_deal_contracts').delete().in('id', contractIds);
+  }
+  await supabase.from('crm_deal_contracts').delete().in('deal_id', dealIds);
+
+  // 8. Delete contract forms
+  await supabase.from('crm_deal_contract_forms').delete().in('deal_id', dealIds);
+
+  // 9. Delete crm_deals
+  const { error: dealsDeleteError } = await supabase.from('crm_deals').delete().in('id', dealIds);
+  if (dealsDeleteError) {
+    console.error('[deleteDealsAndSubDependencies] Erro ao deletar crm_deals:', dealsDeleteError);
+    throw dealsDeleteError;
+  }
+};
+
 export const deleteDeal = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
     const { id } = req.params;
+    const dealId = Array.isArray(id) ? id[0] : id;
 
-    const { error } = await supabase
-      .from('crm_deals')
-      .delete()
-      .eq('id', id);
+    await deleteDealsAndSubDependencies(supabase, [dealId]);
 
-    if (error) throw error;
     res.json({ message: 'Negociação excluída com sucesso' });
   } catch (error: any) {
     console.error('[crmController] Erro em deleteDeal:', error);
@@ -1125,7 +1191,7 @@ export const saveContractForm = async (req: AuthRequest, res: Response) => {
     const body = req.body;
     
     // Extract equipments if sent by frontend
-    const equipments = Array.isArray(body.equipments) ? body.equipments : null;
+    let equipments = Array.isArray(body.equipments) ? body.equipments : null;
     delete body.equipments;
 
     // Sanitize body
@@ -1142,7 +1208,61 @@ export const saveContractForm = async (req: AuthRequest, res: Response) => {
     if (body.period_start === '') body.period_start = null;
     if (body.period_end === '') body.period_end = null;
 
+    // Fetch rental_invoice_id if linked to preserve equipment linkage
+    const { data: dealRec } = await supabase
+      .from('crm_deals')
+      .select('id, rental_invoice_id')
+      .eq('id', dealId)
+      .maybeSingle();
+
+    let linkedRentalId = body.rental_invoice_id || dealRec?.rental_invoice_id;
+    if (!linkedRentalId) {
+      const { data: rentalRec } = await supabase
+        .from('rental_invoices')
+        .select('id')
+        .eq('deal_id', dealId)
+        .maybeSingle();
+      linkedRentalId = rentalRec?.id;
+    }
+
+    // If linked to rental, fetch existing equipment items to preserve equipment_id & asset_number
+    let existingEquips: any[] = [];
+    let rentalHeader: any = null;
+    if (linkedRentalId) {
+      const { data: prevEquips } = await supabase
+        .from('rental_invoice_equipments')
+        .select('*')
+        .eq('rental_invoice_id', linkedRentalId)
+        .order('created_at', { ascending: true });
+      existingEquips = prevEquips || [];
+
+      const { data: rHeader } = await supabase
+        .from('rental_invoices')
+        .select('equipment_id, asset_number, equipment_name, equipment_type')
+        .eq('id', linkedRentalId)
+        .maybeSingle();
+      rentalHeader = rHeader;
+    }
+
     if (equipments && equipments.length > 0) {
+      // Enrich equipments with existing equipment_id and asset_number if missing
+      equipments = equipments.map((eq: any, index: number) => {
+        const matched = existingEquips.find((prev: any) => 
+          (eq.id && prev.id === eq.id) ||
+          (eq.asset_number && prev.asset_number === eq.asset_number) ||
+          (eq.equipment_id && prev.equipment_id === eq.equipment_id)
+        ) || existingEquips[index];
+
+        return {
+          ...eq,
+          equipment_id: eq.equipment_id || matched?.equipment_id || (index === 0 ? rentalHeader?.equipment_id : null) || null,
+          asset_number: eq.asset_number || matched?.asset_number || (index === 0 ? rentalHeader?.asset_number : null) || null,
+          equipment_type: eq.equipment_type || matched?.equipment_type || (index === 0 ? rentalHeader?.equipment_type : null) || null,
+          return_date: eq.return_date || matched?.return_date || null,
+          notes: eq.notes || matched?.notes || null
+        };
+      });
+
       body.equipment_model = `[EQUIPMENTS_JSON]:${JSON.stringify(equipments)}`;
     }
 
@@ -1182,27 +1302,11 @@ export const saveContractForm = async (req: AuthRequest, res: Response) => {
       savedForm.equipments = equipments;
 
       // Sync with rental_invoice_equipments if linked
-      const { data: deal } = await supabase
-        .from('crm_deals')
-        .select('id, rental_invoice_id')
-        .eq('id', dealId)
-        .maybeSingle();
-
-      let rentalInvoiceId = deal?.rental_invoice_id;
-      if (!rentalInvoiceId) {
-        const { data: rental } = await supabase
-          .from('rental_invoices')
-          .select('id')
-          .eq('deal_id', dealId)
-          .maybeSingle();
-        rentalInvoiceId = rental?.id;
-      }
-
-      if (rentalInvoiceId) {
-        await supabase.from('rental_invoice_equipments').delete().eq('rental_invoice_id', rentalInvoiceId);
+      if (linkedRentalId) {
+        await supabase.from('rental_invoice_equipments').delete().eq('rental_invoice_id', linkedRentalId);
         await supabase.from('rental_invoice_equipments').insert(
           equipments.map((eq: any) => ({
-            rental_invoice_id: rentalInvoiceId,
+            rental_invoice_id: linkedRentalId,
             equipment_id: eq.equipment_id || null,
             equipment_name: eq.equipment_name || null,
             equipment_type: eq.equipment_type || null,
@@ -1221,6 +1325,13 @@ export const saveContractForm = async (req: AuthRequest, res: Response) => {
             notes: eq.notes || null
           }))
         );
+
+        // Update equipment status to 'Locado' for active equipments
+        for (const eq of equipments) {
+          if (eq.equipment_id) {
+            await supabase.from('equipments').update({ status: 'Locado' }).eq('id', eq.equipment_id);
+          }
+        }
       }
     }
 
@@ -1267,9 +1378,22 @@ export const generateContractRecord = async (req: AuthRequest, res: Response) =>
     if (form.form_status === 'Rascunho') throw new Error('Preencha os campos obrigatórios');
 
     // Fetch individual equipments (from req.body, from equipment_model JSON, or from rental_invoice_equipments)
+    const dealEquipments = await fetchDealEquipments(supabase, dealId);
     let equipments = Array.isArray(req.body?.equipments) && req.body.equipments.length > 0
-      ? req.body.equipments
-      : await fetchDealEquipments(supabase, dealId);
+      ? req.body.equipments.map((item: any, idx: number) => {
+          const fallback = dealEquipments[idx] || dealEquipments.find((d: any) => 
+            (item.id && d.id === item.id) ||
+            (item.asset_number && d.asset_number === item.asset_number) ||
+            (item.equipment_name && d.equipment_name === item.equipment_name)
+          );
+          return {
+            ...item,
+            equipment_id: item.equipment_id || fallback?.equipment_id || null,
+            asset_number: item.asset_number || fallback?.asset_number || null,
+            equipment_type: item.equipment_type || fallback?.equipment_type || null,
+          };
+        })
+      : dealEquipments;
 
     if (equipments.length === 0 && form.equipment_model) {
       equipments = parseEquipments(form.equipment_model);

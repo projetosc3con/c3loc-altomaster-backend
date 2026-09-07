@@ -19,6 +19,7 @@ export interface Bill {
   bank_transaction_date: string | null;
   bank_raw_snapshot: Record<string, unknown> | null;
   barcode: string | null;
+  bank_slip_url?: string[] | string | null;
   status: BillStatus;
   reconciled_at: string | null;
   created_by: string | null;
@@ -36,6 +37,7 @@ export interface CreateBillPayload {
   type: BillType;
   counterparty_name?: string;
   description?: string;
+  invoice_number?: string;
   barcode?: string;
   gross_value: number;
   due_date: string;
@@ -48,13 +50,14 @@ export interface CreateBillPayload {
   created_by?: string;
   payment_type?: 'a_vista' | 'parcelado';
   installments?: ManualInstallmentInput[];
-  bank_slip_url?: string | null;
+  bank_slip_url?: string[] | string | null;
 }
 
 export interface UpdateBillPayload {
   status?: BillStatus;
   is_reconciled?: boolean;
-  bank_slip_url?: string | null;
+  bank_slip_url?: string[] | string | null;
+  bank_raw_snapshot?: Record<string, unknown>;
 }
 
 // Item normalizado do extrato bancário (GET /api/bills): mescla `bills`
@@ -77,10 +80,11 @@ export interface BillStatementItem {
   client_name: string | null;
   counterparty_name: string | null;
   invoice_number: string | null;
+  fatura_numero?: string | null;
   rental_invoice_id?: string | null;
   description: string | null;
   invoice_url: string | null;
-  bank_slip_url: string | null;
+  bank_slip_url: string[] | string | null;
   is_reconciled: boolean;
   created_by_name?: string | null;
   created_by_photo?: string | null;
