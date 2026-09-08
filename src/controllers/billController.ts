@@ -408,7 +408,7 @@ export const updateBill = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const { status, is_reconciled, bank_slip_url, bank_raw_snapshot } = req.body;
+    const { status, due_date, is_reconciled, bank_slip_url, bank_raw_snapshot } = req.body;
 
     // Buscar bill atual para validar existência e origem
     const { data: currentBill, error: fetchError } = await supabase
@@ -427,6 +427,10 @@ export const updateBill = async (req: AuthRequest, res: Response) => {
 
     if (status !== undefined) {
       updatePayload.status = status;
+    }
+
+    if (due_date !== undefined) {
+      updatePayload.due_date = due_date;
     }
 
     if (bank_slip_url !== undefined) {
