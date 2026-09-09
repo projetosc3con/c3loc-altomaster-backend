@@ -42,6 +42,17 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
     const supabase = getSupabaseUserClient(req.token!);
     const { parts, labor, ...osData } = req.body;
 
+    // Remove read-only / relation fields
+    delete osData.id;
+    delete osData.os_number;
+    delete osData.created_at;
+    delete osData.updated_at;
+    delete osData.service_order_parts;
+    delete osData.service_order_labor;
+    delete osData.executor;
+    delete osData.equipment;
+    delete osData.equipments;
+
     // 0. Validate parts stock availability before doing anything
     if (parts && Array.isArray(parts) && parts.length > 0) {
         for (const p of parts) {
@@ -206,13 +217,16 @@ export const updateServiceOrder = async (req: AuthRequest, res: Response) => {
         const supabase = getSupabaseUserClient(req.token!);
         const { parts, labor, ...osData } = req.body;
 
-        // Remove read-only fields
+        // Remove read-only / relation fields
         delete osData.id;
         delete osData.os_number;
         delete osData.created_at;
         delete osData.updated_at;
         delete osData.service_order_parts;
         delete osData.service_order_labor;
+        delete osData.executor;
+        delete osData.equipment;
+        delete osData.equipments;
 
         // 0. Validate and calculate stock adjustments
         let oldQuantities: Record<string, number> = {};
