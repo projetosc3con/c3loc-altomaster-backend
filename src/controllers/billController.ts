@@ -152,7 +152,7 @@ const groupNfeBills = groupBillsWithInstallments;
 export const listBills = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const { client_id, status, origin, from, to, type, unreconciled, invoice_number, rental_invoice_id } = req.query;
+    const { client_id, status, origin, from, to, type, unreconciled, invoice_number, search, rental_invoice_id } = req.query;
 
     // Paginação só se aplica ao ramo "merge completo" abaixo (bills +
     // payments pendentes) — é a única consulta que vira uma tabela grande
@@ -235,13 +235,52 @@ export const listBills = async (req: AuthRequest, res: Response) => {
       });
     }
 
-    if (invoice_number && typeof invoice_number === 'string' && invoice_number.trim()) {
-      const searchInv = invoice_number.trim().toLowerCase();
+    const searchRaw = (typeof search === 'string' && search.trim()) ||
+                      (typeof invoice_number === 'string' && invoice_number.trim()) ||
+                      '';
+
+    if (searchRaw) {
+      const term = searchRaw.toLowerCase();
       finalItems = finalItems.filter((item) => {
         const itemInv = item.invoice_number ? String(item.invoice_number).toLowerCase() : '';
         const rawInv = (item.raw as any)?.invoice?.invoice_number ? String((item.raw as any).invoice.invoice_number).toLowerCase() : '';
         const rawSnapInv = (item.raw as any)?.bank_raw_snapshot?.invoice_number ? String((item.raw as any).bank_raw_snapshot.invoice_number).toLowerCase() : '';
-        return itemInv.includes(searchInv) || rawInv.includes(searchInv) || rawSnapInv.includes(searchInv);
+        const faturaNum = item.fatura_numero ? String(item.fatura_numero).toLowerCase() : '';
+        const counterparty = (item.counterparty_name || (item.raw as any)?.counterparty_name || '').toLowerCase();
+        const issuerName = ((item.raw as any)?.bank_raw_snapshot?.issuer_name || '').toLowerCase();
+        const clientName = (item.client_name || (item.raw as any)?.client?.company_name || '').toLowerCase();
+        const desc = (item.description || '').toLowerCase();
+
+        const matchDirect =
+          itemInv.includes(term) ||
+          rawInv.includes(term) ||
+          rawSnapInv.includes(term) ||
+          faturaNum.includes(term) ||
+          counterparty.includes(term) ||
+          issuerName.includes(term) ||
+          clientName.includes(term) ||
+          desc.includes(term);
+
+        if (matchDirect) return true;
+
+        if (Array.isArray(item.installments)) {
+          return item.installments.some((inst) => {
+            const instInv = inst.invoice_number ? String(inst.invoice_number).toLowerCase() : '';
+            const instCounterparty = (inst.counterparty_name || '').toLowerCase();
+            const instSnapInv = (inst.raw as any)?.bank_raw_snapshot?.invoice_number ? String((inst.raw as any).bank_raw_snapshot.invoice_number).toLowerCase() : '';
+            const instIssuer = ((inst.raw as any)?.bank_raw_snapshot?.issuer_name || '').toLowerCase();
+            const instDesc = (inst.description || '').toLowerCase();
+            return (
+              instInv.includes(term) ||
+              instCounterparty.includes(term) ||
+              instSnapInv.includes(term) ||
+              instIssuer.includes(term) ||
+              instDesc.includes(term)
+            );
+          });
+        }
+
+        return false;
       });
     }
 

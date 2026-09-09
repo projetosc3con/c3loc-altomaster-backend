@@ -145,23 +145,34 @@ export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
     issuerIe = ieMatch[1].trim();
   }
 
-  // Busca linhas antes de "DANFE"
-  const danfePos = text.indexOf('DANFE');
-  if (danfePos > 10) {
-    const beforeDanfe = text.substring(0, danfePos).trim();
-    const lines = beforeDanfe.split('\n').map((l) => l.trim()).filter((l) => l.length > 3);
-    if (lines.length > 0) {
-      issuerName = lines[0];
+  // 1. Busca por identificação explícita da Razão Social do emitente
+  const razaoMatch = text.match(/(?:IDENTIFICA[ÇC][ÃA]O\s*(?:DO\s*)?EMITENTE|RAZ[ÃA]O\s*SOCIAL)[:\s]*([^\n\r]+)/i);
+  if (razaoMatch && razaoMatch[1] && razaoMatch[1].trim().length > 2) {
+    issuerName = razaoMatch[1].trim();
+  }
+
+  // 2. Caso não tenha rótulo explícito, extrai diretamente da seção do emitente (após o título DANFE)
+  if (!issuerName) {
+    const danfePos = text.indexOf('DANFE');
+    if (danfePos !== -1) {
+      const destIndex = text.search(/DESTINAT[ÁA]RIO\s*\/?\s*REMETENTE/i);
+      const section = text.substring(danfePos + 5, destIndex !== -1 ? destIndex : danfePos + 800);
+      const lines = section
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => {
+          if (l.length < 3) return false;
+          if (/^(DOCUMENTO\s*AUXILIAR|CHAVE|CONSULTA|0\s*-\s*ENTRADA|1\s*-\s*SA|N[º°]|S[ÉE]RIE|FOLHA|PROTOCOLO|NATUREZA)/i.test(l)) return false;
+          return true;
+        });
+      if (lines.length > 0) {
+        issuerName = lines[0];
+      }
     }
   }
 
   if (!issuerName) {
-    const razaoMatch = text.match(/(?:RAZ[ÃA]O\s*SOCIAL|EMITENTE)[:\s]*([^\n\r]+)/i);
-    if (razaoMatch && razaoMatch[1]) {
-      issuerName = razaoMatch[1].trim();
-    } else {
-      issuerName = `Fornecedor CNPJ ${issuerCnpj}`;
-    }
+    issuerName = `Fornecedor CNPJ ${issuerCnpj}`;
   }
 
   // 6. Destinatário
