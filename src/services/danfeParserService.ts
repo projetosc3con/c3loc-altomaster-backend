@@ -39,6 +39,19 @@ function formatCnpj(digits: string): string {
   return c.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5');
 }
 
+function isValidCompanyName(str?: string | null): boolean {
+  if (!str) return false;
+  const s = str.trim();
+  if (s.length < 3) return false;
+  if (/^(CNPJ|CPF|DATA|ENDERE[ÇC]O|BAIRRO|MUNIC[ÍI]PIO|FONE|FRETE|INSCRI[ÇC][ÃA]O|DOCUMENTO|CHAVE|N[º°]|S[ÉE]RIE|PROTOCOLO|NATUREZA|DESTINAT|REMETENTE|FATURA|C[ÁA]LCULO|VALOR|BASE)/i.test(s)) {
+    return false;
+  }
+  if (/\b(CNPJ\s*\/?\s*CPF|DATA\s*(?:DA\s*)?EMISS[ÃA]O|FRETE\s+POR\s+CONTA|VALOR\s+TOTAL)\b/i.test(s)) {
+    return false;
+  }
+  return true;
+}
+
 export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
   const { text } = await extractText(new Uint8Array(pdfBuffer), { mergePages: true });
 
@@ -138,20 +151,53 @@ export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
   let issuerCity = '';
   let issuerState = '';
 
-  // Localiza razão social do emitente no cabeçalho
+  // Localiza razão social e IE no cabeçalho do emitente
   const emitenteBox = text.substring(0, Math.min(text.length, 1200));
   const ieMatch = emitenteBox.match(/(?:INSCRI[ÇC][ÃA]O\s*ESTADUAL|I\.E\.)[:\s]*([0-9.-]+)/i);
   if (ieMatch && ieMatch[1]) {
     issuerIe = ieMatch[1].trim();
   }
 
-  // 1. Busca por identificação explícita da Razão Social do emitente
-  const razaoMatch = text.match(/(?:IDENTIFICA[ÇC][ÃA]O\s*(?:DO\s*)?EMITENTE|RAZ[ÃA]O\s*SOCIAL)[:\s]*([^\n\r]+)/i);
-  if (razaoMatch && razaoMatch[1] && razaoMatch[1].trim().length > 2) {
-    issuerName = razaoMatch[1].trim();
+  // Município / UF do emitente (ex: Indaiatuba - SP)
+  const cityStateMatch = emitenteBox.match(/([A-Za-zÀ-ÿ ]{3,30})\s*-\s*([A-Z]{2})\b/);
+  if (cityStateMatch) {
+    issuerCity = cityStateMatch[1].trim();
+    issuerState = cityStateMatch[2].trim();
   }
 
-  // 2. Caso não tenha rótulo explícito, extrai diretamente da seção do emitente (após o título DANFE)
+  // 1. Canhoto de recebimento: "RECEBEMOS DE [RAZÃO SOCIAL] OS PRODUTOS..."
+  const canhotoMatch = text.match(/RECEB(?:EMOS|I(?:\/EMOS|\(EMOS\))?)\s+DE\s+([^\n\r]+?)(?:\s+(?:OS\s+PRODUTOS|AS\s+MERCADORIAS|OS\s+SERVI[ÇC]OS|CONSTANTES|INDICAD|DA\s+NF|DA\s+NOTA)|$)/i);
+  if (canhotoMatch && canhotoMatch[1] && isValidCompanyName(canhotoMatch[1])) {
+    issuerName = canhotoMatch[1].trim();
+  }
+
+  // 2. Busca nas linhas antes do cabeçalho "DANFE" (bloco de identificação do emitente)
+  if (!issuerName) {
+    const danfePos = text.indexOf('DANFE');
+    if (danfePos > 10) {
+      const beforeDanfe = text.substring(0, danfePos).trim();
+      const lines = beforeDanfe.split('\n').map((l) => l.trim()).filter((l) => l.length > 2);
+      const candidate = lines.find((l) => {
+        if (/^(RECEB|CONSULTA|AUTENTICIDADE|SEFAZ|PORTAL|FAZENDA|IDENTIFICA|DATA\s+DE|N[º°]|S[ÉE]RIE|\d+$|0\s*-\s*ENTRADA|1\s*-\s*SA)/i.test(l)) {
+          return false;
+        }
+        return isValidCompanyName(l);
+      });
+      if (candidate) {
+        issuerName = candidate;
+      }
+    }
+  }
+
+  // 3. Rótulo explícito "IDENTIFICAÇÃO DO EMITENTE"
+  if (!issuerName) {
+    const razaoMatch = text.match(/IDENTIFICA[ÇC][ÃA]O\s*(?:DO\s*)?EMITENTE[:\s]*([^\n\r]+)/i);
+    if (razaoMatch && razaoMatch[1] && isValidCompanyName(razaoMatch[1])) {
+      issuerName = razaoMatch[1].trim();
+    }
+  }
+
+  // 4. Caso não tenha rótulo explícito, linhas após o título DANFE
   if (!issuerName) {
     const danfePos = text.indexOf('DANFE');
     if (danfePos !== -1) {
@@ -163,7 +209,7 @@ export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
         .filter((l) => {
           if (l.length < 3) return false;
           if (/^(DOCUMENTO\s*AUXILIAR|CHAVE|CONSULTA|0\s*-\s*ENTRADA|1\s*-\s*SA|N[º°]|S[ÉE]RIE|FOLHA|PROTOCOLO|NATUREZA)/i.test(l)) return false;
-          return true;
+          return isValidCompanyName(l);
         });
       if (lines.length > 0) {
         issuerName = lines[0];
@@ -186,8 +232,25 @@ export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
       recipientCnpj = cnpjMatch[1];
     }
     const nameMatch = destSection.match(/(?:NOME\s*\/\s*RAZ[ÃA]O\s*SOCIAL)[:\s]*([^\n\r]+)/i);
-    if (nameMatch && nameMatch[1]) {
+    if (nameMatch && nameMatch[1] && isValidCompanyName(nameMatch[1])) {
       recipientName = nameMatch[1].trim();
+    }
+
+    // Fallback: varre linhas do quadro de destinatário procurando linha com Razão Social seguida de CNPJ
+    if (!recipientName) {
+      const lines = destSection.split('\n').map((l) => l.trim()).filter(Boolean);
+      for (const line of lines) {
+        if (/DESTINAT[ÁA]RIO/i.test(line)) continue;
+        const lineMatch = line.match(/^([^\d]+?)\s+(\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2})/);
+        if (lineMatch) {
+          const candName = lineMatch[1].trim();
+          if (isValidCompanyName(candName)) {
+            recipientName = candName;
+            if (!recipientCnpj) recipientCnpj = lineMatch[2].trim();
+            break;
+          }
+        }
+      }
     }
   }
 
@@ -262,26 +325,77 @@ export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
 
     const lines = prodSection.split('\n').map((l) => l.trim()).filter(Boolean);
 
-    // Linha de produto típica: [CÓDIGO] [DESCRIÇÃO] [NCM 8 dig] [CST] [CFOP 4 dig] [UN] [QTD] [VLR UNIT] [VLR DESC (opcional)] [VLR TOT]
-    const itemRegex = /^(?:(\S+)\s+)?(.+?)\s+(\d{8}|\d{4}\.\d{2}\.\d{2})\s+(\d{3,4})\s+([1-7]\d{3})\s+([A-Za-z0-9/²³º°]{1,10})\s+([0-9.,]+)\s+([0-9.,]+)(?:\s+([0-9.,]+))?(?:\s+([0-9.,]+))?/;
+    // Linhas fiscais contêm: NCM (8 dig ou 4.2.2), CST (3-4 dig), CFOP (4 dig), UN, QTD, VL_UNIT, [num3], [num4]
+    const fiscalRegex = /(\d{8}|\d{4}\.\d{2}\.\d{2})\s+(\d{3,4})\s+([1-7]\d{3})\s+([A-Za-z0-9/²³º°]{1,10})\s+([0-9.,]+)\s+([0-9.,]+)(?:\s+([0-9.,]+))?(?:\s+([0-9.,]+))?/;
+
+    const isHeaderLine = (l: string) => {
+      return (
+        /^(DADOS\s*DO\s*PRODUTO|TRANSPORTADOR|VOLUMES|RAZ[ÃA]O\s*SOCIAL|FRETE|ENDERE[ÇC]O|ESP[ÉE]CIE|MARCA|PESO|COD\.?\s*PROD|DESCRI[ÇC]|NCM|CST|CFOP|QTDE?|QUANT|UNID?|VL\.?\s*UNIT|VALOR|AL[ÍI]Q|BC\.?\s*ICMS|V\.?\s*IPI)/i.test(l) &&
+        !fiscalRegex.test(l)
+      );
+    };
+
+    let pendingDescriptionLines: string[] = [];
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      const match = line.match(itemRegex);
+      if (isHeaderLine(line)) {
+        continue;
+      }
 
-      if (match) {
-        const productCode = match[1] || String(items.length + 1);
-        const description = match[2].trim();
-        const ncm = match[3].replace(/\D/g, '');
-        const cst = match[4];
-        const cfop = match[5];
-        const rawUnit = match[6];
+      const fiscalMatch = line.match(fiscalRegex);
+      if (fiscalMatch) {
+        const textBeforeFiscal = line.substring(0, fiscalMatch.index).trim();
+        let fullItemHeader = '';
+
+        if (pendingDescriptionLines.length > 0) {
+          let joined = pendingDescriptionLines[0];
+          for (let j = 1; j < pendingDescriptionLines.length; j++) {
+            const prev = joined;
+            const curr = pendingDescriptionLines[j];
+            // Se a linha anterior terminar com hífen ou quebra de palavra monossílaba/consoante solta (ex: " COMO P" + "ROTECAO")
+            if (prev.endsWith('-')) {
+              joined = prev.slice(0, -1) + curr;
+            } else if (/(?:^|\s)[b-df-hj-np-tv-z]$/i.test(prev) && /^[a-záàâãéêíóôõúç]/i.test(curr)) {
+              joined = prev + curr;
+            } else {
+              joined = prev + ' ' + curr;
+            }
+          }
+          fullItemHeader = textBeforeFiscal ? `${joined} ${textBeforeFiscal}` : joined;
+          pendingDescriptionLines = [];
+        } else {
+          fullItemHeader = textBeforeFiscal;
+        }
+
+        fullItemHeader = fullItemHeader.trim();
+
+        let productCode = '';
+        let description = fullItemHeader;
+
+        // Se o cabeçalho começar com um código de produto (alfanumérico sem espaços) seguido da descrição
+        const codeMatch = fullItemHeader.match(/^(\S+)\s+(.+)$/);
+        if (codeMatch) {
+          productCode = codeMatch[1];
+          description = codeMatch[2].trim();
+        } else if (fullItemHeader) {
+          productCode = String(items.length + 1);
+          description = fullItemHeader;
+        } else {
+          productCode = String(items.length + 1);
+          description = `Item ${items.length + 1}`;
+        }
+
+        const ncm = fiscalMatch[1].replace(/\D/g, '');
+        const cst = fiscalMatch[2];
+        const cfop = fiscalMatch[3];
+        const rawUnit = fiscalMatch[4];
         const unit = normalizeUnit(rawUnit);
-        const quantity = parseMoney(match[7]);
-        const unitValue = parseMoney(match[8]);
+        const quantity = parseMoney(fiscalMatch[5]);
+        const unitValue = parseMoney(fiscalMatch[6]);
 
-        const num3 = match[9] ? parseMoney(match[9]) : null;
-        const num4 = match[10] ? parseMoney(match[10]) : null;
+        const num3 = fiscalMatch[7] ? parseMoney(fiscalMatch[7]) : null;
+        const num4 = fiscalMatch[8] ? parseMoney(fiscalMatch[8]) : null;
 
         let discountValue = 0;
         let totalValue = 0;
@@ -289,15 +403,16 @@ export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
         const calcExpected = Number((quantity * unitValue).toFixed(2));
 
         if (num4 !== null && num3 !== null) {
-          // Layout com coluna de desconto: QTDE, VLR_UNIT, VLR_DESC, VLR_TOT
-          if (Math.abs((calcExpected - num3) - num4) <= 0.05 || (num3 === 0 && Math.abs(calcExpected - num4) <= 0.05)) {
+          // Layout com coluna de desconto: QTDE, VLR_UNIT, VLR_TOT, VLR_DESC
+          if (Math.abs(calcExpected - num3) <= 0.05) {
+            totalValue = num3;
+            discountValue = num4;
+          } else if (Math.abs((calcExpected - num3) - num4) <= 0.05 || (num3 === 0 && Math.abs(calcExpected - num4) <= 0.05)) {
+            // Layout com coluna de desconto antes: QTDE, VLR_UNIT, VLR_DESC, VLR_TOT
             discountValue = num3;
             totalValue = num4;
-          } else if (Math.abs(calcExpected - num3) <= 0.05) {
-            // Se num3 for o total líquido
-            totalValue = num3;
           } else {
-            totalValue = num4 > 0 ? num4 : calcExpected;
+            totalValue = num3 > 0 ? num3 : (num4 > 0 ? num4 : calcExpected);
           }
         } else if (num3 !== null) {
           totalValue = num3 > 0 ? num3 : calcExpected;
@@ -330,6 +445,9 @@ export async function parseDanfePdf(pdfBuffer: Buffer): Promise<ParsedNfeData> {
           extracted_serial_number: inference.serial_number,
           extracted_model: inference.model,
         });
+      } else {
+        // Linha sem dados fiscais: acumula texto/continuação da descrição de produto
+        pendingDescriptionLines.push(line);
       }
     }
   }
