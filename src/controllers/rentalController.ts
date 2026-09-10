@@ -24,7 +24,9 @@ const updateEquipmentItemStatus = async (
       .eq('equipment_id', equipmentId);
 
     const hasCurrentActive = (activeRentals || []).some((item: any) => {
-      const end = (item.return_date || item.billing_period_end || '').split('T')[0];
+      const rDate = item.return_date ? String(item.return_date).split('T')[0] : null;
+      if (rDate && rDate <= todayStr) return false;
+      const end = (item.billing_period_end || '').split('T')[0];
       return end && end >= todayStr;
     });
 
