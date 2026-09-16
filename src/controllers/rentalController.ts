@@ -58,6 +58,8 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
     const dateTo = (req.query.date_to as string) || '';
     const valueMin = parseFloat(req.query.value_min as string) || 0;
     const valueMax = parseFloat(req.query.value_max as string) || 0;
+    const returnStatus = (req.query.return_status as string) || '';
+    const hideReturned = req.query.hide_returned === 'true' || returnStatus === 'active';
 
     const applyFilters = (q: any) => {
       if (search) {
@@ -83,6 +85,11 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
       if (valueMax > 0) {
         q = q.lte('total_value', valueMax);
       }
+      if (hideReturned || returnStatus === 'active') {
+        q = q.is('return_date', null);
+      } else if (returnStatus === 'returned') {
+        q = q.not('return_date', 'is', null);
+      }
       return q;
     };
 
@@ -98,7 +105,10 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
 
     // Sorting
     const sortBy = (req.query.sort_by as string) || 'billing_period_end';
-    const sortOrder = (req.query.sort_order as string)?.toLowerCase() === 'asc' ? 'asc' : 'desc';
+    const defaultOrder = sortBy === 'billing_period_end' ? 'asc' : 'desc';
+    const sortOrder = req.query.sort_order
+      ? ((req.query.sort_order as string).toLowerCase() === 'asc' ? 'asc' : 'desc')
+      : defaultOrder;
 
     const allowedSortFields: Record<string, string> = {
       billing_period_end: 'billing_period_end',
@@ -293,6 +303,18 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
       const ends = rawEquipments.map((e: any) => e.billing_period_end).filter(Boolean).sort();
       if (starts.length > 0) billing_period_start = starts[0];
       if (ends.length > 0) billing_period_end = ends[ends.length - 1];
+
+      // Se todos os equipamentos da locação tiverem data de retorno preenchida,
+      // a última (mais posterior) é definida como return_date da locação (rental_invoice)
+      const allHaveReturnDate = rawEquipments.every((e: any) => Boolean(e.return_date && String(e.return_date).trim()));
+      if (allHaveReturnDate) {
+        const sortedReturnDates = rawEquipments
+          .map((e: any) => String(e.return_date).trim().split('T')[0])
+          .sort((a: string, b: string) => a.localeCompare(b));
+        return_date = sortedReturnDates[sortedReturnDates.length - 1];
+      } else {
+        return_date = null;
+      }
 
       // Representação consolidada do primeiro / múltiplos equipamentos
       equipment_id = rawEquipments[0].equipment_id;
@@ -489,6 +511,18 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
       updateData.total_value = total_value;
       if (starts.length > 0) updateData.billing_period_start = starts[0];
       if (ends.length > 0) updateData.billing_period_end = ends[ends.length - 1];
+
+      // Se todos os equipamentos da locação tiverem data de retorno preenchida,
+      // a última (mais posterior) é definida como return_date da locação (rental_invoice)
+      const allHaveReturnDate = rawEquipments.length > 0 && rawEquipments.every((e: any) => Boolean(e.return_date && String(e.return_date).trim()));
+      if (allHaveReturnDate) {
+        const sortedReturnDates = rawEquipments
+          .map((e: any) => String(e.return_date).trim().split('T')[0])
+          .sort((a: string, b: string) => a.localeCompare(b));
+        updateData.return_date = sortedReturnDates[sortedReturnDates.length - 1];
+      } else {
+        updateData.return_date = null;
+      }
 
       updateData.equipment_id = rawEquipments[0].equipment_id || existingInvoice?.equipment_id || null;
       updateData.equipment_name = rawEquipments.length === 1 

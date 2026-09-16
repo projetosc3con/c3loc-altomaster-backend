@@ -121,6 +121,8 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
     const dateTo = (req.query.date_to as string) || '';
     const valueMin = parseFloat(req.query.value_min as string) || 0;
     const valueMax = parseFloat(req.query.value_max as string) || 0;
+    const returnStatus = (req.query.return_status as string) || '';
+    const hideReturned = req.query.hide_returned === 'true' || returnStatus === 'active';
 
     if (search) {
       query = query.or(
@@ -133,10 +135,18 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
     if (dateTo) query = query.lte('billing_period_start', dateTo);
     if (valueMin > 0) query = query.gte('total_value', valueMin);
     if (valueMax > 0) query = query.lte('total_value', valueMax);
+    if (hideReturned || returnStatus === 'active') {
+      query = query.is('return_date', null);
+    } else if (returnStatus === 'returned') {
+      query = query.not('return_date', 'is', null);
+    }
 
     // Sorting
     const sortBy = (req.query.sort_by as string) || 'billing_period_end';
-    const sortOrder = (req.query.sort_order as string)?.toLowerCase() === 'asc' ? 'asc' : 'desc';
+    const defaultOrder = sortBy === 'billing_period_end' ? 'asc' : 'desc';
+    const sortOrder = req.query.sort_order
+      ? ((req.query.sort_order as string).toLowerCase() === 'asc' ? 'asc' : 'desc')
+      : defaultOrder;
     const allowedSortFields: Record<string, string> = {
       billing_period_end: 'billing_period_end',
       billing_period_start: 'billing_period_start',

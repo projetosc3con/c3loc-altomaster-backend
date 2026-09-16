@@ -104,7 +104,7 @@ export interface BbApiErrorResponseFlat {
 // comum a outras falhas de infraestrutura do gateway BB, não específico
 // desta API).
 export interface BbApiErrorResponseGateway {
-  errors: Array<{ code: string; title?: string; message: string }>;
+  errors: Array<{ code: string; title?: string; message?: string; detail?: string }>;
 }
 
 export type BbApiErrorResponse = BbApiErrorResponseFlat | BbApiErrorResponseGateway;

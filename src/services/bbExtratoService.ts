@@ -44,9 +44,12 @@ function resolveMciTesteHeader(agencia: string, conta: string): string | undefin
   return identity;
 }
 
-function isoToDdmmaaaaInt(iso: string): number {
-  const [y, m, d] = iso.split('-');
-  return Number(`${d}${m}${y}`);
+function isoToDdmmaaaa(iso: string): string {
+  const [y, m, d] = (iso || '').split('-');
+  const day = (d || '').padStart(2, '0');
+  const month = (m || '').padStart(2, '0');
+  const year = (y || '').padStart(4, '0');
+  return `${day}${month}${year}`;
 }
 
 function ddmmaaaaToIso(value: number): string {
@@ -101,7 +104,12 @@ export class BbApiError extends Error {
     // status code X".
     const gatewayError = 'errors' in body ? body.errors[0] : null;
     const code = gatewayError?.code ?? ('code' in body ? body.code : null) ?? null;
-    const message = gatewayError?.message ?? ('message' in body ? body.message : null) ?? JSON.stringify(body);
+    const message =
+      gatewayError?.detail ??
+      gatewayError?.message ??
+      gatewayError?.title ??
+      ('message' in body ? body.message : null) ??
+      JSON.stringify(body);
 
     super(`BB API error${code ? ` ${code}` : ''} (HTTP ${status}): ${message}`);
     this.status = status;
@@ -182,8 +190,8 @@ class BbExtratoService {
         {
           params: {
             'gw-dev-app-key': appKey,
-            dataInicioSolicitacao: isoToDdmmaaaaInt(params.from),
-            dataFimSolicitacao: isoToDdmmaaaaInt(params.to),
+            dataInicioSolicitacao: isoToDdmmaaaa(params.from),
+            dataFimSolicitacao: isoToDdmmaaaa(params.to),
             numeroPaginaSolicitacao: pageNumber,
             quantidadeRegistroPaginaSolicitacao: PAGE_SIZE,
           },
