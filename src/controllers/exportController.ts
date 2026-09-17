@@ -2,6 +2,7 @@ import { Response } from 'express';
 import * as XLSX from 'xlsx';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
+import { calculateCurrentPeriodTotal } from './rentalController';
 
 const EXPORT_BUCKET = 'exports';
 // Signed URL expires after 5 minutes
@@ -168,38 +169,80 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Nenhuma locação encontrada para exportar.' });
     }
 
-    const exportData = rentals.map((r) => ({
-      'Nº Fatura': r.invoice_number || '',
-      'Cliente': r.client_name || '',
-      'CNPJ': r.cnpj || '',
-      'Equipamento': r.equipment_name || '',
-      'Tipo Equipamento': r.equipment_type || '',
-      'Patrimônio': r.asset_number || '',
-      'Obra': r.work_site || '',
-      'Início Período': r.billing_period_start
-        ? new Date(r.billing_period_start).toLocaleDateString('pt-BR')
-        : '',
-      'Fim Período': r.billing_period_end
-        ? new Date(r.billing_period_end).toLocaleDateString('pt-BR')
-        : '',
-      'Status Faturamento': r.billing_status || '',
-      'Data Devolução': r.return_date
-        ? new Date(r.return_date).toLocaleDateString('pt-BR')
-        : '',
-      'Locação (R$)': Number(r.cost_rental || 0).toFixed(2),
-      'Seguro (R$)': Number(r.cost_insurance || 0).toFixed(2),
-      'Frete (R$)': Number(r.cost_freight || 0).toFixed(2),
-      'RCD (R$)': Number(r.cost_rcd || 0).toFixed(2),
-      'Terceiros (R$)': Number(r.cost_third_party || 0).toFixed(2),
-      'Treinamento (R$)': Number(r.cost_training || 0).toFixed(2),
-      'Valor Total (R$)': Number(r.total_value || 0).toFixed(2),
-      'Vencimento': r.due_date
-        ? new Date(r.due_date).toLocaleDateString('pt-BR')
-        : '',
-      'Forma Pagamento': r.payment_method || '',
-      'Status Conciliação': r.reconciliation_status || '',
-      'Observações': r.notes || '',
-    }));
+    const currentPeriodByRentalId: Record<string, number> = {};
+    if (hideReturned || returnStatus === 'active') {
+      const rentalIds = rentals.map((r) => r.id).filter(Boolean);
+      if (rentalIds.length > 0) {
+        const { data: allEquips } = await supabase
+          .from('rental_invoice_equipments')
+          .select('id, rental_invoice_id, equipment_id, asset_number, billing_period_start, billing_period_end, return_date, total_value, created_at')
+          .in('rental_invoice_id', rentalIds);
+
+        const equipsByRental: Record<string, any[]> = {};
+        (allEquips || []).forEach((eq: any) => {
+          if (!equipsByRental[eq.rental_invoice_id]) equipsByRental[eq.rental_invoice_id] = [];
+          equipsByRental[eq.rental_invoice_id].push(eq);
+        });
+
+        const referenceDateStr = dateFrom || undefined;
+        for (const r of rentals) {
+          const equips = equipsByRental[r.id] || [];
+          currentPeriodByRentalId[r.id] = calculateCurrentPeriodTotal(
+            equips,
+            Number(r.total_value) || 0,
+            referenceDateStr,
+            { start: r.billing_period_start, end: r.billing_period_end }
+          );
+        }
+      }
+    }
+
+    const exportData = rentals.map((r) => {
+      const isActiveFilter = hideReturned || returnStatus === 'active';
+      const currentPeriodVal = currentPeriodByRentalId[r.id] !== undefined
+        ? currentPeriodByRentalId[r.id]
+        : Number(r.total_value || 0);
+
+      const row: Record<string, any> = {
+        'Nº Fatura': r.invoice_number || '',
+        'Cliente': r.client_name || '',
+        'CNPJ': r.cnpj || '',
+        'Equipamento': r.equipment_name || '',
+        'Tipo Equipamento': r.equipment_type || '',
+        'Patrimônio': r.asset_number || '',
+        'Obra': r.work_site || '',
+        'Início Período': r.billing_period_start
+          ? new Date(r.billing_period_start).toLocaleDateString('pt-BR')
+          : '',
+        'Fim Período': r.billing_period_end
+          ? new Date(r.billing_period_end).toLocaleDateString('pt-BR')
+          : '',
+        'Status Faturamento': r.billing_status || '',
+        'Data Devolução': r.return_date
+          ? new Date(r.return_date).toLocaleDateString('pt-BR')
+          : '',
+        'Locação (R$)': Number(r.cost_rental || 0).toFixed(2),
+        'Seguro (R$)': Number(r.cost_insurance || 0).toFixed(2),
+        'Frete (R$)': Number(r.cost_freight || 0).toFixed(2),
+        'RCD (R$)': Number(r.cost_rcd || 0).toFixed(2),
+        'Terceiros (R$)': Number(r.cost_third_party || 0).toFixed(2),
+        'Treinamento (R$)': Number(r.cost_training || 0).toFixed(2),
+      };
+
+      if (isActiveFilter) {
+        row['Valor Período Atual (R$)'] = Number(currentPeriodVal).toFixed(2);
+        row['Valor Total Acumulado (R$)'] = Number(r.total_value || 0).toFixed(2);
+      } else {
+        row['Valor Total (R$)'] = Number(r.total_value || 0).toFixed(2);
+      }
+
+      row['Vencimento'] = r.due_date ? new Date(r.due_date).toLocaleDateString('pt-BR') : '';
+      row['Forma Pagamento'] = r.payment_method || '';
+      row['Status Conciliação'] = r.reconciliation_status || '';
+      row['Observações'] = r.notes || '';
+
+      return row;
+    });
 
     const ws = XLSX.utils.json_to_sheet(exportData);
     ws['!cols'] = [

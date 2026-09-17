@@ -152,7 +152,7 @@ const groupNfeBills = groupBillsWithInstallments;
 export const listBills = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const { client_id, status, origin, from, to, type, unreconciled, invoice_number, search, rental_invoice_id } = req.query;
+    const { client_id, status, origin, from, to, type, unreconciled, invoice_number, search, rental_invoice_id, sort_by, sort_order } = req.query;
 
     // Paginação só se aplica ao ramo "merge completo" abaixo (bills +
     // payments pendentes) — é a única consulta que vira uma tabela grande
@@ -284,10 +284,70 @@ export const listBills = async (req: AuthRequest, res: Response) => {
       });
     }
 
+    const sortBy = (sort_by as string) || 'due_date';
+    const sortOrder = (sort_order as string) === 'asc' ? 'asc' : 'desc';
+
     finalItems.sort((a, b) => {
-      if (!a.due_date) return 1;
-      if (!b.due_date) return -1;
-      return b.due_date.localeCompare(a.due_date);
+      let comparison = 0;
+      switch (sortBy) {
+        case 'due_date': {
+          const valA = a.due_date || '';
+          const valB = b.due_date || '';
+          if (!valA && !valB) comparison = 0;
+          else if (!valA) comparison = 1;
+          else if (!valB) comparison = -1;
+          else comparison = valA.localeCompare(valB);
+          break;
+        }
+        case 'gross_value': {
+          const valA = Number(a.gross_value) || 0;
+          const valB = Number(b.gross_value) || 0;
+          comparison = valA - valB;
+          break;
+        }
+        case 'net_value': {
+          const valA = Number(a.net_value ?? a.gross_value) || 0;
+          const valB = Number(b.net_value ?? b.gross_value) || 0;
+          comparison = valA - valB;
+          break;
+        }
+        case 'counterparty_name':
+        case 'client_name': {
+          const valA = (a.counterparty_name || a.client_name || '').toLowerCase();
+          const valB = (b.counterparty_name || b.client_name || '').toLowerCase();
+          comparison = valA.localeCompare(valB, 'pt-BR');
+          break;
+        }
+        case 'origin': {
+          const valA = (a.origin || a.source || '').toLowerCase();
+          const valB = (b.origin || b.source || '').toLowerCase();
+          comparison = valA.localeCompare(valB, 'pt-BR');
+          break;
+        }
+        case 'status': {
+          const valA = (a.status || '').toLowerCase();
+          const valB = (b.status || '').toLowerCase();
+          comparison = valA.localeCompare(valB, 'pt-BR');
+          break;
+        }
+        case 'is_reconciled': {
+          const valA = a.is_reconciled || Boolean(a.settled_date) ? 1 : 0;
+          const valB = b.is_reconciled || Boolean(b.settled_date) ? 1 : 0;
+          comparison = valA - valB;
+          break;
+        }
+        default: {
+          const valA = a.due_date || '';
+          const valB = b.due_date || '';
+          if (!valA && !valB) comparison = 0;
+          else if (!valA) comparison = 1;
+          else if (!valB) comparison = -1;
+          else comparison = valA.localeCompare(valB);
+          break;
+        }
+      }
+
+      return sortOrder === 'asc' ? comparison : -comparison;
     });
 
     // Se a rota foi chamada especificamente para uma locação (rental_invoice_id) ou conciliação (unreconciled === 'true'), retorna array simples

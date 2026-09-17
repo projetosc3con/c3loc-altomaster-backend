@@ -41,6 +41,90 @@ const updateEquipmentItemStatus = async (
   }
 };
 
+export const getDaysInclusive = (startStr: string, endStr: string): number => {
+  if (!startStr || !endStr) return 0;
+  const s = new Date(startStr.split('T')[0] + 'T00:00:00Z');
+  const e = new Date(endStr.split('T')[0] + 'T00:00:00Z');
+  const diff = Math.round((e.getTime() - s.getTime()) / (1000 * 60 * 60 * 24));
+  return diff >= 0 ? diff + 1 : 0;
+};
+
+/**
+ * Para uma lista de registros de rental_invoice_equipments pertencentes a uma locação,
+ * calcula o valor consolidado proporcional do período contábil atual (mês/ciclo vigente).
+ * Se o período começou antes do 1º dia do mês atual (ex: 23/08 e estamos no mês 09),
+ * desconsidera proporcionalmente os dias anteriores a 01/09 pelo total do período.
+ */
+export const calculateCurrentPeriodTotal = (
+  equipments: any[],
+  invoiceTotalFallback: number = 0,
+  referenceDateStr?: string,
+  invoiceDatesFallback?: { start?: string | null; end?: string | null }
+): number => {
+  const refDate = referenceDateStr ? new Date(referenceDateStr.split('T')[0] + 'T00:00:00Z') : new Date();
+  const currentYear = refDate.getUTCFullYear();
+  const currentMonth = String(refDate.getUTCMonth() + 1).padStart(2, '0');
+  const firstDayOfMonth = `${currentYear}-${currentMonth}-01`;
+
+  if (!equipments || equipments.length === 0) {
+    const startStr = invoiceDatesFallback?.start ? String(invoiceDatesFallback.start).split('T')[0] : '';
+    const endStr = invoiceDatesFallback?.end ? String(invoiceDatesFallback.end).split('T')[0] : '';
+    const val = Number(invoiceTotalFallback) || 0;
+
+    if (startStr && endStr && startStr < firstDayOfMonth) {
+      const totalDays = getDaysInclusive(startStr, endStr);
+      if (endStr < firstDayOfMonth) return 0;
+      const effectiveDays = getDaysInclusive(firstDayOfMonth, endStr);
+      return totalDays > 0 ? Math.round(val * (effectiveDays / totalDays) * 100) / 100 : val;
+    }
+    return val;
+  }
+
+  const eqGroups: Record<string, any[]> = {};
+  for (const item of equipments) {
+    const key = item.equipment_id || item.asset_number || item.id;
+    if (!eqGroups[key]) eqGroups[key] = [];
+    eqGroups[key].push(item);
+  }
+
+  let total = 0;
+  for (const items of Object.values(eqGroups)) {
+    // Ordenar decrescente por billing_period_end e created_at
+    items.sort((a, b) => {
+      const endA = a.billing_period_end ? String(a.billing_period_end) : '';
+      const endB = b.billing_period_end ? String(b.billing_period_end) : '';
+      if (endB !== endA) return endB.localeCompare(endA);
+      const crA = a.created_at ? String(a.created_at) : '';
+      const crB = b.created_at ? String(b.created_at) : '';
+      return crB.localeCompare(crA);
+    });
+
+    const latest = items[0];
+    if (latest && !latest.return_date) {
+      const val = Number(latest.total_value) || 0;
+      const startStr = latest.billing_period_start ? String(latest.billing_period_start).split('T')[0] : '';
+      const endStr = latest.billing_period_end ? String(latest.billing_period_end).split('T')[0] : '';
+
+      // Se o período começou antes do primeiro dia do mês atual (ex: 23/08 com mês 09),
+      // desconsidera proporcionalmente os dias anteriores ao dia 01 do mês
+      if (startStr && endStr && startStr < firstDayOfMonth) {
+        const totalDays = getDaysInclusive(startStr, endStr);
+        if (endStr < firstDayOfMonth) {
+          // Já finalizou antes do início do mês
+        } else {
+          const effectiveDays = getDaysInclusive(firstDayOfMonth, endStr);
+          const propVal = totalDays > 0 ? (val * (effectiveDays / totalDays)) : val;
+          total += propVal;
+        }
+      } else {
+        total += val;
+      }
+    }
+  }
+
+  return Math.round(total * 100) / 100;
+};
+
 export const getAllInvoices = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
@@ -100,7 +184,7 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
 
     let statsQuery = supabase
       .from('rental_invoices')
-      .select('reconciliation_status, total_value');
+      .select('id, reconciliation_status, total_value, billing_period_start, billing_period_end, return_date');
     statsQuery = applyFilters(statsQuery);
 
     // Sorting
@@ -139,13 +223,75 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
     const pendingCount = statsData.filter(
       (item: any) => item.reconciliation_status === 'No prazo' || item.reconciliation_status === 'Atrasado' || item.reconciliation_status === 'Pendente'
     ).length;
-    const totalValue = statsData.reduce((acc: number, curr: any) => acc + Number(curr.total_value || 0), 0);
+    const accumulatedTotalValue = statsData.reduce((acc: number, curr: any) => acc + Number(curr.total_value || 0), 0);
+
+    // Coletar IDs dos registros para buscar os equipamentos vigentes em rental_invoice_equipments
+    const matchingIds = statsData.map((item: any) => item.id).filter(Boolean);
+    const currentPeriodByRentalId: Record<string, number> = {};
+    let calculatedActivePeriodSum = 0;
+
+    if (matchingIds.length > 0) {
+      const { data: allEquips, error: equipErr } = await supabase
+        .from('rental_invoice_equipments')
+        .select('id, rental_invoice_id, equipment_id, asset_number, billing_period_start, billing_period_end, return_date, total_value, created_at')
+        .in('rental_invoice_id', matchingIds);
+
+      if (!equipErr && allEquips) {
+        const equipsByRental: Record<string, any[]> = {};
+        for (const eq of allEquips) {
+          if (!equipsByRental[eq.rental_invoice_id]) equipsByRental[eq.rental_invoice_id] = [];
+          equipsByRental[eq.rental_invoice_id].push(eq);
+        }
+
+        const referenceDateStr = dateFrom || undefined;
+        for (const inv of statsData) {
+          const equips = equipsByRental[inv.id] || [];
+          const periodVal = calculateCurrentPeriodTotal(
+            equips,
+            Number(inv.total_value) || 0,
+            referenceDateStr,
+            { start: inv.billing_period_start, end: inv.billing_period_end }
+          );
+          currentPeriodByRentalId[inv.id] = periodVal;
+          calculatedActivePeriodSum += periodVal;
+        }
+      }
+    }
+
+    const currentPeriodTotalValue = Math.round(calculatedActivePeriodSum * 100) / 100;
+
+    // Enriquecer registros da página atual com current_period_value e accumulated_total_value
+    let pageData = dataResult.data || [];
+    let enrichedData = pageData.map((r: any) => {
+      const periodVal = currentPeriodByRentalId[r.id] !== undefined
+        ? currentPeriodByRentalId[r.id]
+        : Number(r.total_value) || 0;
+      return {
+        ...r,
+        current_period_value: periodVal,
+        accumulated_total_value: Number(r.total_value) || 0
+      };
+    });
+
+    // Se o filtro de locações ativas estiver ligado e a ordenação for por total_value,
+    // reordenar os itens da página atual por current_period_value
+    if ((hideReturned || returnStatus === 'active') && sortBy === 'total_value') {
+      enrichedData.sort((a: any, b: any) => {
+        const valA = a.current_period_value ?? a.total_value ?? 0;
+        const valB = b.current_period_value ?? b.total_value ?? 0;
+        return isAscending ? valA - valB : valB - valA;
+      });
+    }
+
+    const totalValue = (hideReturned || returnStatus === 'active')
+      ? currentPeriodTotalValue
+      : accumulatedTotalValue;
 
     const total = dataResult.count ?? 0;
     const totalPages = Math.ceil(total / limit);
 
     return res.json({
-      data: dataResult.data,
+      data: enrichedData,
       total,
       page,
       limit,
@@ -153,6 +299,8 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
       stats: {
         pendingReconciliationCount: pendingCount,
         totalValue,
+        currentPeriodTotalValue,
+        accumulatedTotalValue,
         monthlyReceivedTotal: totalValue
       }
     });
