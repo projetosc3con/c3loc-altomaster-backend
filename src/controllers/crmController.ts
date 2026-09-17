@@ -723,6 +723,8 @@ export const deleteDealsAndSubDependencies = async (supabase: any, dealIds: stri
   // 6. Delete rental_invoice_equipments linked to these contracts if any
   if (contractIds.length > 0) {
     await supabase.from('rental_invoice_equipments').delete().in('deal_contract_id', contractIds);
+    // Desvincular active_contract_id em quaisquer negociações que apontem para esses contratos
+    await supabase.from('crm_deals').update({ active_contract_id: null }).in('active_contract_id', contractIds);
   }
 
   // 7. Delete contracts

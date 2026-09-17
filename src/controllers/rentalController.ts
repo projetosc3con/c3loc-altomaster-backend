@@ -705,11 +705,28 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
     // Desvincular deal_id na locação para permitir exclusão sem restrições de FK
     await supabase.from('rental_invoices').update({ deal_id: null }).eq('id', id);
 
-    // Excluir contratos atrelados diretamente a esta rental_invoice_id
-    await supabase
-      .from('crm_deal_contracts')
-      .delete()
-      .eq('rental_invoice_id', id);
+    const directContractIds = (contractsByRental || []).map((c: any) => c.id).filter(Boolean);
+
+    // Se houver contratos atrelados diretamente a esta locação:
+    if (directContractIds.length > 0) {
+      // Desvincular active_contract_id de quaisquer negociações que apontem para eles
+      await supabase
+        .from('crm_deals')
+        .update({ active_contract_id: null })
+        .in('active_contract_id', directContractIds);
+
+      // Excluir registros de equipamentos atrelados a esses contratos
+      await supabase
+        .from('rental_invoice_equipments')
+        .delete()
+        .in('deal_contract_id', directContractIds);
+
+      // Excluir contratos atrelados diretamente a esta rental_invoice_id
+      await supabase
+        .from('crm_deal_contracts')
+        .delete()
+        .in('id', directContractIds);
+    }
 
     // Excluir os crm_deals e todas as suas subdependências (contracts, forms, activities, tasks)
     if (relatedDealIds.size > 0) {
@@ -722,13 +739,19 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
       .update({ rental_invoice_id: null })
       .eq('rental_invoice_id', id);
 
-    // 6. Excluir itens da locação em rental_invoice_equipments
+    // 6. Excluir possíveis notas fiscais de serviço atreladas (invoice_nfse)
+    await supabase
+      .from('invoice_nfse')
+      .delete()
+      .eq('invoice_id', id);
+
+    // 7. Excluir itens da locação em rental_invoice_equipments
     await supabase
       .from('rental_invoice_equipments')
       .delete()
       .eq('rental_invoice_id', id);
 
-    // 7. Excluir a locação em rental_invoices
+    // 8. Excluir a locação em rental_invoices
     const { error: invoiceDeleteError } = await supabase
       .from('rental_invoices')
       .delete()

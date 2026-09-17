@@ -2,6 +2,92 @@ import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient } from '../config/supabase';
 
+/**
+ * Helper to fetch and resolve active rental details for equipment with status 'Locado'.
+ * Searches both rental_invoice_equipments (multi-equipment contracts) and rental_invoices (legacy direct).
+ */
+const fetchActiveRentalsForEquipments = async (supabase: any, equipmentIds: string[]) => {
+  if (!equipmentIds || equipmentIds.length === 0) return {};
+
+  // 1. Fetch from rental_invoice_equipments joined with rental_invoices
+  const { data: items } = await supabase
+    .from('rental_invoice_equipments')
+    .select('equipment_id, billing_period_start, billing_period_end, return_date, created_at, rental_invoices(id, invoice_number, client_name, billing_period_start, billing_period_end, work_site, billing_status, return_date, created_at)')
+    .in('equipment_id', equipmentIds);
+
+  // 2. Fetch from direct rental_invoices (legacy records)
+  const { data: directs } = await supabase
+    .from('rental_invoices')
+    .select('id, equipment_id, invoice_number, client_name, billing_period_start, billing_period_end, work_site, billing_status, return_date, created_at')
+    .in('equipment_id', equipmentIds);
+
+  const candidatesByEq: Record<string, any[]> = {};
+  for (const id of equipmentIds) {
+    candidatesByEq[id] = [];
+  }
+
+  for (const item of (items || [])) {
+    const inv: any = item.rental_invoices;
+    if (!inv || inv.billing_status === 'Cancelada') continue;
+    candidatesByEq[item.equipment_id].push({
+      client_name: inv.client_name,
+      billing_period_start: item.billing_period_start || inv.billing_period_start,
+      billing_period_end: item.billing_period_end || inv.billing_period_end,
+      work_site: inv.work_site,
+      return_date: item.return_date || inv.return_date,
+      invoice_number: inv.invoice_number,
+      created_at: item.created_at || inv.created_at
+    });
+  }
+
+  for (const inv of (directs || [])) {
+    if (inv.billing_status === 'Cancelada') continue;
+    candidatesByEq[inv.equipment_id].push({
+      client_name: inv.client_name,
+      billing_period_start: inv.billing_period_start,
+      billing_period_end: inv.billing_period_end,
+      work_site: inv.work_site,
+      return_date: inv.return_date,
+      invoice_number: inv.invoice_number,
+      created_at: inv.created_at
+    });
+  }
+
+  const rentalMap: Record<string, any> = {};
+  for (const id of equipmentIds) {
+    const list = candidatesByEq[id] || [];
+    if (list.length > 0) {
+      list.sort((a, b) => {
+        // Ativas (sem data de retorno) têm prioridade máxima
+        const aActive = !a.return_date ? 1 : 0;
+        const bActive = !b.return_date ? 1 : 0;
+        if (aActive !== bActive) return bActive - aActive;
+
+        // Fim de período mais recente/posterior
+        const aEnd = a.billing_period_end || '';
+        const bEnd = b.billing_period_end || '';
+        if (aEnd !== bEnd) return bEnd.localeCompare(aEnd);
+
+        // Início de período mais recente
+        const aStart = a.billing_period_start || '';
+        const bStart = b.billing_period_start || '';
+        return bStart.localeCompare(aStart);
+      });
+
+      const best = list[0];
+      rentalMap[id] = {
+        rental_client_name: best.client_name,
+        rental_period_start: best.billing_period_start,
+        rental_period_end: best.billing_period_end,
+        rental_work_site: best.work_site,
+        rental_contract_number: best.invoice_number,
+      };
+    }
+  }
+
+  return rentalMap;
+};
+
 export const getAllEquipments = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
@@ -12,34 +98,12 @@ export const getAllEquipments = async (req: AuthRequest, res: Response) => {
 
     if (error) throw error;
 
-    // For equipment with status 'Locado', fetch active rental info
+    // Para equipamentos com status 'Locado', buscar informações da locação ativa
     const locadoIds = (equipments || [])
       .filter((e: any) => e.status === 'Locado')
       .map((e: any) => e.id);
 
-    let rentalMap: Record<string, any> = {};
-    if (locadoIds.length > 0) {
-      const { data: rentals } = await supabase
-        .from('rental_invoices')
-        .select('equipment_id, client_name, billing_period_start, billing_period_end, work_site, billing_status')
-        .in('equipment_id', locadoIds)
-        .neq('billing_status', 'Cancelada')
-        .order('billing_period_end', { ascending: false });
-
-      if (rentals) {
-        for (const r of rentals) {
-          // Keep only the most recent active rental per equipment
-          if (!rentalMap[r.equipment_id]) {
-            rentalMap[r.equipment_id] = {
-              rental_client_name: r.client_name,
-              rental_period_start: r.billing_period_start,
-              rental_period_end: r.billing_period_end,
-              rental_work_site: r.work_site,
-            };
-          }
-        }
-      }
-    }
+    const rentalMap = await fetchActiveRentalsForEquipments(supabase, locadoIds);
 
     const enriched = (equipments || []).map((eq: any) => ({
       ...eq,
@@ -53,7 +117,7 @@ export const getAllEquipments = async (req: AuthRequest, res: Response) => {
 };
 
 export const getEquipmentById = async (req: AuthRequest, res: Response) => {
-  const { id } = req.params;
+  const id = String(req.params.id);
   try {
     const supabase = getSupabaseUserClient(req.token!);
     const { data, error } = await supabase
@@ -67,22 +131,11 @@ export const getEquipmentById = async (req: AuthRequest, res: Response) => {
 
     let enriched = { ...data };
     if (data.status === 'Locado') {
-      const { data: rental } = await supabase
-        .from('rental_invoices')
-        .select('client_name, billing_period_start, billing_period_end, work_site, billing_status')
-        .eq('equipment_id', id)
-        .neq('billing_status', 'Cancelada')
-        .order('billing_period_end', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (rental) {
+      const rentalMap = await fetchActiveRentalsForEquipments(supabase, [id]);
+      if (rentalMap[id]) {
         enriched = {
           ...enriched,
-          rental_client_name: rental.client_name,
-          rental_period_start: rental.billing_period_start,
-          rental_period_end: rental.billing_period_end,
-          rental_work_site: rental.work_site,
+          ...rentalMap[id],
         };
       }
     }

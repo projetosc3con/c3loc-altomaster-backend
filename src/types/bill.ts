@@ -51,6 +51,7 @@ export interface CreateBillPayload {
   payment_type?: 'a_vista' | 'parcelado';
   installments?: ManualInstallmentInput[];
   bank_slip_url?: string[] | string | null;
+  rental_invoice_id?: string | null;
 }
 
 export interface UpdateBillPayload {

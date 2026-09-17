@@ -321,7 +321,7 @@ export const createBill = async (req: AuthRequest, res: Response) => {
       type, counterparty_name, description, barcode,
       gross_value, due_date, status, is_reconciled, already_settled, settled_date,
       bank_transaction_date, bank_raw_snapshot, payment_type, installments,
-      bank_slip_url, invoice_number,
+      bank_slip_url, invoice_number, rental_invoice_id,
     } = req.body as CreateBillPayload;
 
     if (type !== 'receivable' && type !== 'payable') {
@@ -370,6 +370,7 @@ export const createBill = async (req: AuthRequest, res: Response) => {
           origin: 'MANUAL' as const,
           type,
           client_id: null,
+          rental_invoice_id: rental_invoice_id || null,
           counterparty_name: counterparty_name?.trim() || null,
           description: instDesc,
           gross_value: instGross,
@@ -414,6 +415,7 @@ export const createBill = async (req: AuthRequest, res: Response) => {
         origin: 'MANUAL',
         type,
         client_id: null,
+        rental_invoice_id: rental_invoice_id || null,
         counterparty_name: counterparty_name || null,
         description: description || null,
         gross_value,

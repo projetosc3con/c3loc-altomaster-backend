@@ -18,7 +18,7 @@ const adminOnly = authorize(['Administrador']);
 router.get('/', fullAccess, listBills);
 router.post('/', fullAccess, createBill);
 router.patch('/:id', managerOrAdmin, updateBill);
-router.delete('/:id', adminOnly, deleteBill);
+router.delete('/:id', managerOrAdmin, deleteBill);
 router.post('/reconcile', fullAccess, reconcileBankStatement);
 router.post('/:id/link-statement-line', fullAccess, linkStatementLineToBill);
 
