@@ -1,6 +1,6 @@
 export type BillOrigin = 'ASAAS' | 'MANUAL' | 'NFE';
 export type BillType = 'receivable' | 'payable';
-export type BillStatus = 'Pendente' | 'Atrasado' | 'Recebido' | 'Divergente' | 'No prazo';
+export type BillStatus = 'Pendente' | 'Atrasado' | 'Recebido' | 'Pago' | 'Divergente' | 'No prazo';
 
 export interface Bill {
   id: string;
@@ -130,13 +130,17 @@ export interface ReconcileBankStatementResponse {
   unmatched_count: number;
 }
 
-// Envelope paginado de GET /api/bills — só usado no ramo "merge completo"
-// (bills + payments pendentes, sem filtros de bills). O ramo com filtros
-// (picker de lançamentos não conciliados) continua devolvendo array puro.
 export interface PaginatedBillStatement {
   data: BillStatementItem[];
   total: number;
   page: number;
   limit: number;
   totalPages: number;
+  summary?: {
+    total_gross: number;
+    total_net: number;
+    total_pending?: number;
+    total_settled?: number;
+    count: number;
+  };
 }

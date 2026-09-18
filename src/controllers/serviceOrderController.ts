@@ -2,6 +2,7 @@ import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient } from '../config/supabase';
 import { recordStockMovement } from '../services/stockMovementService';
+import { recordHourMeterUpdate } from '../services/hourMeterService';
 
 const SERVICE_ORDER_SELECT = '*, service_order_parts(*, parts(*)), service_order_labor(*), executor:users_profiles!executed_by(id, full_name)';
 
@@ -135,6 +136,19 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
             .from('equipments')
             .update({ status: isAvailable ? 'Disponível' : 'Em Manutenção' })
             .eq('id', osData.equipment_id);
+    }
+
+    // 2.1 Se hour_meter_after for informado, atualizar o horímetro do equipamento e registrar log
+    if (osData.equipment_id && osData.hour_meter_after != null && osData.hour_meter_after !== '') {
+        await recordHourMeterUpdate(supabase, {
+            equipment_id: osData.equipment_id,
+            new_hour_meter: Number(osData.hour_meter_after),
+            source_type: 'service_order',
+            reference_id: os.id,
+            reference_number: os.os_number ? String(os.os_number) : null,
+            notes: `Horímetro registrado na OS #${os.os_number || ''}`,
+            created_by: req.user?.id || null,
+        });
     }
 
     // 3. Add parts if provided
@@ -319,6 +333,20 @@ export const updateServiceOrder = async (req: AuthRequest, res: Response) => {
                     .update({ status: 'Em Manutenção' })
                     .eq('id', os.equipment_id);
             }
+        }
+
+        // 2.1 Se hour_meter_after for informado, atualizar o horímetro do equipamento e registrar log
+        const effectiveEqId = os.equipment_id || osData.equipment_id;
+        if (effectiveEqId && osData.hour_meter_after != null && osData.hour_meter_after !== '') {
+            await recordHourMeterUpdate(supabase, {
+                equipment_id: effectiveEqId,
+                new_hour_meter: Number(osData.hour_meter_after),
+                source_type: 'service_order',
+                reference_id: String(id),
+                reference_number: os.os_number ? String(os.os_number) : null,
+                notes: `Horímetro atualizado na OS #${os.os_number || ''}`,
+                created_by: req.user?.id || null,
+            });
         }
 
         // 3. Replace parts: update stock, delete old service_order_parts, insert new

@@ -70,7 +70,7 @@ function groupBillsWithInstallments(items: BillStatementItem[]): BillStatementIt
         ...single,
         installments: [single],
         installments_count: 1,
-        paid_installments_count: single.status === 'Recebido' || single.status === 'No prazo' ? 1 : 0,
+        paid_installments_count: single.status === 'Recebido' || single.status === 'Pago' || single.status === 'No prazo' ? 1 : 0,
       });
       continue;
     }
@@ -88,16 +88,16 @@ function groupBillsWithInstallments(items: BillStatementItem[]): BillStatementIt
     const sumFee = installments.reduce((acc, curr) => acc + (Number(curr.fee_amount) || 0), 0);
     const totalFee = Math.round(sumFee * 100) / 100;
 
-    const paidCount = installments.filter((i) => i.status === 'Recebido' || i.status === 'No prazo').length;
+    const paidCount = installments.filter((i) => i.status === 'Recebido' || i.status === 'Pago' || i.status === 'No prazo').length;
     const allReconciled = installments.every((i) => i.is_reconciled);
 
     // Próximo vencimento pendente (ou o último se todos quitados)
-    const pendingInst = installments.find((i) => i.status !== 'Recebido' && i.status !== 'No prazo');
+    const pendingInst = installments.find((i) => i.status !== 'Recebido' && i.status !== 'Pago' && i.status !== 'No prazo');
     const targetDueDate = pendingInst?.due_date || installments[installments.length - 1]?.due_date || first.due_date;
 
     let consolidatedStatus = 'Pendente';
     if (paidCount === totalCount) {
-      consolidatedStatus = 'Recebido';
+      consolidatedStatus = first.type === 'payable' ? 'Pago' : 'Recebido';
     } else if (paidCount > 0) {
       consolidatedStatus = `Parcial (${paidCount}/${totalCount})`;
     } else {
@@ -213,7 +213,7 @@ export const listBills = async (req: AuthRequest, res: Response) => {
       if (status) {
         if (status === 'Pendente') paymentsQuery = paymentsQuery.eq('status', 'PENDING');
         else if (status === 'Atrasado') paymentsQuery = paymentsQuery.eq('status', 'OVERDUE');
-        else if (status === 'Recebido') paymentsQuery = paymentsQuery.eq('status', 'RECEIVED');
+        else if (status === 'Recebido' || status === 'Pago') paymentsQuery = paymentsQuery.eq('status', 'RECEIVED');
         else if (status === 'Aguardando compensação') paymentsQuery = paymentsQuery.eq('status', 'CONFIRMED');
         else paymentsQuery = paymentsQuery.eq('status', '__NONE__');
       }
@@ -361,7 +361,29 @@ export const listBills = async (req: AuthRequest, res: Response) => {
     const start = (page - 1) * limit;
     const paginated = finalItems.slice(start, start + limit);
 
-    return res.json({ data: paginated, total, page, limit, totalPages });
+    const totalGross = finalItems.reduce((acc, item) => acc + (Number(item.gross_value) || 0), 0);
+    const totalNet = finalItems.reduce((acc, item) => acc + (Number(item.net_value ?? item.gross_value) || 0), 0);
+    const totalPending = finalItems
+      .filter((i) => !i.is_reconciled && !Boolean(i.settled_date) && i.status !== 'Recebido' && i.status !== 'Pago' && i.status !== 'No prazo')
+      .reduce((acc, item) => acc + (Number(item.gross_value) || 0), 0);
+    const totalSettled = finalItems
+      .filter((i) => i.is_reconciled || Boolean(i.settled_date) || i.status === 'Recebido' || i.status === 'Pago' || i.status === 'No prazo')
+      .reduce((acc, item) => acc + (Number(item.gross_value) || 0), 0);
+
+    return res.json({
+      data: paginated,
+      total,
+      page,
+      limit,
+      totalPages,
+      summary: {
+        total_gross: totalGross,
+        total_net: totalNet,
+        total_pending: totalPending,
+        total_settled: totalSettled,
+        count: total,
+      }
+    });
   } catch (error: any) {
     console.error('[listBills] Erro:', error.message);
     return res.status(500).json({ error: error.message });
@@ -394,16 +416,18 @@ export const createBill = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: 'due_date é obrigatório' });
     }
 
-    const resolvedStatus = status || (already_settled ? 'Recebido' : 'Pendente');
+    const defaultSettledStatus = type === 'payable' ? 'Pago' : 'Recebido';
+    const resolvedStatus = status || (already_settled ? defaultSettledStatus : 'Pendente');
 
     let reconciledAt: string | null = null;
+    const isSettled = resolvedStatus === 'Recebido' || resolvedStatus === 'Pago' || resolvedStatus === 'No prazo';
     if (is_reconciled !== undefined) {
       if (is_reconciled) {
         reconciledAt = settled_date ? new Date(settled_date as string).toISOString() : new Date().toISOString();
       } else {
         reconciledAt = null;
       }
-    } else if (already_settled) {
+    } else if (already_settled || isSettled) {
       reconciledAt = settled_date ? new Date(settled_date as string).toISOString() : new Date().toISOString();
     }
 

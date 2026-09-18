@@ -152,6 +152,7 @@ export const createEquipment = async (req: AuthRequest, res: Response) => {
     const insertData = {
       ...req.body,
       created_by: req.user?.id || req.body.created_by || null,
+      hour_meter: req.body.hour_meter != null && req.body.hour_meter !== '' ? Number(req.body.hour_meter) : 0,
     };
     const { data, error } = await supabase
       .from('equipments')
@@ -160,6 +161,21 @@ export const createEquipment = async (req: AuthRequest, res: Response) => {
       .single();
 
     if (error) throw error;
+
+    if (data && data.hour_meter != null && Number(data.hour_meter) > 0) {
+      await supabase
+        .from('equipment_hour_meter_logs')
+        .insert({
+          equipment_id: data.id,
+          hour_meter: Number(data.hour_meter),
+          previous_hour_meter: null,
+          source_type: 'manual',
+          reference_id: data.id,
+          notes: 'Horímetro inicial informado no cadastro',
+          created_by: req.user?.id || null,
+        });
+    }
+
     return res.status(201).json(data);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
@@ -180,6 +196,20 @@ export const updateEquipment = async (req: AuthRequest, res: Response) => {
     delete updateData.rental_work_site;
     delete updateData.rental_contract_number;
 
+    const userRole = req.profile?.access_level;
+    const canEditHourMeter = userRole === 'Administrador' || userRole === 'Diretoria';
+
+    if (updateData.hour_meter !== undefined) {
+      if (!canEditHourMeter) {
+        // Usuários sem permissão não podem alterar o horímetro
+        delete updateData.hour_meter;
+      } else if (updateData.hour_meter !== null && updateData.hour_meter !== '') {
+        updateData.hour_meter = Number(updateData.hour_meter);
+      } else {
+        updateData.hour_meter = 0;
+      }
+    }
+
     const { data, error } = await supabase
       .from('equipments')
       .update(updateData)
@@ -188,6 +218,32 @@ export const updateEquipment = async (req: AuthRequest, res: Response) => {
       .single();
 
     if (error) throw error;
+
+    if (updateData.hour_meter !== undefined && canEditHourMeter && data) {
+      const { data: currentEq } = await supabase
+        .from('equipments')
+        .select('hour_meter')
+        .eq('id', id)
+        .single();
+
+      const prevHourMeter = currentEq?.hour_meter != null ? Number(currentEq.hour_meter) : null;
+      const newHour = Number(updateData.hour_meter);
+
+      if (prevHourMeter === null || Math.abs(prevHourMeter - newHour) > 0.001) {
+        await supabase
+          .from('equipment_hour_meter_logs')
+          .insert({
+            equipment_id: id,
+            hour_meter: newHour,
+            previous_hour_meter: prevHourMeter,
+            source_type: 'manual',
+            reference_id: id,
+            notes: 'Ajuste manual de horímetro',
+            created_by: req.user?.id || null,
+          });
+      }
+    }
+
     return res.json(data);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
@@ -250,3 +306,147 @@ export const getEquipmentRentals = async (req: AuthRequest, res: Response) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
+export const getEquipmentDocuments = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+    const { data, error } = await supabase
+      .from('equipment_documents')
+      .select('*, created_by_profile:users_profiles!created_by(id, full_name), updated_by_profile:users_profiles!updated_by(id, full_name)')
+      .eq('equipment_id', id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    return res.json(data || []);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+export const createEquipmentDocument = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+    const { document_name, file_url, file_name, file_size } = req.body;
+
+    if (!document_name || !file_url) {
+      return res.status(400).json({ error: 'Nome do documento e URL do arquivo são obrigatórios.' });
+    }
+
+    const { data, error } = await supabase
+      .from('equipment_documents')
+      .insert([
+        {
+          equipment_id: id,
+          document_name,
+          file_url,
+          file_name: file_name || null,
+          file_size: file_size || null,
+          created_by: req.user?.id || null,
+          updated_by: req.user?.id || null,
+        }
+      ])
+      .select('*, created_by_profile:users_profiles!created_by(id, full_name)')
+      .single();
+
+    if (error) throw error;
+    return res.status(201).json(data);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+export const updateEquipmentDocument = async (req: AuthRequest, res: Response) => {
+  const { docId } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+    const { document_name } = req.body;
+
+    if (!document_name) {
+      return res.status(400).json({ error: 'Nome do documento é obrigatório.' });
+    }
+
+    const { data, error } = await supabase
+      .from('equipment_documents')
+      .update({
+        document_name,
+        updated_by: req.user?.id || null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', docId)
+      .select('*, created_by_profile:users_profiles!created_by(id, full_name), updated_by_profile:users_profiles!updated_by(id, full_name)')
+      .single();
+
+    if (error) throw error;
+    return res.json(data);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+export const deleteEquipmentDocument = async (req: AuthRequest, res: Response) => {
+  const { docId } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+    const { error } = await supabase
+      .from('equipment_documents')
+      .delete()
+      .eq('id', docId);
+
+    if (error) throw error;
+    return res.status(204).send();
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+export const getEquipmentServiceOrders = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+
+    // Buscar o equipamento para obter seu asset_number também
+    const { data: eq } = await supabase
+      .from('equipments')
+      .select('id, asset_number')
+      .eq('id', id)
+      .single();
+
+    let query = supabase
+      .from('service_orders')
+      .select('*, executor:users_profiles!executed_by(id, full_name)')
+      .order('execution_date', { ascending: false, nullsFirst: false });
+
+    if (eq?.asset_number) {
+      query = query.or(`equipment_id.eq.${id},equipment_asset_number.eq.${eq.asset_number}`);
+    } else {
+      query = query.eq('equipment_id', id);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    return res.json(data || []);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+export const getEquipmentHourMeterLogs = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+    const { data, error } = await supabase
+      .from('equipment_hour_meter_logs')
+      .select('*, created_by_profile:users_profiles!created_by(id, full_name)')
+      .eq('equipment_id', id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    return res.json(data || []);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+};
+

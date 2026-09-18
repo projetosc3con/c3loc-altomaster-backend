@@ -39,7 +39,7 @@ function resolvePeriod(from: unknown, to: unknown): { from: string; to: string }
 async function applyBankLineToBill(supabase: ReturnType<typeof getSupabaseUserClient>, billId: string, line: BankStatementLine) {
   const { data: existing, error: fetchError } = await supabase
     .from('bills')
-    .select('net_value')
+    .select('net_value, type')
     .eq('id', billId)
     .single();
   if (fetchError) throw fetchError;
@@ -58,7 +58,7 @@ async function applyBankLineToBill(supabase: ReturnType<typeof getSupabaseUserCl
       net_value: line.value,
       bank_transaction_date: line.bank_date,
       bank_raw_snapshot: line.raw,
-      status: isDivergent ? 'Divergente' : 'Recebido',
+      status: isDivergent ? 'Divergente' : (existing.type === 'payable' ? 'Pago' : 'Recebido'),
       reconciled_at: new Date().toISOString(),
     })
     .eq('id', billId)

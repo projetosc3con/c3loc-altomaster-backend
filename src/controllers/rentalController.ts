@@ -2,6 +2,7 @@ import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
 import { deleteDealsAndSubDependencies } from './crmController';
+import { recordHourMeterUpdate } from '../services/hourMeterService';
 
 const updateEquipmentItemStatus = async (
   supabase: any,
@@ -754,6 +755,24 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
       .single();
 
     if (error) throw error;
+
+    // Registrar horímetro de retorno para equipamentos com devolução informada
+    if (rawEquipments && rawEquipments.length > 0) {
+      for (const eq of rawEquipments) {
+        const returnHourMeter = eq.hour_meter ?? eq.return_hour_meter;
+        if (eq.equipment_id && returnHourMeter != null && returnHourMeter !== '') {
+          await recordHourMeterUpdate(supabase, {
+            equipment_id: eq.equipment_id,
+            new_hour_meter: Number(returnHourMeter),
+            source_type: 'rental_return',
+            reference_id: String(id),
+            reference_number: updatedInvoice?.invoice_number ? String(updatedInvoice.invoice_number) : null,
+            notes: `Horímetro de retorno registrado na locação #${updatedInvoice?.invoice_number || id}`,
+            created_by: req.user?.id || null,
+          });
+        }
+      }
+    }
 
     return res.json(updatedInvoice);
   } catch (error: any) {

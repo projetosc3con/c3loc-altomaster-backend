@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient } from '../config/supabase';
+import { recordHourMeterUpdate } from '../services/hourMeterService';
 
 /**
  * GET /api/logistics/contracts
@@ -451,6 +452,22 @@ export const finishProcessing = async (req: AuthRequest, res: Response) => {
         .in('id', equipmentIds);
       if (eqUpdateError) {
         console.error('[logisticsController] Erro ao atualizar status dos equipamentos para Locado:', eqUpdateError);
+      }
+    }
+
+    // 5. Registrar horímetro de saída de cada equipamento na triagem da locação
+    for (const item of equipmentsList) {
+      if (item.equipment_id && item.hour_meter != null && item.hour_meter !== '') {
+        const refNumber = contract.contract_number ? String(contract.contract_number) : (newInvoice.invoice_number ? String(newInvoice.invoice_number) : null);
+        await recordHourMeterUpdate(supabase, {
+          equipment_id: item.equipment_id,
+          new_hour_meter: Number(item.hour_meter),
+          source_type: 'rental_dispatch',
+          reference_id: newInvoice.id,
+          reference_number: refNumber,
+          notes: `Horímetro de saída registrado na triagem do Contrato #${refNumber || id}`,
+          created_by: req.user?.id || null,
+        });
       }
     }
 
