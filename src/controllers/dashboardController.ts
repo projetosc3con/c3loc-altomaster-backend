@@ -69,11 +69,11 @@ const getAdminDashboard = async (req: AuthRequest, res: Response, supabase: any)
       ? ((currentMonthTotal - prevMonthTotal) / Math.abs(prevMonthTotal)) * 100
       : currentMonthTotal !== 0 ? 100 : 0;
 
-    // ── 2. Pending reconciliation count (bills) ──
-    const { count: pendingReconciliationCount } = await supabase
+    // ── 2. Overdue bills count (status = 'Atrasado') ──
+    const { count: overdueBillsCount } = await supabase
       .from('bills')
       .select('*', { count: 'exact', head: true })
-      .in('status', ['No prazo', 'Atrasado', 'Pendente']);
+      .eq('status', 'Atrasado');
 
     // ── 3. Equipment with status "Locado" ──
     const { count: rentedEquipmentCount } = await supabase
@@ -130,13 +130,87 @@ const getAdminDashboard = async (req: AuthRequest, res: Response, supabase: any)
       }
     });
 
-    // ── 7. Recent invoices ──
-    const { data: recentInvoices } = await supabase
+    // ── 7. Upcoming / Closest Payables (10 closest to today) ──
+    const { data: payablesData } = await supabase
+      .from('bills')
+      .select('id, counterparty_name, description, gross_value, net_value, due_date, status, origin, barcode, bank_raw_snapshot')
+      .eq('type', 'payable')
+      .not('due_date', 'is', null);
+
+    const todayDate = new Date();
+    todayDate.setHours(0, 0, 0, 0);
+
+    const upcomingPayables = (payablesData || [])
+      .map((b: any) => {
+        const [y, m, d] = (b.due_date || '').split('-').map(Number);
+        const billDate = new Date(y, m - 1, d);
+        billDate.setHours(0, 0, 0, 0);
+        const diffTime = billDate.getTime() - todayDate.getTime();
+        const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+        const absDiffDays = Math.abs(diffDays);
+
+        return {
+          id: b.id,
+          counterparty_name: b.counterparty_name || (b.bank_raw_snapshot as any)?.issuer_name || 'Não informado',
+          description: b.description || 'Conta a pagar',
+          due_date: b.due_date,
+          gross_value: Number(b.gross_value || 0),
+          net_value: Number(b.net_value ?? b.gross_value ?? 0),
+          status: b.status,
+          origin: b.origin,
+          diff_days: diffDays,
+          abs_diff_days: absDiffDays,
+          invoice_number: (b.bank_raw_snapshot as any)?.invoice_number || (b.bank_raw_snapshot as any)?.document_number || null,
+        };
+      })
+      .sort((a: any, b: any) => {
+        if (a.abs_diff_days !== b.abs_diff_days) {
+          return a.abs_diff_days - b.abs_diff_days;
+        }
+        return (a.due_date || '').localeCompare(b.due_date || '');
+      })
+      .slice(0, 10);
+
+    // ── 8. Ending Rentals (sem return_date, ordenados por billing_period_end ASC) ──
+    const { data: endingRentalsData, error: endingRentalsErr } = await supabase
       .from('rental_invoices')
-      .select('id, client_name, equipment_name, asset_number, due_date, total_value, billing_status')
-      .not('due_date', 'is', null)
-      .order('due_date', { ascending: false })
+      .select('id, client_name, equipment_name, asset_number, billing_period_start, billing_period_end, return_date, total_value, billing_status, invoice_number, work_site')
+      .is('return_date', null)
+      .not('billing_period_end', 'is', null)
+      .order('billing_period_end', { ascending: true })
       .limit(5);
+
+    if (endingRentalsErr) {
+      console.error('Erro ao buscar ending rentals no dashboard:', endingRentalsErr);
+    }
+
+    const todayRentalsDate = new Date();
+    todayRentalsDate.setHours(0, 0, 0, 0);
+
+    const endingRentals = (endingRentalsData || []).map((r: any) => {
+      let diffDays = 0;
+      if (r.billing_period_end) {
+        const [y, m, d] = String(r.billing_period_end).split('-').map(Number);
+        const endDate = new Date(y, m - 1, d);
+        endDate.setHours(0, 0, 0, 0);
+        const diffTime = endDate.getTime() - todayRentalsDate.getTime();
+        diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+      }
+
+      return {
+        id: r.id,
+        client_name: r.client_name || 'Não informado',
+        equipment_name: r.equipment_name || 'Equipamento',
+        asset_number: r.asset_number || null,
+        billing_period_start: r.billing_period_start,
+        billing_period_end: r.billing_period_end,
+        total_value: Number(r.total_value || 0),
+        billing_status: r.billing_status || 'Pendente',
+        invoice_number: r.invoice_number || null,
+        work_site: r.work_site || null,
+        diff_days: diffDays,
+      };
+    });
 
     return res.json({
       type: 'admin',
@@ -144,13 +218,14 @@ const getAdminDashboard = async (req: AuthRequest, res: Response, supabase: any)
         currentMonthTotal,
         prevMonthTotal,
         variation: Math.round(variation * 10) / 10,
-        pendingReconciliationCount: pendingReconciliationCount || 0,
+        overdueBillsCount: overdueBillsCount || 0,
         rentedEquipmentCount: rentedEquipmentCount || 0,
         serviceOrderCount: serviceOrderCount || 0,
       },
       revenueByMonth,
       fleetStatus,
-      recentInvoices: recentInvoices || [],
+      upcomingPayables,
+      endingRentals,
     });
   } catch (error: any) {
     return res.status(500).json({ error: error.message });

@@ -22,6 +22,7 @@ import serasaRoutes from './routes/serasaRoutes';
 import fiscalRoutes from './routes/fiscalRoutes';
 import billRoutes from './routes/billRoutes';
 import powerBiRoutes from './routes/powerBiRoutes';
+import cronRoutes from './routes/cronRoutes';
 
 dotenv.config();
 
@@ -49,6 +50,9 @@ app.use('/api/webhooks', asaasWebhookRoutes);
 
 // Rota com autenticação via API Key estática para ingestão do Power BI
 app.use('/api/powerbi', powerBiRoutes);
+
+// Rotas de Cron Jobs da Vercel
+app.use('/api/cron', cronRoutes);
 
 // Protected routes
 app.use('/api/rentals', authenticate, rentalRoutes);

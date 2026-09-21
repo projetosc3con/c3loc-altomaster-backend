@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/update-overdue-bills",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}
