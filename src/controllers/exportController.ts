@@ -2,7 +2,8 @@ import { Response } from 'express';
 import * as XLSX from 'xlsx';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
-import { calculatePeriodProportionalValue, resolveWindow } from './rentalController';
+import { calculateRentalPeriodValue, PeriodWindow } from './rentalController';
+import { getFilteredBills } from './billController';
 
 const EXPORT_BUCKET = 'exports';
 // Signed URL expires after 5 minutes
@@ -125,6 +126,24 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
     const returnStatus = (req.query.return_status as string) || '';
     const hideReturned = req.query.hide_returned === 'true' || returnStatus === 'active';
 
+    // Se houver filtro de data (início de período), buscar os contratos que possuem período começando no intervalo
+    let matchingRentalIdsForDates: string[] | null = null;
+    if (dateFrom || dateTo) {
+      let eqQuery = supabase.from('rental_invoice_equipments').select('rental_invoice_id');
+      if (dateFrom) eqQuery = eqQuery.gte('billing_period_start', dateFrom);
+      if (dateTo) eqQuery = eqQuery.lte('billing_period_start', dateTo);
+      const { data: eqData } = await eqQuery;
+      const eqRentalIds = (eqData || []).map((e: any) => e.rental_invoice_id).filter(Boolean);
+
+      let invQuery = supabase.from('rental_invoices').select('id');
+      if (dateFrom) invQuery = invQuery.gte('billing_period_start', dateFrom);
+      if (dateTo) invQuery = invQuery.lte('billing_period_start', dateTo);
+      const { data: invData } = await invQuery;
+      const invRentalIds = (invData || []).map((i: any) => i.id).filter(Boolean);
+
+      matchingRentalIdsForDates = [...new Set([...eqRentalIds, ...invRentalIds])];
+    }
+
     if (search) {
       query = query.or(
         `client_name.ilike.%${search}%,equipment_name.ilike.%${search}%,asset_number.ilike.%${search}%,invoice_number.ilike.%${search}%`
@@ -132,12 +151,12 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
     }
     if (billingStatus) query = query.eq('billing_status', billingStatus);
     if (reconciliationStatus) query = query.eq('reconciliation_status', reconciliationStatus);
-    if (dateTo) {
-      query = query.lte('billing_period_start', dateTo);
-    }
-    if (dateFrom) {
-      query = query.or(`billing_period_end.is.null,billing_period_end.gte.${dateFrom}`);
-      query = query.or(`return_date.is.null,return_date.gte.${dateFrom}`);
+    if (matchingRentalIdsForDates !== null) {
+      if (matchingRentalIdsForDates.length === 0) {
+        query = query.eq('id', '00000000-0000-0000-0000-000000000000');
+      } else {
+        query = query.in('id', matchingRentalIdsForDates);
+      }
     }
     if (valueMin > 0) query = query.gte('total_value', valueMin);
     if (valueMax > 0) query = query.lte('total_value', valueMax);
@@ -176,6 +195,10 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
 
     const currentPeriodByRentalId: Record<string, number> = {};
     const rentalIds = rentals.map((r) => r.id).filter(Boolean);
+    const targetWindow: PeriodWindow | undefined = (dateFrom || dateTo)
+      ? { start: dateFrom || undefined, end: dateTo || undefined }
+      : undefined;
+
     if (rentalIds.length > 0) {
       const { data: allEquips } = await supabase
         .from('rental_invoice_equipments')
@@ -188,10 +211,9 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
         equipsByRental[eq.rental_invoice_id].push(eq);
       });
 
-      const targetWindow = resolveWindow(dateFrom, dateTo);
       for (const r of rentals) {
         const equips = equipsByRental[r.id] || [];
-        currentPeriodByRentalId[r.id] = calculatePeriodProportionalValue(
+        currentPeriodByRentalId[r.id] = calculateRentalPeriodValue(
           equips,
           Number(r.total_value) || 0,
           targetWindow,
@@ -201,8 +223,8 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
     }
 
     const periodColHeader = (dateFrom || dateTo)
-      ? 'Valor Proporcional Período (R$)'
-      : 'Valor Proporcional Mês (R$)';
+      ? 'Valor Faturado no Período (R$)'
+      : 'Valor Período Atual (R$)';
 
     const exportData = rentals.map((r) => {
       const currentPeriodVal = currentPeriodByRentalId[r.id] !== undefined
@@ -307,6 +329,162 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
     });
   } catch (error: any) {
     console.error('[exportRentalsToXlsx]', error);
+    return res.status(500).json({ error: error.message || 'Erro interno ao gerar exportação.' });
+  }
+};
+
+function formatExportDate(dateStr?: string | null): string {
+  if (!dateStr) return '';
+  if (typeof dateStr !== 'string') {
+    try {
+      const d = new Date(dateStr);
+      return isNaN(d.getTime()) ? '' : d.toLocaleDateString('pt-BR');
+    } catch {
+      return '';
+    }
+  }
+  const rawDate = dateStr.includes('T') ? dateStr.split('T')[0] : dateStr.trim();
+  const parts = rawDate.split('-');
+  if (parts.length === 3) {
+    const [year, month, day] = parts;
+    if (year && month && day) {
+      return `${day.padStart(2, '0')}/${month.padStart(2, '0')}/${year}`;
+    }
+  }
+  try {
+    const d = new Date(dateStr);
+    return isNaN(d.getTime()) ? '' : d.toLocaleDateString('pt-BR');
+  } catch {
+    return '';
+  }
+}
+
+export const exportBillsToXlsx = async (req: AuthRequest, res: Response) => {
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+    const bills = await getFilteredBills(supabase, req.query);
+
+    if (!bills || bills.length === 0) {
+      return res.status(404).json({ error: 'Nenhum lançamento encontrado para exportar.' });
+    }
+
+    const type = (req.query.type as string) || 'payable';
+    const isPayable = type === 'payable';
+    const sheetName = isPayable ? 'Contas a Pagar' : 'Contas a Receber';
+    const filePrefix = isPayable ? 'contas_a_pagar' : 'contas_a_receber';
+
+    const exportData = bills.map((b) => {
+      const isReconciled = b.is_reconciled || Boolean(b.settled_date);
+      const conciliationStatus = isReconciled ? 'Conciliado' : 'Pendente';
+      const dueDateStr = formatExportDate(b.due_date);
+      const settledDateStr = formatExportDate(b.settled_date);
+
+      let parcelasStr = '1x';
+      if (b.installments_count && b.installments_count > 1) {
+        parcelasStr = `${b.installments_count}x (${b.paid_installments_count || 0} quitadas)`;
+      }
+
+      if (isPayable) {
+        return {
+          'Conciliado': conciliationStatus,
+          'Vencimento': dueDateStr,
+          'Fornecedor / Favorecido': b.counterparty_name || b.client_name || '',
+          'NF / Documento': b.invoice_number || b.description || '',
+          'Origem': b.origin || '',
+          'Valor Bruto (R$)': Number(Number(b.gross_value || 0).toFixed(2)),
+          'Valor Líquido (R$)': Number(Number(b.net_value ?? b.gross_value ?? 0).toFixed(2)),
+          'Taxas (R$)': Number(Number(b.fee_amount || 0).toFixed(2)),
+          'Status': b.status || '',
+          'Parcelas': parcelasStr,
+          'Data Liquidação': settledDateStr,
+          'Chave de Acesso': b.access_key || '',
+          'Cadastrado por': b.created_by_name || '',
+        };
+      } else {
+        return {
+          'Conciliado': conciliationStatus,
+          'Vencimento': dueDateStr,
+          'Cliente / Pagador': b.client_name || b.counterparty_name || '',
+          'Nº Fatura / Título': b.invoice_number || b.fatura_numero || b.description || '',
+          'Origem': b.origin || '',
+          'Valor Bruto (R$)': Number(Number(b.gross_value || 0).toFixed(2)),
+          'Valor Líquido (R$)': Number(Number(b.net_value ?? b.gross_value ?? 0).toFixed(2)),
+          'Taxas (R$)': Number(Number(b.fee_amount || 0).toFixed(2)),
+          'Status': b.status || '',
+          'Parcelas': parcelasStr,
+          'Data Recebimento': settledDateStr,
+          'Cadastrado por': b.created_by_name || '',
+        };
+      }
+    });
+
+    const ws = XLSX.utils.json_to_sheet(exportData);
+
+    ws['!cols'] = isPayable
+      ? [
+          { wch: 14 }, // Conciliado
+          { wch: 14 }, // Vencimento
+          { wch: 35 }, // Fornecedor / Favorecido
+          { wch: 30 }, // NF / Documento
+          { wch: 12 }, // Origem
+          { wch: 16 }, // Valor Bruto
+          { wch: 16 }, // Valor Líquido
+          { wch: 14 }, // Taxas
+          { wch: 18 }, // Status
+          { wch: 22 }, // Parcelas
+          { wch: 16 }, // Data Liquidação
+          { wch: 46 }, // Chave de Acesso
+          { wch: 25 }, // Cadastrado por
+        ]
+      : [
+          { wch: 14 }, // Conciliado
+          { wch: 14 }, // Vencimento
+          { wch: 35 }, // Cliente / Pagador
+          { wch: 30 }, // Nº Fatura / Título
+          { wch: 12 }, // Origem
+          { wch: 16 }, // Valor Bruto
+          { wch: 16 }, // Valor Líquido
+          { wch: 14 }, // Taxas
+          { wch: 18 }, // Status
+          { wch: 22 }, // Parcelas
+          { wch: 16 }, // Data Recebimento
+          { wch: 25 }, // Cadastrado por
+        ];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+
+    const xlsxBuffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+    const userEmail = (req.user?.email ?? 'unknown').replace(/[@.]/g, '_');
+    const fileName = `${filePrefix}_${new Date().toISOString().split('T')[0]}_${userEmail}_${Date.now()}.xlsx`;
+    const storagePath = `financial/${fileName}`;
+
+    const { error: uploadError } = await supabaseAdmin.storage
+      .from(EXPORT_BUCKET)
+      .upload(storagePath, xlsxBuffer, {
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        upsert: false,
+      });
+
+    if (uploadError) throw uploadError;
+
+    const { data: signedUrlData, error: signedUrlError } = await supabaseAdmin.storage
+      .from(EXPORT_BUCKET)
+      .createSignedUrl(storagePath, SIGNED_URL_EXPIRES_IN);
+
+    if (signedUrlError || !signedUrlData?.signedUrl) {
+      throw signedUrlError ?? new Error('Falha ao gerar URL de download.');
+    }
+
+    return res.status(200).json({
+      downloadUrl: signedUrlData.signedUrl,
+      fileName,
+      expiresIn: SIGNED_URL_EXPIRES_IN,
+      totalRecords: bills.length,
+    });
+  } catch (error: any) {
+    console.error('[exportBillsToXlsx]', error);
     return res.status(500).json({ error: error.message || 'Erro interno ao gerar exportação.' });
   }
 };

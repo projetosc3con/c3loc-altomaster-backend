@@ -149,10 +149,204 @@ function groupBillsWithInstallments(items: BillStatementItem[]): BillStatementIt
 
 const groupNfeBills = groupBillsWithInstallments;
 
+export const getFilteredBills = async (supabase: any, query: any): Promise<BillStatementItem[]> => {
+  const { client_id, status, origin, from, to, type, unreconciled, invoice_number, search, rental_invoice_id, sort_by, sort_order } = query;
+
+  let billsQuery = supabase
+    .from('bills')
+    .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url), fatura:rental_billing_invoices(id, invoice_number, sequence_number, pdf_url, invoice_type, total_amount)')
+    .order('created_at', { ascending: false });
+
+  const shouldGroupNfe =
+    unreconciled !== 'true' &&
+    (query.group_nfe === 'true' || query.group_nfe !== 'false');
+
+  if (client_id) billsQuery = billsQuery.eq('client_id', client_id as string);
+  if (rental_invoice_id) billsQuery = billsQuery.eq('rental_invoice_id', rental_invoice_id as string);
+  if (status && !shouldGroupNfe) billsQuery = billsQuery.eq('status', status as string);
+  if (origin) billsQuery = billsQuery.eq('origin', origin as string);
+  if (type) billsQuery = billsQuery.eq('type', type as string);
+  if (from) billsQuery = billsQuery.gte('due_date', from as string);
+  if (to) billsQuery = billsQuery.lte('due_date', to as string);
+  if (unreconciled === 'true') billsQuery = billsQuery.is('bank_transaction_date', null).is('reconciled_at', null);
+
+  const { data: bills, error: billsError } = await billsQuery;
+  if (billsError) throw billsError;
+
+  const items: BillStatementItem[] = (bills ?? []).map(normalizeBill);
+
+  // Inclui pagamentos Asaas pendentes de reconciliação caso o filtro permita (tipo receivable e origem ASAAS ou sem filtro)
+  const shouldIncludePayments =
+    unreconciled !== 'true' &&
+    (!type || type === 'receivable') &&
+    (!origin || origin === 'ASAAS');
+
+  if (shouldIncludePayments) {
+    const { data: reconciled, error: reconciledError } = await supabase
+      .from('bills')
+      .select('payment_id')
+      .not('payment_id', 'is', null);
+    if (reconciledError) throw reconciledError;
+
+    const reconciledPaymentIds = new Set((reconciled ?? []).map((r: any) => r.payment_id));
+
+    let paymentsQuery = supabase
+      .from('payments')
+      .select('*, invoice:rental_invoices(invoice_number, client_name)')
+      .order('created_at', { ascending: false });
+
+    if (client_id) paymentsQuery = paymentsQuery.eq('client_id', client_id as string);
+    if (rental_invoice_id) paymentsQuery = paymentsQuery.eq('invoice_id', rental_invoice_id as string);
+    if (from) paymentsQuery = paymentsQuery.gte('due_date', from as string);
+    if (to) paymentsQuery = paymentsQuery.lte('due_date', to as string);
+
+    if (status) {
+      if (status === 'Pendente') paymentsQuery = paymentsQuery.eq('status', 'PENDING');
+      else if (status === 'Atrasado') paymentsQuery = paymentsQuery.eq('status', 'OVERDUE');
+      else if (status === 'Recebido' || status === 'Pago') paymentsQuery = paymentsQuery.eq('status', 'RECEIVED');
+      else if (status === 'Aguardando compensação') paymentsQuery = paymentsQuery.eq('status', 'CONFIRMED');
+      else paymentsQuery = paymentsQuery.eq('status', '__NONE__');
+    }
+
+    const { data: payments, error: paymentsError } = await paymentsQuery;
+    if (paymentsError) throw paymentsError;
+
+    const pending = (payments ?? []).filter((p: any) => !reconciledPaymentIds.has(p.id));
+    items.push(...pending.map(normalizePendingPayment));
+  }
+
+  let finalItems = shouldGroupNfe ? groupNfeBills(items) : items;
+
+  if (status && shouldGroupNfe) {
+    finalItems = finalItems.filter((item) => {
+      if (item.status === status) return true;
+      if (item.status.startsWith('Parcial') && status === 'Pendente') return true;
+      return false;
+    });
+  }
+
+  const searchRaw = (typeof search === 'string' && search.trim()) ||
+                    (typeof invoice_number === 'string' && invoice_number.trim()) ||
+                    '';
+
+  if (searchRaw) {
+    const term = searchRaw.toLowerCase();
+    finalItems = finalItems.filter((item) => {
+      const itemInv = item.invoice_number ? String(item.invoice_number).toLowerCase() : '';
+      const rawInv = (item.raw as any)?.invoice?.invoice_number ? String((item.raw as any).invoice.invoice_number).toLowerCase() : '';
+      const rawSnapInv = (item.raw as any)?.bank_raw_snapshot?.invoice_number ? String((item.raw as any).bank_raw_snapshot.invoice_number).toLowerCase() : '';
+      const faturaNum = item.fatura_numero ? String(item.fatura_numero).toLowerCase() : '';
+      const counterparty = (item.counterparty_name || (item.raw as any)?.counterparty_name || '').toLowerCase();
+      const issuerName = ((item.raw as any)?.bank_raw_snapshot?.issuer_name || '').toLowerCase();
+      const clientName = (item.client_name || (item.raw as any)?.client?.company_name || '').toLowerCase();
+      const desc = (item.description || '').toLowerCase();
+
+      const matchDirect =
+        itemInv.includes(term) ||
+        rawInv.includes(term) ||
+        rawSnapInv.includes(term) ||
+        faturaNum.includes(term) ||
+        counterparty.includes(term) ||
+        issuerName.includes(term) ||
+        clientName.includes(term) ||
+        desc.includes(term);
+
+      if (matchDirect) return true;
+
+      if (Array.isArray(item.installments)) {
+        return item.installments.some((inst) => {
+          const instInv = inst.invoice_number ? String(inst.invoice_number).toLowerCase() : '';
+          const instCounterparty = (inst.counterparty_name || '').toLowerCase();
+          const instSnapInv = (inst.raw as any)?.bank_raw_snapshot?.invoice_number ? String((inst.raw as any).bank_raw_snapshot.invoice_number).toLowerCase() : '';
+          const instIssuer = ((inst.raw as any)?.bank_raw_snapshot?.issuer_name || '').toLowerCase();
+          const instDesc = (inst.description || '').toLowerCase();
+          return (
+            instInv.includes(term) ||
+            instCounterparty.includes(term) ||
+            instSnapInv.includes(term) ||
+            instIssuer.includes(term) ||
+            instDesc.includes(term)
+          );
+        });
+      }
+
+      return false;
+    });
+  }
+
+  const sortBy = (sort_by as string) || 'due_date';
+  const sortOrder = (sort_order as string) === 'asc' ? 'asc' : 'desc';
+
+  finalItems.sort((a, b) => {
+    let comparison = 0;
+    switch (sortBy) {
+      case 'due_date': {
+        const valA = a.due_date || '';
+        const valB = b.due_date || '';
+        if (!valA && !valB) comparison = 0;
+        else if (!valA) comparison = 1;
+        else if (!valB) comparison = -1;
+        else comparison = valA.localeCompare(valB);
+        break;
+      }
+      case 'gross_value': {
+        const valA = Number(a.gross_value) || 0;
+        const valB = Number(b.gross_value) || 0;
+        comparison = valA - valB;
+        break;
+      }
+      case 'net_value': {
+        const valA = Number(a.net_value ?? a.gross_value) || 0;
+        const valB = Number(b.net_value ?? b.gross_value) || 0;
+        comparison = valA - valB;
+        break;
+      }
+      case 'counterparty_name':
+      case 'client_name': {
+        const valA = (a.counterparty_name || a.client_name || '').toLowerCase();
+        const valB = (b.counterparty_name || b.client_name || '').toLowerCase();
+        comparison = valA.localeCompare(valB, 'pt-BR');
+        break;
+      }
+      case 'origin': {
+        const valA = (a.origin || a.source || '').toLowerCase();
+        const valB = (b.origin || b.source || '').toLowerCase();
+        comparison = valA.localeCompare(valB, 'pt-BR');
+        break;
+      }
+      case 'status': {
+        const valA = (a.status || '').toLowerCase();
+        const valB = (b.status || '').toLowerCase();
+        comparison = valA.localeCompare(valB, 'pt-BR');
+        break;
+      }
+      case 'is_reconciled': {
+        const valA = a.is_reconciled || Boolean(a.settled_date) ? 1 : 0;
+        const valB = b.is_reconciled || Boolean(b.settled_date) ? 1 : 0;
+        comparison = valA - valB;
+        break;
+      }
+      default: {
+        const valA = a.due_date || '';
+        const valB = b.due_date || '';
+        if (!valA && !valB) comparison = 0;
+        else if (!valA) comparison = 1;
+        else if (!valB) comparison = -1;
+        else comparison = valA.localeCompare(valB);
+        break;
+      }
+    }
+
+    return sortOrder === 'asc' ? comparison : -comparison;
+  });
+
+  return finalItems;
+};
+
 export const listBills = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const { client_id, status, origin, from, to, type, unreconciled, invoice_number, search, rental_invoice_id, sort_by, sort_order } = req.query;
+    const { rental_invoice_id, unreconciled } = req.query;
 
     // Paginação só se aplica ao ramo "merge completo" abaixo (bills +
     // payments pendentes) — é a única consulta que vira uma tabela grande
@@ -162,193 +356,7 @@ export const listBills = async (req: AuthRequest, res: Response) => {
     const defaultLimit = rental_invoice_id ? 100 : 20;
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || defaultLimit));
 
-    let billsQuery = supabase
-      .from('bills')
-      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url), fatura:rental_billing_invoices(id, invoice_number, sequence_number, pdf_url, invoice_type, total_amount)')
-      .order('created_at', { ascending: false });
-
-    const shouldGroupNfe =
-      unreconciled !== 'true' &&
-      (req.query.group_nfe === 'true' || req.query.group_nfe !== 'false');
-
-    if (client_id) billsQuery = billsQuery.eq('client_id', client_id as string);
-    if (rental_invoice_id) billsQuery = billsQuery.eq('rental_invoice_id', rental_invoice_id as string);
-    if (status && !shouldGroupNfe) billsQuery = billsQuery.eq('status', status as string);
-    if (origin) billsQuery = billsQuery.eq('origin', origin as string);
-    if (type) billsQuery = billsQuery.eq('type', type as string);
-    if (from) billsQuery = billsQuery.gte('due_date', from as string);
-    if (to) billsQuery = billsQuery.lte('due_date', to as string);
-    if (unreconciled === 'true') billsQuery = billsQuery.is('bank_transaction_date', null).is('reconciled_at', null);
-
-    const { data: bills, error: billsError } = await billsQuery;
-    if (billsError) throw billsError;
-
-    const items: BillStatementItem[] = (bills ?? []).map(normalizeBill);
-
-    // Inclui pagamentos Asaas pendentes de reconciliação caso o filtro permita (tipo receivable e origem ASAAS ou sem filtro)
-    const shouldIncludePayments =
-      unreconciled !== 'true' &&
-      (!type || type === 'receivable') &&
-      (!origin || origin === 'ASAAS');
-
-    if (shouldIncludePayments) {
-      const { data: reconciled, error: reconciledError } = await supabase
-        .from('bills')
-        .select('payment_id')
-        .not('payment_id', 'is', null);
-      if (reconciledError) throw reconciledError;
-
-      const reconciledPaymentIds = new Set((reconciled ?? []).map((r) => r.payment_id));
-
-      let paymentsQuery = supabase
-        .from('payments')
-        .select('*, invoice:rental_invoices(invoice_number, client_name)')
-        .order('created_at', { ascending: false });
-
-      if (client_id) paymentsQuery = paymentsQuery.eq('client_id', client_id as string);
-      if (rental_invoice_id) paymentsQuery = paymentsQuery.eq('invoice_id', rental_invoice_id as string);
-      if (from) paymentsQuery = paymentsQuery.gte('due_date', from as string);
-      if (to) paymentsQuery = paymentsQuery.lte('due_date', to as string);
-
-      if (status) {
-        if (status === 'Pendente') paymentsQuery = paymentsQuery.eq('status', 'PENDING');
-        else if (status === 'Atrasado') paymentsQuery = paymentsQuery.eq('status', 'OVERDUE');
-        else if (status === 'Recebido' || status === 'Pago') paymentsQuery = paymentsQuery.eq('status', 'RECEIVED');
-        else if (status === 'Aguardando compensação') paymentsQuery = paymentsQuery.eq('status', 'CONFIRMED');
-        else paymentsQuery = paymentsQuery.eq('status', '__NONE__');
-      }
-
-      const { data: payments, error: paymentsError } = await paymentsQuery;
-      if (paymentsError) throw paymentsError;
-
-      const pending = (payments ?? []).filter((p) => !reconciledPaymentIds.has(p.id));
-      items.push(...pending.map(normalizePendingPayment));
-    }
-
-    let finalItems = shouldGroupNfe ? groupNfeBills(items) : items;
-
-    if (status && shouldGroupNfe) {
-      finalItems = finalItems.filter((item) => {
-        if (item.status === status) return true;
-        if (item.status.startsWith('Parcial') && status === 'Pendente') return true;
-        return false;
-      });
-    }
-
-    const searchRaw = (typeof search === 'string' && search.trim()) ||
-                      (typeof invoice_number === 'string' && invoice_number.trim()) ||
-                      '';
-
-    if (searchRaw) {
-      const term = searchRaw.toLowerCase();
-      finalItems = finalItems.filter((item) => {
-        const itemInv = item.invoice_number ? String(item.invoice_number).toLowerCase() : '';
-        const rawInv = (item.raw as any)?.invoice?.invoice_number ? String((item.raw as any).invoice.invoice_number).toLowerCase() : '';
-        const rawSnapInv = (item.raw as any)?.bank_raw_snapshot?.invoice_number ? String((item.raw as any).bank_raw_snapshot.invoice_number).toLowerCase() : '';
-        const faturaNum = item.fatura_numero ? String(item.fatura_numero).toLowerCase() : '';
-        const counterparty = (item.counterparty_name || (item.raw as any)?.counterparty_name || '').toLowerCase();
-        const issuerName = ((item.raw as any)?.bank_raw_snapshot?.issuer_name || '').toLowerCase();
-        const clientName = (item.client_name || (item.raw as any)?.client?.company_name || '').toLowerCase();
-        const desc = (item.description || '').toLowerCase();
-
-        const matchDirect =
-          itemInv.includes(term) ||
-          rawInv.includes(term) ||
-          rawSnapInv.includes(term) ||
-          faturaNum.includes(term) ||
-          counterparty.includes(term) ||
-          issuerName.includes(term) ||
-          clientName.includes(term) ||
-          desc.includes(term);
-
-        if (matchDirect) return true;
-
-        if (Array.isArray(item.installments)) {
-          return item.installments.some((inst) => {
-            const instInv = inst.invoice_number ? String(inst.invoice_number).toLowerCase() : '';
-            const instCounterparty = (inst.counterparty_name || '').toLowerCase();
-            const instSnapInv = (inst.raw as any)?.bank_raw_snapshot?.invoice_number ? String((inst.raw as any).bank_raw_snapshot.invoice_number).toLowerCase() : '';
-            const instIssuer = ((inst.raw as any)?.bank_raw_snapshot?.issuer_name || '').toLowerCase();
-            const instDesc = (inst.description || '').toLowerCase();
-            return (
-              instInv.includes(term) ||
-              instCounterparty.includes(term) ||
-              instSnapInv.includes(term) ||
-              instIssuer.includes(term) ||
-              instDesc.includes(term)
-            );
-          });
-        }
-
-        return false;
-      });
-    }
-
-    const sortBy = (sort_by as string) || 'due_date';
-    const sortOrder = (sort_order as string) === 'asc' ? 'asc' : 'desc';
-
-    finalItems.sort((a, b) => {
-      let comparison = 0;
-      switch (sortBy) {
-        case 'due_date': {
-          const valA = a.due_date || '';
-          const valB = b.due_date || '';
-          if (!valA && !valB) comparison = 0;
-          else if (!valA) comparison = 1;
-          else if (!valB) comparison = -1;
-          else comparison = valA.localeCompare(valB);
-          break;
-        }
-        case 'gross_value': {
-          const valA = Number(a.gross_value) || 0;
-          const valB = Number(b.gross_value) || 0;
-          comparison = valA - valB;
-          break;
-        }
-        case 'net_value': {
-          const valA = Number(a.net_value ?? a.gross_value) || 0;
-          const valB = Number(b.net_value ?? b.gross_value) || 0;
-          comparison = valA - valB;
-          break;
-        }
-        case 'counterparty_name':
-        case 'client_name': {
-          const valA = (a.counterparty_name || a.client_name || '').toLowerCase();
-          const valB = (b.counterparty_name || b.client_name || '').toLowerCase();
-          comparison = valA.localeCompare(valB, 'pt-BR');
-          break;
-        }
-        case 'origin': {
-          const valA = (a.origin || a.source || '').toLowerCase();
-          const valB = (b.origin || b.source || '').toLowerCase();
-          comparison = valA.localeCompare(valB, 'pt-BR');
-          break;
-        }
-        case 'status': {
-          const valA = (a.status || '').toLowerCase();
-          const valB = (b.status || '').toLowerCase();
-          comparison = valA.localeCompare(valB, 'pt-BR');
-          break;
-        }
-        case 'is_reconciled': {
-          const valA = a.is_reconciled || Boolean(a.settled_date) ? 1 : 0;
-          const valB = b.is_reconciled || Boolean(b.settled_date) ? 1 : 0;
-          comparison = valA - valB;
-          break;
-        }
-        default: {
-          const valA = a.due_date || '';
-          const valB = b.due_date || '';
-          if (!valA && !valB) comparison = 0;
-          else if (!valA) comparison = 1;
-          else if (!valB) comparison = -1;
-          else comparison = valA.localeCompare(valB);
-          break;
-        }
-      }
-
-      return sortOrder === 'asc' ? comparison : -comparison;
-    });
+    const finalItems = await getFilteredBills(supabase, req.query);
 
     // Se a rota foi chamada especificamente para uma locação (rental_invoice_id) ou conciliação (unreconciled === 'true'), retorna array simples
     if (rental_invoice_id || unreconciled === 'true') {

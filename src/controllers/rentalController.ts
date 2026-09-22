@@ -51,143 +51,92 @@ export const getDaysInclusive = (startStr: string, endStr: string): number => {
 };
 
 export interface PeriodWindow {
-  start: string; // YYYY-MM-DD
-  end: string;   // YYYY-MM-DD
+  start?: string; // YYYY-MM-DD
+  end?: string;   // YYYY-MM-DD
 }
 
-export const getMonthWindow = (referenceDateStr?: string): PeriodWindow => {
-  let refDate: Date;
-  if (referenceDateStr) {
-    const clean = referenceDateStr.split('T')[0];
-    refDate = new Date(`${clean}T12:00:00Z`);
-  } else {
-    const now = new Date();
-    const spDateStr = now.toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
-    refDate = new Date(`${spDateStr}T12:00:00Z`);
-  }
-  const year = refDate.getUTCFullYear();
-  const month = refDate.getUTCMonth();
-  const firstDay = new Date(Date.UTC(year, month, 1));
-  const lastDay = new Date(Date.UTC(year, month + 1, 0));
-
-  const pad = (n: number) => String(n).padStart(2, '0');
-  const start = `${firstDay.getUTCFullYear()}-${pad(firstDay.getUTCMonth() + 1)}-01`;
-  const end = `${lastDay.getUTCFullYear()}-${pad(lastDay.getUTCMonth() + 1)}-${pad(lastDay.getUTCDate())}`;
-  return { start, end };
-};
-
-export const resolveWindow = (
-  dateFrom?: string,
-  dateTo?: string,
-  referenceDateStr?: string
-): PeriodWindow => {
-  const dFrom = dateFrom ? dateFrom.split('T')[0] : '';
-  const dTo = dateTo ? dateTo.split('T')[0] : '';
-
-  if (dFrom && dTo) {
-    return { start: dFrom, end: dTo };
-  }
-  if (dFrom && !dTo) {
-    const parts = dFrom.split('-');
-    const year = parseInt(parts[0], 10);
-    const month = parseInt(parts[1], 10);
-    const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
-    const pad = (n: number) => String(n).padStart(2, '0');
-    return { start: dFrom, end: `${year}-${pad(month)}-${pad(lastDay)}` };
-  }
-  if (!dFrom && dTo) {
-    const parts = dTo.split('-');
-    const year = parts[0];
-    const month = parts[1];
-    return { start: `${year}-${month}-01`, end: dTo };
-  }
-  return getMonthWindow(referenceDateStr);
-};
-
 /**
- * Calcula o valor proporcional faturado dentro de uma janela [window.start, window.end]
- * para todos os itens/prorrogações em rental_invoice_equipments (ou fallback do contrato).
- * Considera devoluções antecipadas (return_date) e períodos sobrepostos no mês/intervalo.
+ * Calcula o valor faturado da locação.
+ * - Se uma janela [window.start, window.end] for fornecida (filtro por data):
+ *   soma o total_value INTEGRAL (sem divisão parcial por dias) de todos os períodos
+ *   em rental_invoice_equipments cujo billing_period_start se inicia dentro da janela.
+ * - Se nenhuma janela for fornecida (visão padrão / locações ativas):
+ *   para cada equipamento, toma o período mais recente (ativo) e soma o seu total_value INTEGRAL.
  */
-export const calculatePeriodProportionalValue = (
+export const calculateRentalPeriodValue = (
   equipments: any[],
   invoiceTotalFallback: number = 0,
-  window: PeriodWindow,
+  window?: PeriodWindow,
   invoiceDatesFallback?: { start?: string | null; end?: string | null; return_date?: string | null }
 ): number => {
-  const winStart = window.start;
-  const winEnd = window.end;
+  const hasWindow = Boolean(window && (window.start || window.end));
 
-  const calculateItemOverlap = (
-    startStr: string,
-    endStr: string,
-    returnStr: string | null | undefined,
-    itemVal: number
-  ): number => {
-    if (!startStr || !endStr || itemVal <= 0) return 0;
+  if (hasWindow) {
+    const winStart = window?.start ? window.start.split('T')[0] : '1900-01-01';
+    const winEnd = window?.end ? window.end.split('T')[0] : '9999-12-31';
 
-    const s = startStr.split('T')[0];
-    const e = endStr.split('T')[0];
-    const r = returnStr ? returnStr.split('T')[0] : null;
+    if (!equipments || equipments.length === 0) {
+      const startStr = invoiceDatesFallback?.start ? String(invoiceDatesFallback.start).split('T')[0] : '';
+      if (startStr && startStr >= winStart && startStr <= winEnd) {
+        return Number(invoiceTotalFallback) || 0;
+      }
+      return 0;
+    }
 
-    const totalDays = getDaysInclusive(s, e);
-    if (totalDays <= 0) return 0;
-
-    // Se houve devolução antes do término do período previsto, o término efetivo é a devolução
-    const effectiveEnd = (r && r < e) ? r : e;
-    if (effectiveEnd < s) return 0;
-
-    const overlapStart = s > winStart ? s : winStart;
-    const overlapEnd = effectiveEnd < winEnd ? effectiveEnd : winEnd;
-
-    if (overlapStart > overlapEnd) return 0;
-
-    const overlapDays = getDaysInclusive(overlapStart, overlapEnd);
-    if (overlapDays <= 0) return 0;
-
-    return (itemVal / totalDays) * overlapDays;
-  };
-
-  // Se não houver itens em rental_invoice_equipments, usar fallback do contrato principal
-  if (!equipments || equipments.length === 0) {
-    const startStr = invoiceDatesFallback?.start ? String(invoiceDatesFallback.start).split('T')[0] : '';
-    const endStr = invoiceDatesFallback?.end ? String(invoiceDatesFallback.end).split('T')[0] : '';
-    const returnStr = invoiceDatesFallback?.return_date ? String(invoiceDatesFallback.return_date).split('T')[0] : null;
-    const val = Number(invoiceTotalFallback) || 0;
-
-    const propVal = calculateItemOverlap(startStr, endStr, returnStr, val);
-    return Math.round(propVal * 100) / 100;
+    let sum = 0;
+    for (const eq of equipments) {
+      const startStr = eq.billing_period_start ? String(eq.billing_period_start).split('T')[0] : '';
+      if (startStr && startStr >= winStart && startStr <= winEnd) {
+        sum += Number(eq.total_value) || 0;
+      }
+    }
+    return Math.round(sum * 100) / 100;
   }
 
-  // Iterar por todos os registros em rental_invoice_equipments (itens e prorrogações)
-  let total = 0;
-  for (const item of equipments) {
-    const itemVal = Number(item.total_value) || 0;
-    const startStr = item.billing_period_start ? String(item.billing_period_start).split('T')[0] : '';
-    const endStr = item.billing_period_end ? String(item.billing_period_end).split('T')[0] : '';
-    const returnStr = item.return_date
-      ? String(item.return_date).split('T')[0]
-      : (invoiceDatesFallback?.return_date ? String(invoiceDatesFallback.return_date).split('T')[0] : null);
+  // Visão padrão sem filtro de datas (locações ativas / período mais recente)
+  if (!equipments || equipments.length === 0) {
+    return Number(invoiceTotalFallback) || 0;
+  }
 
-    const propVal = calculateItemOverlap(startStr, endStr, returnStr, itemVal);
-    total += propVal;
+  const eqGroups: Record<string, any[]> = {};
+  for (const item of equipments) {
+    const key = item.equipment_id || item.asset_number || item.id;
+    if (!eqGroups[key]) eqGroups[key] = [];
+    eqGroups[key].push(item);
+  }
+
+  let total = 0;
+  for (const items of Object.values(eqGroups)) {
+    // Ordenar decrescente por billing_period_end e created_at
+    items.sort((a, b) => {
+      const endA = a.billing_period_end ? String(a.billing_period_end) : '';
+      const endB = b.billing_period_end ? String(b.billing_period_end) : '';
+      if (endB !== endA) return endB.localeCompare(endA);
+      const crA = a.created_at ? String(a.created_at) : '';
+      const crB = b.created_at ? String(b.created_at) : '';
+      return crB.localeCompare(crA);
+    });
+
+    const latest = items[0];
+    if (latest) {
+      total += Number(latest.total_value) || 0;
+    }
   }
 
   return Math.round(total * 100) / 100;
 };
 
-/**
- * Wrapper retrocompatível para cálculo do mês atual / de referência.
- */
+// Aliases para compatibilidade
 export const calculateCurrentPeriodTotal = (
   equipments: any[],
   invoiceTotalFallback: number = 0,
-  referenceDateStr?: string,
+  _referenceDateStr?: string,
   invoiceDatesFallback?: { start?: string | null; end?: string | null; return_date?: string | null }
 ): number => {
-  const window = resolveWindow(undefined, undefined, referenceDateStr);
-  return calculatePeriodProportionalValue(equipments, invoiceTotalFallback, window, invoiceDatesFallback);
+  return calculateRentalPeriodValue(equipments, invoiceTotalFallback, undefined, invoiceDatesFallback);
 };
+
+export const calculatePeriodProportionalValue = calculateRentalPeriodValue;
 
 export const getAllInvoices = async (req: AuthRequest, res: Response) => {
   try {
@@ -209,6 +158,24 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
     const returnStatus = (req.query.return_status as string) || '';
     const hideReturned = req.query.hide_returned === 'true' || returnStatus === 'active';
 
+    // Se houver filtro de data (início de período), buscar os contratos que possuem período começando no intervalo
+    let matchingRentalIdsForDates: string[] | null = null;
+    if (dateFrom || dateTo) {
+      let eqQuery = supabase.from('rental_invoice_equipments').select('rental_invoice_id');
+      if (dateFrom) eqQuery = eqQuery.gte('billing_period_start', dateFrom);
+      if (dateTo) eqQuery = eqQuery.lte('billing_period_start', dateTo);
+      const { data: eqData } = await eqQuery;
+      const eqRentalIds = (eqData || []).map((e: any) => e.rental_invoice_id).filter(Boolean);
+
+      let invQuery = supabase.from('rental_invoices').select('id');
+      if (dateFrom) invQuery = invQuery.gte('billing_period_start', dateFrom);
+      if (dateTo) invQuery = invQuery.lte('billing_period_start', dateTo);
+      const { data: invData } = await invQuery;
+      const invRentalIds = (invData || []).map((i: any) => i.id).filter(Boolean);
+
+      matchingRentalIdsForDates = [...new Set([...eqRentalIds, ...invRentalIds])];
+    }
+
     const applyFilters = (q: any) => {
       if (search) {
         q = q.or(
@@ -221,12 +188,12 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
       if (reconciliationStatus) {
         q = q.eq('reconciliation_status', reconciliationStatus);
       }
-      if (dateTo) {
-        q = q.lte('billing_period_start', dateTo);
-      }
-      if (dateFrom) {
-        q = q.or(`billing_period_end.is.null,billing_period_end.gte.${dateFrom}`);
-        q = q.or(`return_date.is.null,return_date.gte.${dateFrom}`);
+      if (matchingRentalIdsForDates !== null) {
+        if (matchingRentalIdsForDates.length === 0) {
+          q = q.eq('id', '00000000-0000-0000-0000-000000000000');
+        } else {
+          q = q.in('id', matchingRentalIdsForDates);
+        }
       }
       if (valueMin > 0) {
         q = q.gte('total_value', valueMin);
@@ -294,7 +261,9 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
     const matchingIds = statsData.map((item: any) => item.id).filter(Boolean);
     const currentPeriodByRentalId: Record<string, number> = {};
     let calculatedActivePeriodSum = 0;
-    const targetWindow = resolveWindow(dateFrom, dateTo);
+    const targetWindow: PeriodWindow | undefined = (dateFrom || dateTo)
+      ? { start: dateFrom || undefined, end: dateTo || undefined }
+      : undefined;
 
     if (matchingIds.length > 0) {
       const { data: allEquips, error: equipErr } = await supabase
@@ -311,7 +280,7 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
 
         for (const inv of statsData) {
           const equips = equipsByRental[inv.id] || [];
-          const periodVal = calculatePeriodProportionalValue(
+          const periodVal = calculateRentalPeriodValue(
             equips,
             Number(inv.total_value) || 0,
             targetWindow,
@@ -322,7 +291,7 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
         }
       } else {
         for (const inv of statsData) {
-          const periodVal = calculatePeriodProportionalValue(
+          const periodVal = calculateRentalPeriodValue(
             [],
             Number(inv.total_value) || 0,
             targetWindow,
