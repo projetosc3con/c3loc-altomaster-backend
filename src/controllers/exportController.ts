@@ -2,7 +2,7 @@ import { Response } from 'express';
 import * as XLSX from 'xlsx';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
-import { calculateCurrentPeriodTotal } from './rentalController';
+import { calculatePeriodProportionalValue, resolveWindow } from './rentalController';
 
 const EXPORT_BUCKET = 'exports';
 // Signed URL expires after 5 minutes
@@ -132,8 +132,13 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
     }
     if (billingStatus) query = query.eq('billing_status', billingStatus);
     if (reconciliationStatus) query = query.eq('reconciliation_status', reconciliationStatus);
-    if (dateFrom) query = query.gte('billing_period_start', dateFrom);
-    if (dateTo) query = query.lte('billing_period_start', dateTo);
+    if (dateTo) {
+      query = query.lte('billing_period_start', dateTo);
+    }
+    if (dateFrom) {
+      query = query.or(`billing_period_end.is.null,billing_period_end.gte.${dateFrom}`);
+      query = query.or(`return_date.is.null,return_date.gte.${dateFrom}`);
+    }
     if (valueMin > 0) query = query.gte('total_value', valueMin);
     if (valueMax > 0) query = query.lte('total_value', valueMax);
     if (hideReturned || returnStatus === 'active') {
@@ -170,35 +175,36 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
     }
 
     const currentPeriodByRentalId: Record<string, number> = {};
-    if (hideReturned || returnStatus === 'active') {
-      const rentalIds = rentals.map((r) => r.id).filter(Boolean);
-      if (rentalIds.length > 0) {
-        const { data: allEquips } = await supabase
-          .from('rental_invoice_equipments')
-          .select('id, rental_invoice_id, equipment_id, asset_number, billing_period_start, billing_period_end, return_date, total_value, created_at')
-          .in('rental_invoice_id', rentalIds);
+    const rentalIds = rentals.map((r) => r.id).filter(Boolean);
+    if (rentalIds.length > 0) {
+      const { data: allEquips } = await supabase
+        .from('rental_invoice_equipments')
+        .select('id, rental_invoice_id, equipment_id, asset_number, billing_period_start, billing_period_end, return_date, total_value, created_at')
+        .in('rental_invoice_id', rentalIds);
 
-        const equipsByRental: Record<string, any[]> = {};
-        (allEquips || []).forEach((eq: any) => {
-          if (!equipsByRental[eq.rental_invoice_id]) equipsByRental[eq.rental_invoice_id] = [];
-          equipsByRental[eq.rental_invoice_id].push(eq);
-        });
+      const equipsByRental: Record<string, any[]> = {};
+      (allEquips || []).forEach((eq: any) => {
+        if (!equipsByRental[eq.rental_invoice_id]) equipsByRental[eq.rental_invoice_id] = [];
+        equipsByRental[eq.rental_invoice_id].push(eq);
+      });
 
-        const referenceDateStr = dateFrom || undefined;
-        for (const r of rentals) {
-          const equips = equipsByRental[r.id] || [];
-          currentPeriodByRentalId[r.id] = calculateCurrentPeriodTotal(
-            equips,
-            Number(r.total_value) || 0,
-            referenceDateStr,
-            { start: r.billing_period_start, end: r.billing_period_end }
-          );
-        }
+      const targetWindow = resolveWindow(dateFrom, dateTo);
+      for (const r of rentals) {
+        const equips = equipsByRental[r.id] || [];
+        currentPeriodByRentalId[r.id] = calculatePeriodProportionalValue(
+          equips,
+          Number(r.total_value) || 0,
+          targetWindow,
+          { start: r.billing_period_start, end: r.billing_period_end, return_date: r.return_date }
+        );
       }
     }
 
+    const periodColHeader = (dateFrom || dateTo)
+      ? 'Valor Proporcional Período (R$)'
+      : 'Valor Proporcional Mês (R$)';
+
     const exportData = rentals.map((r) => {
-      const isActiveFilter = hideReturned || returnStatus === 'active';
       const currentPeriodVal = currentPeriodByRentalId[r.id] !== undefined
         ? currentPeriodByRentalId[r.id]
         : Number(r.total_value || 0);
@@ -229,12 +235,8 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
         'Treinamento (R$)': Number(r.cost_training || 0).toFixed(2),
       };
 
-      if (isActiveFilter) {
-        row['Valor Período Atual (R$)'] = Number(currentPeriodVal).toFixed(2);
-        row['Valor Total Acumulado (R$)'] = Number(r.total_value || 0).toFixed(2);
-      } else {
-        row['Valor Total (R$)'] = Number(r.total_value || 0).toFixed(2);
-      }
+      row[periodColHeader] = Number(currentPeriodVal).toFixed(2);
+      row['Valor Total Acumulado (R$)'] = Number(r.total_value || 0).toFixed(2);
 
       row['Vencimento'] = r.due_date ? new Date(r.due_date).toLocaleDateString('pt-BR') : '';
       row['Forma Pagamento'] = r.payment_method || '';
@@ -263,7 +265,8 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
       { wch: 14 }, // RCD
       { wch: 14 }, // Terceiros
       { wch: 14 }, // Treinamento
-      { wch: 16 }, // Valor Total
+      { wch: 20 }, // Valor Proporcional
+      { wch: 20 }, // Valor Total Acumulado
       { wch: 14 }, // Vencimento
       { wch: 18 }, // Forma Pagamento
       { wch: 18 }, // Status Conciliação

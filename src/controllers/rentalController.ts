@@ -50,80 +50,143 @@ export const getDaysInclusive = (startStr: string, endStr: string): number => {
   return diff >= 0 ? diff + 1 : 0;
 };
 
+export interface PeriodWindow {
+  start: string; // YYYY-MM-DD
+  end: string;   // YYYY-MM-DD
+}
+
+export const getMonthWindow = (referenceDateStr?: string): PeriodWindow => {
+  let refDate: Date;
+  if (referenceDateStr) {
+    const clean = referenceDateStr.split('T')[0];
+    refDate = new Date(`${clean}T12:00:00Z`);
+  } else {
+    const now = new Date();
+    const spDateStr = now.toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+    refDate = new Date(`${spDateStr}T12:00:00Z`);
+  }
+  const year = refDate.getUTCFullYear();
+  const month = refDate.getUTCMonth();
+  const firstDay = new Date(Date.UTC(year, month, 1));
+  const lastDay = new Date(Date.UTC(year, month + 1, 0));
+
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const start = `${firstDay.getUTCFullYear()}-${pad(firstDay.getUTCMonth() + 1)}-01`;
+  const end = `${lastDay.getUTCFullYear()}-${pad(lastDay.getUTCMonth() + 1)}-${pad(lastDay.getUTCDate())}`;
+  return { start, end };
+};
+
+export const resolveWindow = (
+  dateFrom?: string,
+  dateTo?: string,
+  referenceDateStr?: string
+): PeriodWindow => {
+  const dFrom = dateFrom ? dateFrom.split('T')[0] : '';
+  const dTo = dateTo ? dateTo.split('T')[0] : '';
+
+  if (dFrom && dTo) {
+    return { start: dFrom, end: dTo };
+  }
+  if (dFrom && !dTo) {
+    const parts = dFrom.split('-');
+    const year = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10);
+    const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return { start: dFrom, end: `${year}-${pad(month)}-${pad(lastDay)}` };
+  }
+  if (!dFrom && dTo) {
+    const parts = dTo.split('-');
+    const year = parts[0];
+    const month = parts[1];
+    return { start: `${year}-${month}-01`, end: dTo };
+  }
+  return getMonthWindow(referenceDateStr);
+};
+
 /**
- * Para uma lista de registros de rental_invoice_equipments pertencentes a uma locação,
- * calcula o valor consolidado proporcional do período contábil atual (mês/ciclo vigente).
- * Se o período começou antes do 1º dia do mês atual (ex: 23/08 e estamos no mês 09),
- * desconsidera proporcionalmente os dias anteriores a 01/09 pelo total do período.
+ * Calcula o valor proporcional faturado dentro de uma janela [window.start, window.end]
+ * para todos os itens/prorrogações em rental_invoice_equipments (ou fallback do contrato).
+ * Considera devoluções antecipadas (return_date) e períodos sobrepostos no mês/intervalo.
+ */
+export const calculatePeriodProportionalValue = (
+  equipments: any[],
+  invoiceTotalFallback: number = 0,
+  window: PeriodWindow,
+  invoiceDatesFallback?: { start?: string | null; end?: string | null; return_date?: string | null }
+): number => {
+  const winStart = window.start;
+  const winEnd = window.end;
+
+  const calculateItemOverlap = (
+    startStr: string,
+    endStr: string,
+    returnStr: string | null | undefined,
+    itemVal: number
+  ): number => {
+    if (!startStr || !endStr || itemVal <= 0) return 0;
+
+    const s = startStr.split('T')[0];
+    const e = endStr.split('T')[0];
+    const r = returnStr ? returnStr.split('T')[0] : null;
+
+    const totalDays = getDaysInclusive(s, e);
+    if (totalDays <= 0) return 0;
+
+    // Se houve devolução antes do término do período previsto, o término efetivo é a devolução
+    const effectiveEnd = (r && r < e) ? r : e;
+    if (effectiveEnd < s) return 0;
+
+    const overlapStart = s > winStart ? s : winStart;
+    const overlapEnd = effectiveEnd < winEnd ? effectiveEnd : winEnd;
+
+    if (overlapStart > overlapEnd) return 0;
+
+    const overlapDays = getDaysInclusive(overlapStart, overlapEnd);
+    if (overlapDays <= 0) return 0;
+
+    return (itemVal / totalDays) * overlapDays;
+  };
+
+  // Se não houver itens em rental_invoice_equipments, usar fallback do contrato principal
+  if (!equipments || equipments.length === 0) {
+    const startStr = invoiceDatesFallback?.start ? String(invoiceDatesFallback.start).split('T')[0] : '';
+    const endStr = invoiceDatesFallback?.end ? String(invoiceDatesFallback.end).split('T')[0] : '';
+    const returnStr = invoiceDatesFallback?.return_date ? String(invoiceDatesFallback.return_date).split('T')[0] : null;
+    const val = Number(invoiceTotalFallback) || 0;
+
+    const propVal = calculateItemOverlap(startStr, endStr, returnStr, val);
+    return Math.round(propVal * 100) / 100;
+  }
+
+  // Iterar por todos os registros em rental_invoice_equipments (itens e prorrogações)
+  let total = 0;
+  for (const item of equipments) {
+    const itemVal = Number(item.total_value) || 0;
+    const startStr = item.billing_period_start ? String(item.billing_period_start).split('T')[0] : '';
+    const endStr = item.billing_period_end ? String(item.billing_period_end).split('T')[0] : '';
+    const returnStr = item.return_date
+      ? String(item.return_date).split('T')[0]
+      : (invoiceDatesFallback?.return_date ? String(invoiceDatesFallback.return_date).split('T')[0] : null);
+
+    const propVal = calculateItemOverlap(startStr, endStr, returnStr, itemVal);
+    total += propVal;
+  }
+
+  return Math.round(total * 100) / 100;
+};
+
+/**
+ * Wrapper retrocompatível para cálculo do mês atual / de referência.
  */
 export const calculateCurrentPeriodTotal = (
   equipments: any[],
   invoiceTotalFallback: number = 0,
   referenceDateStr?: string,
-  invoiceDatesFallback?: { start?: string | null; end?: string | null }
+  invoiceDatesFallback?: { start?: string | null; end?: string | null; return_date?: string | null }
 ): number => {
-  const refDate = referenceDateStr ? new Date(referenceDateStr.split('T')[0] + 'T00:00:00Z') : new Date();
-  const currentYear = refDate.getUTCFullYear();
-  const currentMonth = String(refDate.getUTCMonth() + 1).padStart(2, '0');
-  const firstDayOfMonth = `${currentYear}-${currentMonth}-01`;
-
-  if (!equipments || equipments.length === 0) {
-    const startStr = invoiceDatesFallback?.start ? String(invoiceDatesFallback.start).split('T')[0] : '';
-    const endStr = invoiceDatesFallback?.end ? String(invoiceDatesFallback.end).split('T')[0] : '';
-    const val = Number(invoiceTotalFallback) || 0;
-
-    if (startStr && endStr && startStr < firstDayOfMonth) {
-      const totalDays = getDaysInclusive(startStr, endStr);
-      if (endStr < firstDayOfMonth) return 0;
-      const effectiveDays = getDaysInclusive(firstDayOfMonth, endStr);
-      return totalDays > 0 ? Math.round(val * (effectiveDays / totalDays) * 100) / 100 : val;
-    }
-    return val;
-  }
-
-  const eqGroups: Record<string, any[]> = {};
-  for (const item of equipments) {
-    const key = item.equipment_id || item.asset_number || item.id;
-    if (!eqGroups[key]) eqGroups[key] = [];
-    eqGroups[key].push(item);
-  }
-
-  let total = 0;
-  for (const items of Object.values(eqGroups)) {
-    // Ordenar decrescente por billing_period_end e created_at
-    items.sort((a, b) => {
-      const endA = a.billing_period_end ? String(a.billing_period_end) : '';
-      const endB = b.billing_period_end ? String(b.billing_period_end) : '';
-      if (endB !== endA) return endB.localeCompare(endA);
-      const crA = a.created_at ? String(a.created_at) : '';
-      const crB = b.created_at ? String(b.created_at) : '';
-      return crB.localeCompare(crA);
-    });
-
-    const latest = items[0];
-    if (latest && !latest.return_date) {
-      const val = Number(latest.total_value) || 0;
-      const startStr = latest.billing_period_start ? String(latest.billing_period_start).split('T')[0] : '';
-      const endStr = latest.billing_period_end ? String(latest.billing_period_end).split('T')[0] : '';
-
-      // Se o período começou antes do primeiro dia do mês atual (ex: 23/08 com mês 09),
-      // desconsidera proporcionalmente os dias anteriores ao dia 01 do mês
-      if (startStr && endStr && startStr < firstDayOfMonth) {
-        const totalDays = getDaysInclusive(startStr, endStr);
-        if (endStr < firstDayOfMonth) {
-          // Já finalizou antes do início do mês
-        } else {
-          const effectiveDays = getDaysInclusive(firstDayOfMonth, endStr);
-          const propVal = totalDays > 0 ? (val * (effectiveDays / totalDays)) : val;
-          total += propVal;
-        }
-      } else {
-        total += val;
-      }
-    }
-  }
-
-  return Math.round(total * 100) / 100;
+  const window = resolveWindow(undefined, undefined, referenceDateStr);
+  return calculatePeriodProportionalValue(equipments, invoiceTotalFallback, window, invoiceDatesFallback);
 };
 
 export const getAllInvoices = async (req: AuthRequest, res: Response) => {
@@ -158,11 +221,12 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
       if (reconciliationStatus) {
         q = q.eq('reconciliation_status', reconciliationStatus);
       }
-      if (dateFrom) {
-        q = q.gte('billing_period_start', dateFrom);
-      }
       if (dateTo) {
         q = q.lte('billing_period_start', dateTo);
+      }
+      if (dateFrom) {
+        q = q.or(`billing_period_end.is.null,billing_period_end.gte.${dateFrom}`);
+        q = q.or(`return_date.is.null,return_date.gte.${dateFrom}`);
       }
       if (valueMin > 0) {
         q = q.gte('total_value', valueMin);
@@ -230,6 +294,7 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
     const matchingIds = statsData.map((item: any) => item.id).filter(Boolean);
     const currentPeriodByRentalId: Record<string, number> = {};
     let calculatedActivePeriodSum = 0;
+    const targetWindow = resolveWindow(dateFrom, dateTo);
 
     if (matchingIds.length > 0) {
       const { data: allEquips, error: equipErr } = await supabase
@@ -244,14 +309,24 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
           equipsByRental[eq.rental_invoice_id].push(eq);
         }
 
-        const referenceDateStr = dateFrom || undefined;
         for (const inv of statsData) {
           const equips = equipsByRental[inv.id] || [];
-          const periodVal = calculateCurrentPeriodTotal(
+          const periodVal = calculatePeriodProportionalValue(
             equips,
             Number(inv.total_value) || 0,
-            referenceDateStr,
-            { start: inv.billing_period_start, end: inv.billing_period_end }
+            targetWindow,
+            { start: inv.billing_period_start, end: inv.billing_period_end, return_date: inv.return_date }
+          );
+          currentPeriodByRentalId[inv.id] = periodVal;
+          calculatedActivePeriodSum += periodVal;
+        }
+      } else {
+        for (const inv of statsData) {
+          const periodVal = calculatePeriodProportionalValue(
+            [],
+            Number(inv.total_value) || 0,
+            targetWindow,
+            { start: inv.billing_period_start, end: inv.billing_period_end, return_date: inv.return_date }
           );
           currentPeriodByRentalId[inv.id] = periodVal;
           calculatedActivePeriodSum += periodVal;
@@ -274,9 +349,8 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
       };
     });
 
-    // Se o filtro de locações ativas estiver ligado e a ordenação for por total_value,
-    // reordenar os itens da página atual por current_period_value
-    if ((hideReturned || returnStatus === 'active') && sortBy === 'total_value') {
+    // Se a ordenação for por total_value, reordenar os itens da página atual por current_period_value
+    if (sortBy === 'total_value') {
       enrichedData.sort((a: any, b: any) => {
         const valA = a.current_period_value ?? a.total_value ?? 0;
         const valB = b.current_period_value ?? b.total_value ?? 0;
@@ -284,9 +358,7 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
       });
     }
 
-    const totalValue = (hideReturned || returnStatus === 'active')
-      ? currentPeriodTotalValue
-      : accumulatedTotalValue;
+    const totalValue = currentPeriodTotalValue;
 
     const total = dataResult.count ?? 0;
     const totalPages = Math.ceil(total / limit);
