@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { listBills, createBill, updateBill, deleteBill } from '../controllers/billController';
+import { listBills, createBill, updateBill, deleteBill, splitBillIntoInstallments } from '../controllers/billController';
 import { reconcileBankStatement, linkStatementLineToBill } from '../controllers/bankReconciliationController';
 import { authorize } from '../middleware/auth';
 
@@ -19,6 +19,7 @@ router.get('/', fullAccess, listBills);
 router.post('/', fullAccess, createBill);
 router.patch('/:id', managerOrAdmin, updateBill);
 router.delete('/:id', managerOrAdmin, deleteBill);
+router.post('/:id/split-installments', fullAccess, splitBillIntoInstallments);
 router.post('/reconcile', fullAccess, reconcileBankStatement);
 router.post('/:id/link-statement-line', fullAccess, linkStatementLineToBill);
 

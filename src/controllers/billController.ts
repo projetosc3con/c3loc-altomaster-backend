@@ -42,7 +42,7 @@ function groupBillsWithInstallments(items: BillStatementItem[]): BillStatementIt
         groups.set(groupKey, []);
       }
       groups.get(groupKey)!.push(item);
-    } else if (item.origin === 'MANUAL' && (item.raw as any)?.bank_raw_snapshot?.group_id) {
+    } else if ((item.raw as any)?.bank_raw_snapshot?.group_id) {
       const groupId = (item.raw as any).bank_raw_snapshot.group_id;
       const groupKey = `manual_${groupId}`;
       if (!groups.has(groupKey)) {
@@ -679,3 +679,195 @@ export const deleteBill = async (req: AuthRequest, res: Response) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
+export const splitBillIntoInstallments = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+
+    // 1. Validar payload
+    const rawInstallments = req.body.installments;
+    if (!Array.isArray(rawInstallments) || rawInstallments.length < 2) {
+      return res.status(400).json({ error: 'O parcelamento requer no mínimo 2 parcelas.' });
+    }
+
+    const todayStr = new Date().toISOString().split('T')[0];
+
+    const installments: Array<{ amount: number; due_date: string }> = [];
+    for (let i = 0; i < rawInstallments.length; i++) {
+      const inst = rawInstallments[i];
+      const amount = Math.round((Number(inst.amount) || 0) * 100) / 100;
+      const dueDate = inst.due_date ? String(inst.due_date).trim().split('T')[0] : '';
+
+      if (amount <= 0) {
+        return res.status(400).json({ error: `O valor da parcela ${i + 1} deve ser maior que zero.` });
+      }
+      if (!dueDate || !/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) {
+        return res.status(400).json({ error: `Data de vencimento inválida para a parcela ${i + 1}.` });
+      }
+
+      installments.push({ amount, due_date: dueDate });
+    }
+
+    // 2. Buscar o lançamento atual
+    const { data: currentBill, error: fetchError } = await supabase
+      .from('bills')
+      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !currentBill) {
+      return res.status(404).json({ error: 'Lançamento não encontrado.' });
+    }
+
+    if (currentBill.status === 'Recebido' || currentBill.status === 'Pago') {
+      return res.status(400).json({ error: 'Não é possível parcelar um lançamento que já foi recebido/pago integralmente.' });
+    }
+
+    const currentGross = Number(currentBill.gross_value) || 0;
+    const currentSnap = (currentBill.bank_raw_snapshot as any) || {};
+
+    // Valor total de referência: se já pertencia a um grupo anterior, pega o total_value do snapshot, senão currentGross
+    const referenceTotal = Number(currentSnap.total_value) || currentGross;
+    const sumInstallments = Math.round(installments.reduce((acc, it) => acc + it.amount, 0) * 100) / 100;
+
+    // Verificar se a soma difere significativamente do valor de referência
+    if (Math.abs(sumInstallments - referenceTotal) > 0.05 && Math.abs(sumInstallments - currentGross) > 0.05) {
+      return res.status(400).json({
+        error: `A soma das parcelas (R$ ${sumInstallments.toFixed(2)}) deve corresponder ao valor da fatura (R$ ${referenceTotal.toFixed(2)}).`
+      });
+    }
+
+    // 3. Gerenciar grupo de parcelas
+    let groupId = currentSnap.group_id;
+    if (groupId) {
+      // Se já pertencia a um grupo, verificar se alguma parcela irmã foi recebida
+      const { data: siblingBills } = await supabase
+        .from('bills')
+        .select('id, status, bank_raw_snapshot')
+        .filter('bank_raw_snapshot->>group_id', 'eq', groupId);
+
+      const siblingsInGroup = (siblingBills || []).filter(
+        (b: any) => b.bank_raw_snapshot?.group_id === groupId && b.id !== id
+      );
+
+      const anySiblingPaid = siblingsInGroup.some(
+        (b: any) => b.status === 'Recebido' || b.status === 'Pago'
+      );
+
+      if (anySiblingPaid) {
+        return res.status(400).json({
+          error: 'Não é possível re-parcelar este lançamento pois já existem parcelas recebidas/pagas neste grupo.'
+        });
+      }
+
+      // Remover parcelas irmãs anteriores para substituir pelas novas
+      const siblingIdsToDelete = siblingsInGroup.map((b: any) => b.id);
+      if (siblingIdsToDelete.length > 0) {
+        await supabase.from('bills').delete().in('id', siblingIdsToDelete);
+      }
+    } else {
+      groupId = crypto.randomUUID();
+    }
+
+    // 4. Descrição base limpa
+    const rawDesc = currentSnap.original_description || currentBill.description || 'Fatura de Locação';
+    const baseDesc = rawDesc.replace(/\s*-\s*Parcela\s+\d+\/\d+.*$/i, '').trim();
+
+    // 5. Determinar status da Parcela 1
+    const due1 = installments[0].due_date;
+    const isOverdue1 = due1 < todayStr;
+    const status1 = isOverdue1 ? 'Atrasado' : 'No prazo';
+
+    const updatedSnap1 = {
+      ...currentSnap,
+      group_id: groupId,
+      installment_number: 1,
+      total_installments: installments.length,
+      total_value: sumInstallments,
+      original_description: baseDesc,
+      split_at: new Date().toISOString(),
+      split_by: req.user?.id || null
+    };
+
+    // Atualizar a 1ª parcela no registro existente
+    const { data: updatedFirstBill, error: updateError } = await supabase
+      .from('bills')
+      .update({
+        description: `${baseDesc} - Parcela 1/${installments.length}`,
+        gross_value: installments[0].amount,
+        net_value: installments[0].amount,
+        fee_amount: 0,
+        due_date: installments[0].due_date,
+        status: status1,
+        bank_raw_snapshot: updatedSnap1,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
+      .single();
+
+    if (updateError) throw updateError;
+
+    // 6. Inserir novas contas a receber para as parcelas 2..N
+    const newBillsToInsert = installments.slice(1).map((inst, idx) => {
+      const instNum = idx + 2;
+      const isOverdue = inst.due_date < todayStr;
+      const instStatus = isOverdue ? 'Atrasado' : 'No prazo';
+
+      return {
+        origin: 'MANUAL',
+        type: currentBill.type || 'receivable',
+        rental_invoice_id: currentBill.rental_invoice_id || null,
+        client_id: currentBill.client_id || null,
+        counterparty_name: currentBill.counterparty_name || null,
+        description: `${baseDesc} - Parcela ${instNum}/${installments.length}`,
+        gross_value: inst.amount,
+        fee_amount: 0,
+        net_value: inst.amount,
+        due_date: inst.due_date,
+        status: instStatus,
+        reconciled_at: null,
+        created_by: req.user?.id || null,
+        bank_slip_url: currentBill.bank_slip_url || null,
+        bank_raw_snapshot: {
+          ...currentSnap,
+          group_id: groupId,
+          installment_number: instNum,
+          total_installments: installments.length,
+          total_value: sumInstallments,
+          original_description: baseDesc,
+          parent_bill_id: id,
+          split_at: new Date().toISOString(),
+          split_by: req.user?.id || null
+        }
+      };
+    });
+
+    const { data: insertedSiblings, error: insertError } = await supabase
+      .from('bills')
+      .insert(newBillsToInsert)
+      .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
+      .order('due_date', { ascending: true });
+
+    if (insertError) throw insertError;
+
+    // 7. Consolidar todas as parcelas do grupo
+    const allGroupBills = [updatedFirstBill, ...(insertedSiblings || [])];
+    const normalizedItems = allGroupBills.map(normalizeBill);
+    const grouped = groupBillsWithInstallments(normalizedItems);
+
+    const resultItem = grouped[0] || normalizeBill(updatedFirstBill);
+
+    return res.json({
+      success: true,
+      message: `Fatura dividida com sucesso em ${installments.length} parcelas!`,
+      item: resultItem,
+      installments: normalizedItems
+    });
+  } catch (error: any) {
+    console.error('[splitBillIntoInstallments] Erro:', error.message);
+    return res.status(500).json({ error: error.message || 'Erro ao parcelar fatura.' });
+  }
+};
+

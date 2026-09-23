@@ -95,6 +95,7 @@ export interface BillStatementItem {
   installments?: BillStatementItem[];
   installments_count?: number;
   paid_installments_count?: number;
+  total_value?: number | null;
   raw: Record<string, unknown>;
 }
 
