@@ -58,10 +58,14 @@ export interface PeriodWindow {
 /**
  * Calcula o valor faturado da locação.
  * - Se uma janela [window.start, window.end] for fornecida (filtro por data):
- *   soma o total_value INTEGRAL (sem divisão parcial por dias) de todos os períodos
- *   em rental_invoice_equipments cujo billing_period_start se inicia dentro da janela.
+ *   utiliza a janela definida pelo usuário.
  * - Se nenhuma janela for fornecida (visão padrão / locações ativas):
- *   para cada equipamento, toma o período mais recente (ativo) e soma o seu total_value INTEGRAL.
+ *   utiliza o mês corrente como janela de referência padrão.
+ * - Para cada equipamento:
+ *   1. Localiza todos os períodos em rental_invoice_equipments cujo billing_period_start se inicia dentro da janela.
+ *      Se houver períodos na janela, SOMA todos eles (ex: múltiplos períodos semanais no mesmo mês).
+ *   2. Se nenhum período deste equipamento se iniciou dentro da janela, localiza o período ativo/vigente
+ *      que sobrepõe a janela (ou período mais recente caso visão sem filtro de datas).
  */
 export const calculateRentalPeriodValue = (
   equipments: any[],
@@ -71,33 +75,35 @@ export const calculateRentalPeriodValue = (
 ): number => {
   const hasWindow = Boolean(window && (window.start || window.end));
 
-  if (hasWindow) {
-    const winStart = window?.start ? window.start.split('T')[0] : '1900-01-01';
-    const winEnd = window?.end ? window.end.split('T')[0] : '9999-12-31';
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const lastDay = new Date(y, now.getMonth() + 1, 0).getDate();
+  const defaultMonthStart = `${y}-${m}-01`;
+  const defaultMonthEnd = `${y}-${m}-${String(lastDay).padStart(2, '0')}`;
 
-    if (!equipments || equipments.length === 0) {
-      const startStr = invoiceDatesFallback?.start ? String(invoiceDatesFallback.start).split('T')[0] : '';
-      if (startStr && startStr >= winStart && startStr <= winEnd) {
-        return Number(invoiceTotalFallback) || 0;
-      }
-      return 0;
-    }
+  const winStart = window?.start ? window.start.split('T')[0] : defaultMonthStart;
+  const winEnd = window?.end ? window.end.split('T')[0] : defaultMonthEnd;
 
-    let sum = 0;
-    for (const eq of equipments) {
-      const startStr = eq.billing_period_start ? String(eq.billing_period_start).split('T')[0] : '';
-      if (startStr && startStr >= winStart && startStr <= winEnd) {
-        sum += Number(eq.total_value) || 0;
-      }
-    }
-    return Math.round(sum * 100) / 100;
-  }
-
-  // Visão padrão sem filtro de datas (locações ativas / período mais recente)
   if (!equipments || equipments.length === 0) {
-    return Number(invoiceTotalFallback) || 0;
+    const startStr = invoiceDatesFallback?.start ? String(invoiceDatesFallback.start).split('T')[0] : '';
+    const endStr = invoiceDatesFallback?.end ? String(invoiceDatesFallback.end).split('T')[0] : '';
+    const returnDateStr = invoiceDatesFallback?.return_date ? String(invoiceDatesFallback.return_date).split('T')[0] : '';
+
+    if (startStr && startStr >= winStart && startStr <= winEnd) {
+      return Number(invoiceTotalFallback) || 0;
+    }
+    // Se overlap no período
+    if (startStr && startStr <= winEnd && (!endStr || endStr >= winStart) && (!returnDateStr || returnDateStr >= winStart)) {
+      return Number(invoiceTotalFallback) || 0;
+    }
+    if (!hasWindow) {
+      return Number(invoiceTotalFallback) || 0;
+    }
+    return 0;
   }
 
+  // Agrupar por equipamento
   const eqGroups: Record<string, any[]> = {};
   for (const item of equipments) {
     const key = item.equipment_id || item.asset_number || item.id;
@@ -107,19 +113,46 @@ export const calculateRentalPeriodValue = (
 
   let total = 0;
   for (const items of Object.values(eqGroups)) {
-    // Ordenar decrescente por billing_period_end e created_at
-    items.sort((a, b) => {
-      const endA = a.billing_period_end ? String(a.billing_period_end) : '';
-      const endB = b.billing_period_end ? String(b.billing_period_end) : '';
-      if (endB !== endA) return endB.localeCompare(endA);
-      const crA = a.created_at ? String(a.created_at) : '';
-      const crB = b.created_at ? String(b.created_at) : '';
-      return crB.localeCompare(crA);
+    // 1. Períodos deste equipamento que começam dentro do mês / janela
+    const itemsInWindow = items.filter((it: any) => {
+      const s = it.billing_period_start ? String(it.billing_period_start).split('T')[0] : '';
+      return s && s >= winStart && s <= winEnd;
     });
 
-    const latest = items[0];
-    if (latest) {
-      total += Number(latest.total_value) || 0;
+    if (itemsInWindow.length > 0) {
+      // Somar TODOS os períodos deste equipamento no mês (ex: 3 períodos de 7k = 21k)
+      const sumInWin = itemsInWindow.reduce((acc: number, it: any) => acc + (Number(it.total_value) || 0), 0);
+      total += sumInWin;
+    } else {
+      // 2. Se nenhum período começou dentro da janela, verificar se há período ativo sobrepondo a janela
+      items.sort((a: any, b: any) => {
+        const endA = a.billing_period_end ? String(a.billing_period_end) : '';
+        const endB = b.billing_period_end ? String(b.billing_period_end) : '';
+        if (endB !== endA) return endB.localeCompare(endA);
+        const crA = a.created_at ? String(a.created_at) : '';
+        const crB = b.created_at ? String(b.created_at) : '';
+        return crB.localeCompare(crA);
+      });
+
+      const activeOverlapping = items.find((it: any) => {
+        const s = it.billing_period_start ? String(it.billing_period_start).split('T')[0] : '';
+        const e = it.billing_period_end ? String(it.billing_period_end).split('T')[0] : '';
+        const r = it.return_date ? String(it.return_date).split('T')[0] : '';
+        const startsBeforeOrInWin = !s || s <= winEnd;
+        const endsAfterOrInWin = !e || e >= winStart;
+        const notReturnedBeforeWin = !r || r >= winStart;
+        return startsBeforeOrInWin && endsAfterOrInWin && notReturnedBeforeWin;
+      });
+
+      if (activeOverlapping) {
+        total += Number(activeOverlapping.total_value) || 0;
+      } else if (!hasWindow) {
+        // Sem filtro de datas explícito (visão geral), tomar o período mais recente
+        const fallback = items[0];
+        if (fallback) {
+          total += Number(fallback.total_value) || 0;
+        }
+      }
     }
   }
 
