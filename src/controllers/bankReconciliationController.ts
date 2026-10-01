@@ -189,6 +189,19 @@ export const reconcileBankStatement = async (req: AuthRequest, res: Response) =>
     return res.json(response);
   } catch (error: any) {
     console.error('[reconcileBankStatement] Erro:', error.message);
+    const status = error.status || 500;
+    const msg = String(error.message || '');
+    if (
+      status === 503 ||
+      status === 403 ||
+      msg.includes('503') ||
+      msg.includes('403') ||
+      msg.includes('serviço subjacente') ||
+      msg.includes('chave de aplicacao') ||
+      msg.includes('AppKey')
+    ) {
+      return res.status(503).json({ error: 'Serviço inacessível no momento. Tente novamente mais tarde.' });
+    }
     return res.status(500).json({ error: error.message });
   }
 };
