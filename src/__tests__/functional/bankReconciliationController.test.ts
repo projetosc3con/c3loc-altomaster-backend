@@ -121,6 +121,70 @@ describe('bankReconciliationController', () => {
       const untouchedB = db.getTable('bills').find((b) => b.id === billB.id)!;
       expect(untouchedB.status).toBe('Pendente');
     });
+
+    it('match forte por CNPJ da contrapartida casa com o cliente correto mesmo com data fora da tolerância', async () => {
+      const { makeClient } = await import('../helpers/fixtures');
+      const client = makeClient({ cnpj: '42.293.085/0001-93' });
+      const bill = makeBill({
+        type: 'receivable',
+        client_id: client.id,
+        net_value: 7000,
+        due_date: '2026-08-01', // 27 dias antes da data do banco
+      });
+      db.seed('clients', [client]);
+      db.seed('bills', [bill]);
+
+      vi.mocked(bbExtratoService.fetchExtrato).mockResolvedValue({
+        simulated: false,
+        lines: [
+          makeBankLine({
+            value: 7000,
+            bank_date: '2026-08-28',
+            counterparty_document: '42293085000193',
+            counterparty_name: 'STRUTEX MON',
+          }),
+        ],
+      });
+
+      const res = await request(app)
+        .post('/api/bills/reconcile')
+        .set('x-test-profile', profileHeader('Administrador'));
+
+      expect(res.body.matched_count).toBe(1);
+      expect(res.body.lines[0].matched_bill_id).toBe(bill.id);
+      const updated = db.getTable('bills').find((b) => b.id === bill.id)!;
+      expect(updated.status).toBe('Recebido');
+    });
+
+    it('idempotência bancária: transação já conciliada anteriormente em outro refresh é identificada como matched', async () => {
+      const bill = makeBill({
+        type: 'receivable',
+        net_value: 1250,
+        bank_transaction_date: '2026-08-28',
+        pix_end_to_end_id: 'BB002202609280080107244972',
+        status: 'Recebido',
+      });
+      db.seed('bills', [bill]);
+
+      vi.mocked(bbExtratoService.fetchExtrato).mockResolvedValue({
+        simulated: false,
+        lines: [
+          makeBankLine({
+            value: 1250,
+            bank_date: '2026-08-28',
+            unique_transaction_id: 'BB002202609280080107244972',
+          }),
+        ],
+      });
+
+      const res = await request(app)
+        .post('/api/bills/reconcile?from=2026-08-01&to=2026-08-31')
+        .set('x-test-profile', profileHeader('Administrador'));
+
+      expect(res.body.matched_count).toBe(1);
+      expect(res.body.lines[0].match_status).toBe('matched');
+      expect(res.body.lines[0].matched_bill_id).toBe(bill.id);
+    });
   });
 
   describe('POST /api/bills/:id/link-statement-line', () => {

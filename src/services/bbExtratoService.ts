@@ -74,16 +74,59 @@ function dcToType(dc: 'C' | 'D'): BillType {
   return dc === 'C' ? 'receivable' : 'payable';
 }
 
+function extractCounterpartyDetails(
+  sub?: string,
+  comp?: string
+): { counterpartyName: string | null; enrichedDescription: string | null } {
+  const trimmedComp = (comp || '').trim();
+  const trimmedSub = (sub || '').trim();
+  let counterpartyName: string | null = null;
+
+  if (trimmedComp) {
+    // Formatos do BB em textoInformacaoComplementar:
+    // 1) "28/09 11:04 42293085000193 STRUTEX MON"
+    // 2) "42293085000193 STRUTEX MON"
+    // 3) "STRUTEX MON" ou texto complementar livre ("Dinheiro na Conta")
+    const matchWithPrefix = trimmedComp.match(/^(?:\d{2}\/\d{2}(?:\s+\d{2}:\d{2})?\s+)?(?:\d{11,14}\s+)?(.*)$/);
+    const candidate = matchWithPrefix && matchWithPrefix[1] ? matchWithPrefix[1].trim() : trimmedComp;
+    if (candidate && candidate !== trimmedSub) {
+      counterpartyName = candidate;
+    }
+  }
+
+  let enrichedDescription: string | null = trimmedSub || null;
+  if (counterpartyName && counterpartyName !== trimmedSub) {
+    enrichedDescription = trimmedSub ? `${trimmedSub} - ${counterpartyName}` : counterpartyName;
+  } else if (trimmedComp && trimmedComp !== trimmedSub) {
+    enrichedDescription = trimmedSub ? `${trimmedSub} - ${trimmedComp}` : trimmedComp;
+  }
+
+  return { counterpartyName, enrichedDescription };
+}
+
 function normalizeBbLine(raw: BbExtratoLancamentoRaw): BankStatementLine | null {
   const dc = raw.indicadorSinalLancamento;
   if (dc === '*') return null; // valor bloqueado, sem D/C definido — não conciliável
+  if (raw.valorLancamento === 0) return null; // saldo anterior ou marcador de saldo do dia com valor 0
+
+  const { counterpartyName, enrichedDescription } = extractCounterpartyDetails(
+    raw.textoDescricaoSubHistorico,
+    raw.textoInformacaoComplementar
+  );
+
+  const cleanDoc = raw.numeroCadastroPessoaFisicaCadastroNacPessoasJuridicasContrapartida
+    ? String(raw.numeroCadastroPessoaFisicaCadastroNacPessoasJuridicasContrapartida).replace(/\D/g, '') || null
+    : null;
 
   return {
     bank_date: ddmmaaaaToIso(raw.dataLancamento),
     value: Math.abs(raw.valorLancamento),
     dc_indicator: dc,
     type: dcToType(dc),
-    description: raw.textoDescricaoSubHistorico ?? raw.textoInformacaoComplementar ?? null,
+    description: enrichedDescription,
+    counterparty_name: counterpartyName,
+    counterparty_document: cleanDoc,
+    complementary_info: raw.textoInformacaoComplementar ? String(raw.textoInformacaoComplementar).trim() : null,
     document_number: raw.numeroDocumento != null ? String(raw.numeroDocumento) : null,
     unique_transaction_id: raw.textoIdentificadorUnicoTransacao || null,
     raw: raw as unknown as Record<string, unknown>,
@@ -163,6 +206,20 @@ function buildSimulatedLines(params: ExtratoParams): BankStatementLine[] {
   ];
 }
 
+const MAX_RETRIES = 2;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resolveRetryDelay(): number {
+  return process.env.NODE_ENV === 'test' ? 10 : 1500;
+}
+
+function resolvePacingDelay(): number {
+  return process.env.NODE_ENV === 'test' ? 0 : 600;
+}
+
 class BbExtratoService {
   private httpCache: AxiosInstance | null = null;
 
@@ -184,30 +241,44 @@ class BbExtratoService {
     pageNumber: number
   ): Promise<BbExtratoResponseRaw> {
     const mciTeste = resolveMciTesteHeader(agencia, conta);
-    try {
-      const { data } = await this.getHttp().get<BbExtratoResponseRaw>(
-        `/conta-corrente/agencia/${agencia}/conta/${conta}`,
-        {
-          params: {
-            'gw-dev-app-key': appKey,
-            dataInicioSolicitacao: isoToDdmmaaaa(params.from),
-            dataFimSolicitacao: isoToDdmmaaaa(params.to),
-            numeroPaginaSolicitacao: pageNumber,
-            quantidadeRegistroPaginaSolicitacao: PAGE_SIZE,
-          },
-          headers: {
-            Authorization: `Bearer ${token}`,
-            ...(mciTeste ? { 'x-br-com-bb-ipa-mciteste': mciTeste } : {}),
-          },
+    const retryDelay = resolveRetryDelay();
+    let attempt = 0;
+
+    while (true) {
+      try {
+        const { data } = await this.getHttp().get<BbExtratoResponseRaw>(
+          `/conta-corrente/agencia/${agencia}/conta/${conta}`,
+          {
+            params: {
+              'gw-dev-app-key': appKey,
+              dataInicioSolicitacao: isoToDdmmaaaa(params.from),
+              dataFimSolicitacao: isoToDdmmaaaa(params.to),
+              numeroPaginaSolicitacao: pageNumber,
+              quantidadeRegistroPaginaSolicitacao: PAGE_SIZE,
+            },
+            headers: {
+              Authorization: `Bearer ${token}`,
+              ...(mciTeste ? { 'x-br-com-bb-ipa-mciteste': mciTeste } : {}),
+            },
+          }
+        );
+        return data;
+      } catch (err: any) {
+        const status = err.response?.status;
+        if ((status === 503 || status === 429) && attempt < MAX_RETRIES) {
+          attempt++;
+          console.warn(
+            `[bbExtratoService] BB retornou HTTP ${status} na página ${pageNumber}. Tentativa ${attempt} de ${MAX_RETRIES} após ${retryDelay}ms...`
+          );
+          await sleep(retryDelay);
+          continue;
         }
-      );
-      return data;
-    } catch (err: any) {
-      const status = err.response?.status;
-      if (status && err.response?.data) {
-        throw new BbApiError(status, err.response.data as BbApiErrorResponse);
+
+        if (status && err.response?.data) {
+          throw new BbApiError(status, err.response.data as BbApiErrorResponse);
+        }
+        throw err;
       }
-      throw err;
     }
   }
 
@@ -232,6 +303,7 @@ class BbExtratoService {
     }
 
     const token = await getBbAccessToken(BB_EXTRATO_SCOPE);
+    const pacingDelay = resolvePacingDelay();
 
     const rawLines: BbExtratoLancamentoRaw[] = [];
     let pageNumber = 1;
@@ -239,6 +311,11 @@ class BbExtratoService {
       const page = await this.fetchPage(agencia, conta, appKey, token, params, pageNumber);
       rawLines.push(...(page.listaLancamento ?? []));
       if (!page.numeroPaginaProximo) break;
+
+      // Pacing preventivo: evita requisições em rajada que disparam bloqueio/rate-limit no gateway do BB
+      if (pacingDelay > 0) {
+        await sleep(pacingDelay);
+      }
       pageNumber = page.numeroPaginaProximo;
     }
 

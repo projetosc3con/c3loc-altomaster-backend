@@ -99,14 +99,15 @@ export interface BillStatementItem {
   raw: Record<string, unknown>;
 }
 
-// Linha normalizada do extrato bancário do BB (ver bbExtratoService), já
-// mapeada pro vocabulário de `bills` (D/C -> payable/receivable).
 export interface BankStatementLine {
   bank_date: string; // YYYY-MM-DD
   value: number;
   dc_indicator: 'D' | 'C';
   type: BillType;
   description: string | null;
+  counterparty_name?: string | null;
+  counterparty_document?: string | null;
+  complementary_info?: string | null;
   document_number: string | null;
   // `textoIdentificadorUnicoTransacao` do BB — quando presente, cruza
   // diretamente com `bills.pix_end_to_end_id` (ver reconcileBankStatement)
