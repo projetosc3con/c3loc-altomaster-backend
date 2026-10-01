@@ -328,7 +328,7 @@ export const createEquipmentDocument = async (req: AuthRequest, res: Response) =
   const { id } = req.params;
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const { document_name, file_url, file_name, file_size } = req.body;
+    const { document_name, file_url, file_name, file_size, due_date } = req.body;
 
     if (!document_name || !file_url) {
       return res.status(400).json({ error: 'Nome do documento e URL do arquivo são obrigatórios.' });
@@ -343,6 +343,7 @@ export const createEquipmentDocument = async (req: AuthRequest, res: Response) =
           file_url,
           file_name: file_name || null,
           file_size: file_size || null,
+          due_date: due_date || null,
           created_by: req.user?.id || null,
           updated_by: req.user?.id || null,
         }
@@ -361,19 +362,25 @@ export const updateEquipmentDocument = async (req: AuthRequest, res: Response) =
   const { docId } = req.params;
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const { document_name } = req.body;
+    const { document_name, due_date } = req.body;
 
     if (!document_name) {
       return res.status(400).json({ error: 'Nome do documento é obrigatório.' });
     }
 
+    const updatePayload: Record<string, any> = {
+      document_name,
+      updated_by: req.user?.id || null,
+      updated_at: new Date().toISOString(),
+    };
+
+    if (due_date !== undefined) {
+      updatePayload.due_date = due_date || null;
+    }
+
     const { data, error } = await supabase
       .from('equipment_documents')
-      .update({
-        document_name,
-        updated_by: req.user?.id || null,
-        updated_at: new Date().toISOString(),
-      })
+      .update(updatePayload)
       .eq('id', docId)
       .select('*, created_by_profile:users_profiles!created_by(id, full_name), updated_by_profile:users_profiles!updated_by(id, full_name)')
       .single();
