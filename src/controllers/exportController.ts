@@ -2,7 +2,7 @@ import { Response } from 'express';
 import * as XLSX from 'xlsx';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
-import { calculateRentalPeriodValue, PeriodWindow } from './rentalController';
+import { calculateRentalPeriodValue, getPeriodInfoForStatusOrWindow, PeriodMatchResult, PeriodWindow } from './rentalController';
 import { getFilteredBills } from './billController';
 
 const EXPORT_BUCKET = 'exports';
@@ -125,6 +125,14 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
     const valueMax = parseFloat(req.query.value_max as string) || 0;
     const returnStatus = (req.query.return_status as string) || '';
     const hideReturned = req.query.hide_returned === 'true' || returnStatus === 'active';
+    const periodStatus = (req.query.period_status as string) || '';
+
+    const todayStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Sao_Paulo',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(new Date());
 
     // Se houver filtro de data (início de período), buscar os contratos que possuem período começando no intervalo
     let matchingRentalIdsForDates: string[] | null = null;
@@ -144,6 +152,41 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
       matchingRentalIdsForDates = [...new Set([...eqRentalIds, ...invRentalIds])];
     }
 
+    // Se houver filtro por status de período (encerrado, em_vigor, futuro),
+    // buscar os contratos que possuem pelo menos um período correspondente
+    let matchingRentalIdsForPeriodStatus: string[] | null = null;
+    if (periodStatus) {
+      let eqQuery = supabase.from('rental_invoice_equipments').select('rental_invoice_id');
+      let invQuery = supabase.from('rental_invoices').select('id');
+
+      if (periodStatus === 'encerrado') {
+        eqQuery = eqQuery.or(`return_date.lt.${todayStr},and(return_date.is.null,billing_period_end.lt.${todayStr})`);
+        invQuery = invQuery.or(`return_date.lt.${todayStr},and(return_date.is.null,billing_period_end.lt.${todayStr})`);
+      } else if (periodStatus === 'em_vigor') {
+        eqQuery = eqQuery.lte('billing_period_start', todayStr).or(`return_date.gte.${todayStr},and(return_date.is.null,billing_period_end.gte.${todayStr})`);
+        invQuery = invQuery.lte('billing_period_start', todayStr).or(`return_date.gte.${todayStr},and(return_date.is.null,billing_period_end.gte.${todayStr})`);
+      } else if (periodStatus === 'futuro') {
+        eqQuery = eqQuery.gt('billing_period_start', todayStr);
+        invQuery = invQuery.gt('billing_period_start', todayStr);
+      }
+
+      const [{ data: eqData }, { data: invData }] = await Promise.all([eqQuery, invQuery]);
+      const eqRentalIds = (eqData || []).map((e: any) => e.rental_invoice_id).filter(Boolean);
+      const invRentalIds = (invData || []).map((i: any) => i.id).filter(Boolean);
+      matchingRentalIdsForPeriodStatus = [...new Set([...eqRentalIds, ...invRentalIds])];
+    }
+
+    // Combinar IDs coincidentes
+    let finalMatchingIds: string[] | null = null;
+    if (matchingRentalIdsForDates !== null && matchingRentalIdsForPeriodStatus !== null) {
+      const pSet = new Set(matchingRentalIdsForPeriodStatus);
+      finalMatchingIds = matchingRentalIdsForDates.filter((id) => pSet.has(id));
+    } else if (matchingRentalIdsForDates !== null) {
+      finalMatchingIds = matchingRentalIdsForDates;
+    } else if (matchingRentalIdsForPeriodStatus !== null) {
+      finalMatchingIds = matchingRentalIdsForPeriodStatus;
+    }
+
     if (search) {
       query = query.or(
         `client_name.ilike.%${search}%,equipment_name.ilike.%${search}%,asset_number.ilike.%${search}%,invoice_number.ilike.%${search}%`
@@ -151,19 +194,23 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
     }
     if (billingStatus) query = query.eq('billing_status', billingStatus);
     if (reconciliationStatus) query = query.eq('reconciliation_status', reconciliationStatus);
-    if (matchingRentalIdsForDates !== null) {
-      if (matchingRentalIdsForDates.length === 0) {
+    if (finalMatchingIds !== null) {
+      if (finalMatchingIds.length === 0) {
         query = query.eq('id', '00000000-0000-0000-0000-000000000000');
       } else {
-        query = query.in('id', matchingRentalIdsForDates);
+        query = query.in('id', finalMatchingIds);
       }
     }
     if (valueMin > 0) query = query.gte('total_value', valueMin);
     if (valueMax > 0) query = query.lte('total_value', valueMax);
-    if (hideReturned || returnStatus === 'active') {
-      query = query.is('return_date', null);
-    } else if (returnStatus === 'returned') {
-      query = query.not('return_date', 'is', null);
+
+    // Fallback legado se não houver periodStatus ativo
+    if (!periodStatus) {
+      if (hideReturned || returnStatus === 'active') {
+        query = query.is('return_date', null);
+      } else if (returnStatus === 'returned') {
+        query = query.not('return_date', 'is', null);
+      }
     }
 
     // Sorting
@@ -193,7 +240,7 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Nenhuma locação encontrada para exportar.' });
     }
 
-    const currentPeriodByRentalId: Record<string, number> = {};
+    const periodInfoByRentalId: Record<string, PeriodMatchResult> = {};
     const rentalIds = rentals.map((r) => r.id).filter(Boolean);
     const targetWindow: PeriodWindow | undefined = (dateFrom || dateTo)
       ? { start: dateFrom || undefined, end: dateTo || undefined }
@@ -213,23 +260,41 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
 
       for (const r of rentals) {
         const equips = equipsByRental[r.id] || [];
-        currentPeriodByRentalId[r.id] = calculateRentalPeriodValue(
+        periodInfoByRentalId[r.id] = getPeriodInfoForStatusOrWindow(
           equips,
           Number(r.total_value) || 0,
+          periodStatus,
           targetWindow,
-          { start: r.billing_period_start, end: r.billing_period_end, return_date: r.return_date }
+          { start: r.billing_period_start, end: r.billing_period_end, return_date: r.return_date },
+          todayStr
         );
       }
     }
 
     const periodColHeader = (dateFrom || dateTo)
       ? 'Valor Faturado no Período (R$)'
+      : periodStatus === 'em_vigor'
+      ? 'Valor (Em vigor) (R$)'
+      : periodStatus === 'encerrado'
+      ? 'Valor (Encerrado) (R$)'
+      : periodStatus === 'futuro'
+      ? 'Valor (Futuro) (R$)'
       : 'Valor Período Atual (R$)';
 
     const exportData = rentals.map((r) => {
-      const currentPeriodVal = currentPeriodByRentalId[r.id] !== undefined
-        ? currentPeriodByRentalId[r.id]
-        : Number(r.total_value || 0);
+      const info = periodInfoByRentalId[r.id] || {
+        value: Number(r.total_value || 0),
+        start: r.billing_period_start,
+        end: r.billing_period_end,
+        matchedCount: 1
+      };
+
+      const startFormatted = info.start
+        ? new Date(info.start + 'T00:00:00').toLocaleDateString('pt-BR')
+        : (r.billing_period_start ? new Date(r.billing_period_start + 'T00:00:00').toLocaleDateString('pt-BR') : '');
+      const endFormatted = info.end
+        ? new Date(info.end + 'T00:00:00').toLocaleDateString('pt-BR')
+        : (r.billing_period_end ? new Date(r.billing_period_end + 'T00:00:00').toLocaleDateString('pt-BR') : '');
 
       const row: Record<string, any> = {
         'Nº Fatura': r.invoice_number || '',
@@ -239,15 +304,11 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
         'Tipo Equipamento': r.equipment_type || '',
         'Patrimônio': r.asset_number || '',
         'Obra': r.work_site || '',
-        'Início Período': r.billing_period_start
-          ? new Date(r.billing_period_start).toLocaleDateString('pt-BR')
-          : '',
-        'Fim Período': r.billing_period_end
-          ? new Date(r.billing_period_end).toLocaleDateString('pt-BR')
-          : '',
+        'Início Período': startFormatted,
+        'Fim Período': endFormatted,
         'Status Faturamento': r.billing_status || '',
         'Data Devolução': r.return_date
-          ? new Date(r.return_date).toLocaleDateString('pt-BR')
+          ? new Date(r.return_date + 'T00:00:00').toLocaleDateString('pt-BR')
           : '',
         'Locação (R$)': Number(r.cost_rental || 0).toFixed(2),
         'Seguro (R$)': Number(r.cost_insurance || 0).toFixed(2),
@@ -257,10 +318,10 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
         'Treinamento (R$)': Number(r.cost_training || 0).toFixed(2),
       };
 
-      row[periodColHeader] = Number(currentPeriodVal).toFixed(2);
+      row[periodColHeader] = Number(info.value).toFixed(2);
       row['Valor Total Acumulado (R$)'] = Number(r.total_value || 0).toFixed(2);
 
-      row['Vencimento'] = r.due_date ? new Date(r.due_date).toLocaleDateString('pt-BR') : '';
+      row['Vencimento'] = r.due_date ? new Date(r.due_date + 'T00:00:00').toLocaleDateString('pt-BR') : '';
       row['Forma Pagamento'] = r.payment_method || '';
       row['Status Conciliação'] = r.reconciliation_status || '';
       row['Observações'] = r.notes || '';

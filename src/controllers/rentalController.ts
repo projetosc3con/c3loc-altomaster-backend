@@ -171,6 +171,84 @@ export const calculateCurrentPeriodTotal = (
 
 export const calculatePeriodProportionalValue = calculateRentalPeriodValue;
 
+export interface PeriodMatchResult {
+  value: number;
+  start?: string;
+  end?: string;
+  matchedCount: number;
+}
+
+export const getPeriodInfoForStatusOrWindow = (
+  equips: any[],
+  invoiceTotalFallback: number,
+  periodStatus: string, // 'encerrado' | 'em_vigor' | 'futuro' | ''
+  window?: PeriodWindow,
+  invoiceDatesFallback?: { start?: string | null; end?: string | null; return_date?: string | null },
+  referenceDateStr?: string
+): PeriodMatchResult => {
+  const todayStr = referenceDateStr || new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).format(new Date());
+
+  if (periodStatus === 'encerrado' || periodStatus === 'em_vigor' || periodStatus === 'futuro') {
+    if (equips && equips.length > 0) {
+      const matched = equips.filter((item: any) => {
+        const s = item.billing_period_start ? String(item.billing_period_start).split('T')[0] : '';
+        const e = (item.return_date || item.billing_period_end) ? String(item.return_date || item.billing_period_end).split('T')[0] : '';
+        if (periodStatus === 'encerrado') {
+          return Boolean(e && e < todayStr);
+        } else if (periodStatus === 'em_vigor') {
+          return Boolean(s && e && s <= todayStr && e >= todayStr);
+        } else if (periodStatus === 'futuro') {
+          return Boolean(s && s > todayStr);
+        }
+        return false;
+      });
+
+      if (matched.length > 0) {
+        const sumVal = matched.reduce((acc: number, it: any) => acc + (Number(it.total_value) || 0), 0);
+        const starts = matched.map((it: any) => (it.billing_period_start || '').split('T')[0]).filter(Boolean).sort();
+        const ends = matched.map((it: any) => (it.billing_period_end || '').split('T')[0]).filter(Boolean).sort();
+        return {
+          value: Math.round(sumVal * 100) / 100,
+          start: starts[0],
+          end: ends[ends.length - 1],
+          matchedCount: matched.length
+        };
+      }
+    }
+
+    const s = invoiceDatesFallback?.start ? String(invoiceDatesFallback.start).split('T')[0] : '';
+    const e = (invoiceDatesFallback?.return_date || invoiceDatesFallback?.end) ? String(invoiceDatesFallback.return_date || invoiceDatesFallback.end).split('T')[0] : '';
+    let matches = false;
+    if (periodStatus === 'encerrado') matches = Boolean(e && e < todayStr);
+    else if (periodStatus === 'em_vigor') matches = Boolean(s && e && s <= todayStr && e >= todayStr);
+    else if (periodStatus === 'futuro') matches = Boolean(s && s > todayStr);
+
+    if (matches) {
+      return {
+        value: Number(invoiceTotalFallback) || 0,
+        start: s || undefined,
+        end: invoiceDatesFallback?.end ? String(invoiceDatesFallback.end).split('T')[0] : undefined,
+        matchedCount: 1
+      };
+    }
+
+    return { value: 0, start: undefined, end: undefined, matchedCount: 0 };
+  }
+
+  const periodVal = calculateRentalPeriodValue(equips, invoiceTotalFallback, window, invoiceDatesFallback);
+  return {
+    value: periodVal,
+    start: invoiceDatesFallback?.start ? String(invoiceDatesFallback.start).split('T')[0] : undefined,
+    end: invoiceDatesFallback?.end ? String(invoiceDatesFallback.end).split('T')[0] : undefined,
+    matchedCount: equips.length || 1
+  };
+};
+
 export const getAllInvoices = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
@@ -190,6 +268,14 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
     const valueMax = parseFloat(req.query.value_max as string) || 0;
     const returnStatus = (req.query.return_status as string) || '';
     const hideReturned = req.query.hide_returned === 'true' || returnStatus === 'active';
+    const periodStatus = (req.query.period_status as string) || '';
+
+    const todayStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Sao_Paulo',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(new Date());
 
     // Se houver filtro de data (início de período), buscar os contratos que possuem período começando no intervalo
     let matchingRentalIdsForDates: string[] | null = null;
@@ -209,6 +295,41 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
       matchingRentalIdsForDates = [...new Set([...eqRentalIds, ...invRentalIds])];
     }
 
+    // Se houver filtro por status de período (encerrado, em_vigor, futuro),
+    // buscar os contratos que possuem pelo menos um período/equipamento correspondente
+    let matchingRentalIdsForPeriodStatus: string[] | null = null;
+    if (periodStatus) {
+      let eqQuery = supabase.from('rental_invoice_equipments').select('rental_invoice_id');
+      let invQuery = supabase.from('rental_invoices').select('id');
+
+      if (periodStatus === 'encerrado') {
+        eqQuery = eqQuery.or(`return_date.lt.${todayStr},and(return_date.is.null,billing_period_end.lt.${todayStr})`);
+        invQuery = invQuery.or(`return_date.lt.${todayStr},and(return_date.is.null,billing_period_end.lt.${todayStr})`);
+      } else if (periodStatus === 'em_vigor') {
+        eqQuery = eqQuery.lte('billing_period_start', todayStr).or(`return_date.gte.${todayStr},and(return_date.is.null,billing_period_end.gte.${todayStr})`);
+        invQuery = invQuery.lte('billing_period_start', todayStr).or(`return_date.gte.${todayStr},and(return_date.is.null,billing_period_end.gte.${todayStr})`);
+      } else if (periodStatus === 'futuro') {
+        eqQuery = eqQuery.gt('billing_period_start', todayStr);
+        invQuery = invQuery.gt('billing_period_start', todayStr);
+      }
+
+      const [{ data: eqData }, { data: invData }] = await Promise.all([eqQuery, invQuery]);
+      const eqRentalIds = (eqData || []).map((e: any) => e.rental_invoice_id).filter(Boolean);
+      const invRentalIds = (invData || []).map((i: any) => i.id).filter(Boolean);
+      matchingRentalIdsForPeriodStatus = [...new Set([...eqRentalIds, ...invRentalIds])];
+    }
+
+    // Combinar IDs coincidentes
+    let finalMatchingIds: string[] | null = null;
+    if (matchingRentalIdsForDates !== null && matchingRentalIdsForPeriodStatus !== null) {
+      const pSet = new Set(matchingRentalIdsForPeriodStatus);
+      finalMatchingIds = matchingRentalIdsForDates.filter((id) => pSet.has(id));
+    } else if (matchingRentalIdsForDates !== null) {
+      finalMatchingIds = matchingRentalIdsForDates;
+    } else if (matchingRentalIdsForPeriodStatus !== null) {
+      finalMatchingIds = matchingRentalIdsForPeriodStatus;
+    }
+
     const applyFilters = (q: any) => {
       if (search) {
         q = q.or(
@@ -221,11 +342,11 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
       if (reconciliationStatus) {
         q = q.eq('reconciliation_status', reconciliationStatus);
       }
-      if (matchingRentalIdsForDates !== null) {
-        if (matchingRentalIdsForDates.length === 0) {
+      if (finalMatchingIds !== null) {
+        if (finalMatchingIds.length === 0) {
           q = q.eq('id', '00000000-0000-0000-0000-000000000000');
         } else {
-          q = q.in('id', matchingRentalIdsForDates);
+          q = q.in('id', finalMatchingIds);
         }
       }
       if (valueMin > 0) {
@@ -234,11 +355,16 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
       if (valueMax > 0) {
         q = q.lte('total_value', valueMax);
       }
-      if (hideReturned || returnStatus === 'active') {
-        q = q.is('return_date', null);
-      } else if (returnStatus === 'returned') {
-        q = q.not('return_date', 'is', null);
+
+      // Fallback legado de retorno se não houver filtro de período ativo
+      if (!periodStatus) {
+        if (hideReturned || returnStatus === 'active') {
+          q = q.is('return_date', null);
+        } else if (returnStatus === 'returned') {
+          q = q.not('return_date', 'is', null);
+        }
       }
+
       return q;
     };
 
@@ -292,7 +418,7 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
 
     // Coletar IDs dos registros para buscar os equipamentos vigentes em rental_invoice_equipments
     const matchingIds = statsData.map((item: any) => item.id).filter(Boolean);
-    const currentPeriodByRentalId: Record<string, number> = {};
+    const periodInfoByRentalId: Record<string, PeriodMatchResult> = {};
     let calculatedActivePeriodSum = 0;
     const targetWindow: PeriodWindow | undefined = (dateFrom || dateTo)
       ? { start: dateFrom || undefined, end: dateTo || undefined }
@@ -304,49 +430,45 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
         .select('id, rental_invoice_id, equipment_id, asset_number, billing_period_start, billing_period_end, return_date, total_value, created_at')
         .in('rental_invoice_id', matchingIds);
 
+      const equipsByRental: Record<string, any[]> = {};
       if (!equipErr && allEquips) {
-        const equipsByRental: Record<string, any[]> = {};
         for (const eq of allEquips) {
           if (!equipsByRental[eq.rental_invoice_id]) equipsByRental[eq.rental_invoice_id] = [];
           equipsByRental[eq.rental_invoice_id].push(eq);
         }
+      }
 
-        for (const inv of statsData) {
-          const equips = equipsByRental[inv.id] || [];
-          const periodVal = calculateRentalPeriodValue(
-            equips,
-            Number(inv.total_value) || 0,
-            targetWindow,
-            { start: inv.billing_period_start, end: inv.billing_period_end, return_date: inv.return_date }
-          );
-          currentPeriodByRentalId[inv.id] = periodVal;
-          calculatedActivePeriodSum += periodVal;
-        }
-      } else {
-        for (const inv of statsData) {
-          const periodVal = calculateRentalPeriodValue(
-            [],
-            Number(inv.total_value) || 0,
-            targetWindow,
-            { start: inv.billing_period_start, end: inv.billing_period_end, return_date: inv.return_date }
-          );
-          currentPeriodByRentalId[inv.id] = periodVal;
-          calculatedActivePeriodSum += periodVal;
-        }
+      for (const inv of statsData) {
+        const equips = equipsByRental[inv.id] || [];
+        const info = getPeriodInfoForStatusOrWindow(
+          equips,
+          Number(inv.total_value) || 0,
+          periodStatus,
+          targetWindow,
+          { start: inv.billing_period_start, end: inv.billing_period_end, return_date: inv.return_date },
+          todayStr
+        );
+        periodInfoByRentalId[inv.id] = info;
+        calculatedActivePeriodSum += info.value;
       }
     }
 
     const currentPeriodTotalValue = Math.round(calculatedActivePeriodSum * 100) / 100;
 
-    // Enriquecer registros da página atual com current_period_value e accumulated_total_value
+    // Enriquecer registros da página atual com current_period_value, datas do período correspondente e accumulated_total_value
     let pageData = dataResult.data || [];
     let enrichedData = pageData.map((r: any) => {
-      const periodVal = currentPeriodByRentalId[r.id] !== undefined
-        ? currentPeriodByRentalId[r.id]
-        : Number(r.total_value) || 0;
+      const info = periodInfoByRentalId[r.id] || {
+        value: Number(r.total_value) || 0,
+        start: r.billing_period_start,
+        end: r.billing_period_end,
+        matchedCount: 1
+      };
       return {
         ...r,
-        current_period_value: periodVal,
+        current_period_value: info.value,
+        current_period_start: info.start || r.billing_period_start,
+        current_period_end: info.end || r.billing_period_end,
         accumulated_total_value: Number(r.total_value) || 0
       };
     });
@@ -357,6 +479,18 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
         const valA = a.current_period_value ?? a.total_value ?? 0;
         const valB = b.current_period_value ?? b.total_value ?? 0;
         return isAscending ? valA - valB : valB - valA;
+      });
+    } else if (sortBy === 'billing_period_end' && periodStatus) {
+      enrichedData.sort((a: any, b: any) => {
+        const dateA = a.current_period_end || a.billing_period_end || '';
+        const dateB = b.current_period_end || b.billing_period_end || '';
+        return isAscending ? dateA.localeCompare(dateB) : dateB.localeCompare(dateA);
+      });
+    } else if (sortBy === 'billing_period_start' && periodStatus) {
+      enrichedData.sort((a: any, b: any) => {
+        const dateA = a.current_period_start || a.billing_period_start || '';
+        const dateB = b.current_period_start || b.billing_period_start || '';
+        return isAscending ? dateA.localeCompare(dateB) : dateB.localeCompare(dateA);
       });
     }
 
