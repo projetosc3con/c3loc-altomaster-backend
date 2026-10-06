@@ -80,9 +80,8 @@ function groupBillsWithInstallments(items: BillStatementItem[]): BillStatementIt
     const isNfe = groupKey.startsWith('nfe_');
     const totalCount = installments.length;
 
-    const rawTotalInvoice = Number(rawSnap.total_value || rawSnap.total_invoice);
     const sumGross = installments.reduce((acc, curr) => acc + (Number(curr.gross_value) || 0), 0);
-    const totalGross = (!isNaN(rawTotalInvoice) && rawTotalInvoice > 0) ? rawTotalInvoice : Math.round(sumGross * 100) / 100;
+    const totalGross = Math.round(sumGross * 100) / 100;
     const sumNet = installments.reduce((acc, curr) => acc + (Number(curr.net_value ?? curr.gross_value) || 0), 0);
     const totalNet = Math.round(sumNet * 100) / 100;
     const sumFee = installments.reduce((acc, curr) => acc + (Number(curr.fee_amount) || 0), 0);
