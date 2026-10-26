@@ -356,12 +356,11 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
         q = q.lte('total_value', valueMax);
       }
 
-      // Fallback legado de retorno se não houver filtro de período ativo
-      if (!periodStatus) {
+      if (returnStatus === 'returned') {
+        q = q.not('return_date', 'is', null);
+      } else if (!periodStatus) {
         if (hideReturned || returnStatus === 'active') {
           q = q.is('return_date', null);
-        } else if (returnStatus === 'returned') {
-          q = q.not('return_date', 'is', null);
         }
       }
 
@@ -393,7 +392,8 @@ export const getAllInvoices = async (req: AuthRequest, res: Response) => {
       total_value: 'total_value',
       billing_status: 'billing_status',
       created_at: 'created_at',
-      invoice_number: 'invoice_number'
+      invoice_number: 'invoice_number',
+      return_date: 'return_date'
     };
 
     const orderColumn = allowedSortFields[sortBy] || 'billing_period_end';
@@ -661,11 +661,27 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
       if (starts.length > 0) billing_period_start = starts[0];
       if (ends.length > 0) billing_period_end = ends[ends.length - 1];
 
-      // Se todos os equipamentos da locação tiverem data de retorno preenchida,
-      // a última (mais posterior) é definida como return_date da locação (rental_invoice)
-      const allHaveReturnDate = rawEquipments.every((e: any) => Boolean(e.return_date && String(e.return_date).trim()));
+      // Agrupar os equipamentos por máquina para encontrar o último período de cada equipamento distinto
+      const machineMap = new Map<string, any>();
+      for (const eq of rawEquipments) {
+        const key = eq.equipment_id || eq.asset_number || eq.equipment_name || eq.id;
+        const existing = machineMap.get(key);
+        if (!existing) {
+          machineMap.set(key, eq);
+        } else {
+          const existingEnd = existing.billing_period_end ? String(existing.billing_period_end).split('T')[0] : '';
+          const currentEnd = eq.billing_period_end ? String(eq.billing_period_end).split('T')[0] : '';
+          if (currentEnd >= existingEnd) {
+            machineMap.set(key, eq);
+          }
+        }
+      }
+
+      // Só preenche a data de retorno da locação como um todo quando a última máquina for retornada
+      const distinctMachines = Array.from(machineMap.values());
+      const allHaveReturnDate = distinctMachines.length > 0 && distinctMachines.every((e: any) => Boolean(e.return_date && String(e.return_date).trim()));
       if (allHaveReturnDate) {
-        const sortedReturnDates = rawEquipments
+        const sortedReturnDates = distinctMachines
           .map((e: any) => String(e.return_date).trim().split('T')[0])
           .sort((a: string, b: string) => a.localeCompare(b));
         return_date = sortedReturnDates[sortedReturnDates.length - 1];
@@ -675,8 +691,8 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
 
       // Representação consolidada do primeiro / múltiplos equipamentos
       equipment_id = rawEquipments[0].equipment_id;
-      equipment_name = rawEquipments.length === 1 
-        ? rawEquipments[0].equipment_name 
+      equipment_name = rawEquipments.length === 1
+        ? rawEquipments[0].equipment_name
         : `${rawEquipments[0].equipment_name || 'Equipamento'} (+${rawEquipments.length - 1} itens)`;
       equipment_type = rawEquipments[0].equipment_type || '';
       asset_number = rawEquipments.map((e: any) => e.asset_number).filter(Boolean).join(', ');
@@ -869,11 +885,27 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
       if (starts.length > 0) updateData.billing_period_start = starts[0];
       if (ends.length > 0) updateData.billing_period_end = ends[ends.length - 1];
 
-      // Se todos os equipamentos da locação tiverem data de retorno preenchida,
-      // a última (mais posterior) é definida como return_date da locação (rental_invoice)
-      const allHaveReturnDate = rawEquipments.length > 0 && rawEquipments.every((e: any) => Boolean(e.return_date && String(e.return_date).trim()));
+      // Agrupar os equipamentos por máquina para encontrar o último período de cada equipamento distinto
+      const machineMap = new Map<string, any>();
+      for (const eq of rawEquipments) {
+        const key = eq.equipment_id || eq.asset_number || eq.equipment_name || eq.id;
+        const existing = machineMap.get(key);
+        if (!existing) {
+          machineMap.set(key, eq);
+        } else {
+          const existingEnd = existing.billing_period_end ? String(existing.billing_period_end).split('T')[0] : '';
+          const currentEnd = eq.billing_period_end ? String(eq.billing_period_end).split('T')[0] : '';
+          if (currentEnd >= existingEnd) {
+            machineMap.set(key, eq);
+          }
+        }
+      }
+
+      // Só preenche a data de retorno da locação como um todo quando a última máquina for retornada
+      const distinctMachines = Array.from(machineMap.values());
+      const allHaveReturnDate = distinctMachines.length > 0 && distinctMachines.every((e: any) => Boolean(e.return_date && String(e.return_date).trim()));
       if (allHaveReturnDate) {
-        const sortedReturnDates = rawEquipments
+        const sortedReturnDates = distinctMachines
           .map((e: any) => String(e.return_date).trim().split('T')[0])
           .sort((a: string, b: string) => a.localeCompare(b));
         updateData.return_date = sortedReturnDates[sortedReturnDates.length - 1];
@@ -882,8 +914,8 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
       }
 
       updateData.equipment_id = rawEquipments[0].equipment_id || existingInvoice?.equipment_id || null;
-      updateData.equipment_name = rawEquipments.length === 1 
-        ? rawEquipments[0].equipment_name 
+      updateData.equipment_name = rawEquipments.length === 1
+        ? rawEquipments[0].equipment_name
         : `${rawEquipments[0].equipment_name || 'Equipamento'} (+${rawEquipments.length - 1} itens)`;
       updateData.equipment_type = rawEquipments[0].equipment_type || existingInvoice?.equipment_type || '';
       updateData.asset_number = rawEquipments.map((e: any) => e.asset_number).filter(Boolean).join(', ') || existingInvoice?.asset_number || '';
@@ -895,7 +927,7 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
         .eq('rental_invoice_id', id);
 
       const itemsToInsert = rawEquipments.map((item: any, index: number) => {
-        const matched = (previousItems || []).find((p: any) => 
+        const matched = (previousItems || []).find((p: any) =>
           (item.id && p.id === item.id) ||
           (item.asset_number && p.asset_number === item.asset_number) ||
           (item.equipment_id && p.equipment_id === item.equipment_id)
@@ -1373,25 +1405,25 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
         equipment_description: equipDescription,
         equipment_model: (rentalEquips && rentalEquips.length > 0)
           ? `[EQUIPMENTS_JSON]:${JSON.stringify(rentalEquips.map((eq: any) => ({
-              tempId: eq.id || Math.random().toString(36).substring(2, 9),
-              id: eq.id,
-              equipment_id: eq.equipment_id || null,
-              asset_number: eq.asset_number || null,
-              equipment_type: eq.equipment_type || null,
-              equipment_name: eq.equipment_name || '',
-              equipment_size: eq.equipment_size || '',
-              billing_period_start: eq.billing_period_start ? String(eq.billing_period_start).split('T')[0] : (rental.billing_period_start ? String(rental.billing_period_start).split('T')[0] : ''),
-              billing_period_end: eq.billing_period_end ? String(eq.billing_period_end).split('T')[0] : (rental.billing_period_end ? String(rental.billing_period_end).split('T')[0] : ''),
-              return_date: eq.return_date ? String(eq.return_date).split('T')[0] : null,
-              cost_rental: Number(eq.cost_rental) || 0,
-              cost_insurance: Number(eq.cost_insurance) || 0,
-              cost_freight: Number(eq.cost_freight) || 0,
-              cost_rcd: Number(eq.cost_rcd) || 0,
-              cost_third_party: Number(eq.cost_third_party) || 0,
-              cost_training: Number(eq.cost_training) || 0,
-              total_value: Number(eq.total_value) || 0,
-              notes: eq.notes || null
-            })))}`
+            tempId: eq.id || Math.random().toString(36).substring(2, 9),
+            id: eq.id,
+            equipment_id: eq.equipment_id || null,
+            asset_number: eq.asset_number || null,
+            equipment_type: eq.equipment_type || null,
+            equipment_name: eq.equipment_name || '',
+            equipment_size: eq.equipment_size || '',
+            billing_period_start: eq.billing_period_start ? String(eq.billing_period_start).split('T')[0] : (rental.billing_period_start ? String(rental.billing_period_start).split('T')[0] : ''),
+            billing_period_end: eq.billing_period_end ? String(eq.billing_period_end).split('T')[0] : (rental.billing_period_end ? String(rental.billing_period_end).split('T')[0] : ''),
+            return_date: eq.return_date ? String(eq.return_date).split('T')[0] : null,
+            cost_rental: Number(eq.cost_rental) || 0,
+            cost_insurance: Number(eq.cost_insurance) || 0,
+            cost_freight: Number(eq.cost_freight) || 0,
+            cost_rcd: Number(eq.cost_rcd) || 0,
+            cost_third_party: Number(eq.cost_third_party) || 0,
+            cost_training: Number(eq.cost_training) || 0,
+            total_value: Number(eq.total_value) || 0,
+            notes: eq.notes || null
+          })))}`
           : equipModel,
         contract_duration_days: durationDays,
         period_start: rental.billing_period_start ? rental.billing_period_start.split('T')[0] : null,
@@ -1626,14 +1658,71 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
     }
 
     // 3. Obter lista de extensões/novos períodos do payload
-    const rawExtensions = Array.isArray(req.body.extensions)
+    let rawExtensions = Array.isArray(req.body.extensions)
       ? req.body.extensions
       : Array.isArray(req.body.equipments)
         ? req.body.equipments
         : [];
 
+    // Buscar equipamentos existentes da locação para controle de status por máquina
+    const { data: currentEquips } = await supabase
+      .from('rental_invoice_equipments')
+      .select('*')
+      .eq('rental_invoice_id', id);
+
+    // Agrupar por máquina para pegar o último período de cada equipamento
+    const machineMap = new Map<string, any>();
+    for (const eq of (currentEquips || [])) {
+      const key = eq.equipment_id || eq.asset_number || eq.equipment_name || eq.id;
+      const existing = machineMap.get(key);
+      if (!existing) {
+        machineMap.set(key, eq);
+      } else {
+        const existingEnd = existing.billing_period_end ? String(existing.billing_period_end).split('T')[0] : '';
+        const currentEnd = eq.billing_period_end ? String(eq.billing_period_end).split('T')[0] : '';
+        if (currentEnd >= existingEnd) {
+          machineMap.set(key, eq);
+        }
+      }
+    }
+
+    if (rawExtensions.length === 0 && (req.body.new_end_date || req.body.billing_period_end)) {
+      const targetEnd = (req.body.new_end_date || req.body.billing_period_end).split('T')[0];
+
+      // Apenas máquinas ativas (que NÃO foram devolvidas em seu último período)
+      const activeEquips = Array.from(machineMap.values()).filter((eq: any) => !eq.return_date || !String(eq.return_date).trim());
+      const baseEquips = activeEquips.length > 0 ? activeEquips : [rental];
+
+      let newStartStr = req.body.billing_period_start;
+      if (!newStartStr) {
+        let newStart = rental.billing_period_end ? new Date(rental.billing_period_end + 'T00:00:00') : new Date();
+        newStart.setDate(newStart.getDate() + 1);
+        newStartStr = newStart.toISOString().split('T')[0];
+      }
+
+      const additionalVal = Number(req.body.additional_value) || Number(rental.cost_rental) || 0;
+      const unitVal = Math.round((additionalVal / Math.max(1, baseEquips.length)) * 100) / 100;
+
+      rawExtensions = baseEquips.map((eq: any) => ({
+        equipment_id: eq.equipment_id || null,
+        equipment_name: eq.equipment_name || null,
+        equipment_type: eq.equipment_type || null,
+        equipment_size: eq.equipment_size || null,
+        asset_number: eq.asset_number || null,
+        billing_period_start: newStartStr,
+        billing_period_end: targetEnd,
+        cost_rental: unitVal,
+        cost_insurance: 0,
+        cost_freight: 0,
+        cost_rcd: 0,
+        cost_third_party: 0,
+        cost_training: 0,
+        notes: req.body.reason || req.body.notes || 'Prorrogação de locação',
+      }));
+    }
+
     if (rawExtensions.length === 0) {
-      return res.status(400).json({ error: 'A prorrogação deve conter pelo menos um período de equipamento a adicionar.' });
+      return res.status(400).json({ error: 'A prorrogação deve conter pelo menos um período de equipamento ativo a adicionar.' });
     }
 
     // 4. Validar e preparar itens para inserção em rental_invoice_equipments
@@ -1644,6 +1733,17 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
       }
       if (ext.billing_period_start > ext.billing_period_end) {
         return res.status(400).json({ error: 'A data de início do período não pode ser posterior à data de término.' });
+      }
+
+      // Validar se este equipamento já teve retorno registrado em seu último período
+      const eqKey = ext.equipment_id || ext.asset_number || ext.equipment_name;
+      if (eqKey && machineMap.has(eqKey)) {
+        const lastEq = machineMap.get(eqKey);
+        if (lastEq.return_date && String(lastEq.return_date).trim()) {
+          return res.status(400).json({
+            error: `O equipamento ${ext.asset_number || ext.equipment_name || ext.equipment_id} já possui data de devolução registrada (${String(lastEq.return_date).split('T')[0]}) e não pode receber prorrogação.`
+          });
+        }
       }
 
       const itemRental = Number(ext.cost_rental) || 0;
@@ -1931,3 +2031,188 @@ export const getFaturasLocacaoByRental = async (req: AuthRequest, res: Response)
     return res.status(500).json({ error: error.message });
   }
 };
+
+export const getAllExtensions = async (req: AuthRequest, res: Response) => {
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 15));
+    const search = ((req.query.search as string) || '').trim().toLowerCase();
+    const status = (req.query.status as string) || '';
+    const exportAll = req.query.all === 'true' || req.query.export === 'true' || req.query.limit === 'all';
+
+    // 1. Buscar todas as contas a receber que representam prorrogações
+    // Ordenadas estritamente da mais recente para a mais antiga (created_at DESC)
+    const { data: bills, error: billsError } = await supabase
+      .from('bills')
+      .select('*')
+      .or('description.ilike.%Prorroga%,description.ilike.%prorroga%')
+      .order('created_at', { ascending: false });
+
+    if (billsError) throw billsError;
+
+    // 2. Buscar locações associadas para enriquecer os dados
+    const rentalIds = Array.from(
+      new Set((bills || []).map((b: any) => b.rental_invoice_id).filter(Boolean))
+    );
+
+    let rentals: any[] = [];
+    if (rentalIds.length > 0) {
+      const { data: rentalsData, error: rentalsError } = await supabase
+        .from('rental_invoices')
+        .select('id, invoice_number, client_name, client_id, cnpj, work_site, billing_period_start, billing_period_end, deal_id')
+        .in('id', rentalIds);
+
+      if (!rentalsError && rentalsData) {
+        rentals = rentalsData;
+      }
+    }
+
+    const rentalMap = new Map((rentals || []).map((r: any) => [r.id, r]));
+
+    // 3. Buscar contratos de CRM relacionados às locações ou deals
+    const dealIds = (rentals || []).map((r: any) => r.deal_id).filter(Boolean);
+    const contractMap = new Map<string, string>();
+
+    if (rentalIds.length > 0 || dealIds.length > 0) {
+      let contractQuery = supabase
+        .from('crm_deal_contracts')
+        .select('id, contract_number, rental_invoice_id, deal_id, status')
+        .neq('status', 'Cancelado')
+        .order('created_at', { ascending: false });
+
+      const { data: contractsData } = await contractQuery;
+      if (contractsData) {
+        for (const c of contractsData) {
+          if (c.rental_invoice_id && !contractMap.has(c.rental_invoice_id)) {
+            contractMap.set(c.rental_invoice_id, c.contract_number);
+          }
+          if (c.deal_id && !contractMap.has(c.deal_id)) {
+            contractMap.set(c.deal_id, c.contract_number);
+          }
+        }
+      }
+    }
+
+    // 4. Mapear cada prorrogação em ordem cronológica reversa (mais recente primeiro)
+    const allMapped = (bills || []).map((bill: any, index: number) => {
+      const rental = bill.rental_invoice_id ? rentalMap.get(bill.rental_invoice_id) : null;
+      const snapshot = bill.bank_raw_snapshot || {};
+      const extItems = Array.isArray(snapshot.extension_items) ? snapshot.extension_items : [];
+
+      // Identificar número da locação e fatura
+      const invNum = rental?.invoice_number || (bill.description.match(/#([0-9/]+)/) ? bill.description.match(/#([0-9/]+)/)[1] : '');
+      const faturaNum = snapshot.fatura_numero || null;
+
+      // Código da prorrogação legível
+      const extensionCode = faturaNum
+        ? `PRR-${faturaNum}`
+        : invNum
+          ? `PRR-${invNum.replace('/', '-')}-${index + 1}`
+          : `PRR-${bill.id.substring(0, 8).toUpperCase()}`;
+
+      // Períodos de data
+      const extStart = snapshot.period_start || (extItems[0]?.billing_period_start) || null;
+      const extEnd = snapshot.period_end || (extItems[extItems.length - 1]?.billing_period_end) || rental?.billing_period_end || null;
+
+      // Data de término anterior: se extStart existe, 1 dia antes; senão o início da locação
+      let previousEnd = '';
+      if (extStart) {
+        const d = new Date(extStart + 'T00:00:00');
+        d.setDate(d.getDate() - 1);
+        previousEnd = d.toISOString().split('T')[0];
+      } else if (rental?.billing_period_start) {
+        previousEnd = rental.billing_period_start;
+      }
+
+      // Dias adicionais calculados
+      let additionalDays = 30;
+      if (extStart && extEnd) {
+        const s = new Date(extStart + 'T00:00:00').getTime();
+        const e = new Date(extEnd + 'T00:00:00').getTime();
+        const diff = Math.round((e - s) / (1000 * 60 * 60 * 24));
+        if (diff >= 0) additionalDays = diff + 1;
+      }
+
+      // Status padronizado para as abas e filtros
+      let extStatus: 'aprovada' | 'em_analise' | 'faturada' = 'aprovada';
+      if (snapshot.fatura_numero || snapshot.fatura_pdf_url || bill.status === 'Recebido' || bill.status === 'Paga') {
+        extStatus = 'faturada';
+      } else if (bill.status === 'Em análise' || bill.status === 'Rascunho') {
+        extStatus = 'em_analise';
+      } else {
+        extStatus = 'aprovada';
+      }
+
+      // Contrato
+      const contractNumber =
+        (rental && contractMap.get(rental.id)) ||
+        (rental?.deal_id && contractMap.get(rental.deal_id)) ||
+        (invNum ? `CTR-${invNum}` : 'CTR-N/D');
+
+      return {
+        id: bill.id,
+        extension_code: extensionCode,
+        rental_id: bill.rental_invoice_id || null,
+        rental_code: invNum ? `#${invNum}` : (bill.rental_invoice_id ? `#${bill.rental_invoice_id.substring(0, 6)}` : 'N/D'),
+        contract_number: contractNumber,
+        client_id: bill.client_id || rental?.client_id || null,
+        client_name: bill.counterparty_name || rental?.client_name || 'Cliente não identificado',
+        previous_end_date: previousEnd,
+        new_end_date: extEnd || '',
+        additional_days: additionalDays,
+        additional_value: Number(bill.gross_value) || Number(snapshot.total_value) || 0,
+        reason: snapshot.fatura_notes || bill.description || 'Prorrogação de locação',
+        status: extStatus,
+        bill_status: bill.status,
+        fatura_pdf_url: snapshot.fatura_pdf_url || null,
+        fatura_numero: snapshot.fatura_numero || null,
+        due_date: bill.due_date,
+        created_at: bill.created_at,
+        equipments: extItems
+      };
+    });
+
+    // Estatísticas globais calculadas sobre a totalidade dos registros
+    const stats = {
+      total: allMapped.length,
+      aprovadas: allMapped.filter(e => e.status === 'aprovada').length,
+      emAnalise: allMapped.filter(e => e.status === 'em_analise').length,
+      faturadas: allMapped.filter(e => e.status === 'faturada').length,
+    };
+
+    // Aplicar filtros de busca e status se fornecidos
+    let filtered = allMapped;
+    if (status && status !== 'all') {
+      filtered = filtered.filter(e => e.status === status);
+    }
+    if (search) {
+      filtered = filtered.filter(e =>
+        (e.extension_code || '').toLowerCase().includes(search) ||
+        (e.rental_code || '').toLowerCase().includes(search) ||
+        (e.contract_number || '').toLowerCase().includes(search) ||
+        (e.client_name || '').toLowerCase().includes(search) ||
+        (e.reason || '').toLowerCase().includes(search)
+      );
+    }
+
+    const totalFiltered = filtered.length;
+    const totalPages = Math.max(1, Math.ceil(totalFiltered / limit));
+    const startIndex = (page - 1) * limit;
+    const paginatedItems = exportAll ? filtered : filtered.slice(startIndex, startIndex + limit);
+
+    return res.json({
+      items: paginatedItems,
+      total: totalFiltered,
+      page: exportAll ? 1 : page,
+      limit: exportAll ? totalFiltered : limit,
+      totalPages: exportAll ? 1 : totalPages,
+      stats,
+    });
+  } catch (error: any) {
+    console.error('[getAllExtensions] Erro ao buscar prorrogações:', error);
+    return res.status(500).json({ error: error.message || 'Erro ao consultar prorrogações.' });
+  }
+};
+

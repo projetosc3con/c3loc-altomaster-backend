@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import {
-  getPositions, getLevels, getEmployees, getEmployeeById, updateEmployee,
+  getPositions, getLevels, createLevel, getLevelById, updateLevel, deleteLevel,
+  getEmployees, getEmployeeById, updateEmployee,
   getEmployeeDocumentationDetails, getRecentActivities, getPositionHistory,
   getDocumentTypes, createDocumentType, updateDocumentType,
   createPosition, getPositionById, updatePosition, changeEmployeePosition,
@@ -31,6 +32,10 @@ router.put('/positions/:id', updatePosition);
 
 // Levels
 router.get('/levels', getLevels);
+router.post('/levels', createLevel);
+router.get('/levels/:id', getLevelById);
+router.put('/levels/:id', updateLevel);
+router.delete('/levels/:id', deleteLevel);
 
 // Employees
 router.get('/employees', getEmployees);

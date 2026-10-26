@@ -41,7 +41,7 @@ export const getPositions = async (req: Request, res: Response) => {
         .filter((sr: any) => sr.position_id === pos.id && sr.hr_job_levels);
 
       const uniqueLevels = [...new Set(posRanges.map((sr: any) => sr.hr_job_levels.name))];
-      
+
       const ranges = posRanges.map((sr: any) => ({
         level: sr.hr_job_levels.name,
         min: sr.salary_min,
@@ -92,6 +92,121 @@ export const getLevels = async (req: Request, res: Response) => {
   }
 };
 
+export const createLevel = async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ error: 'Missing authorization header' });
+    }
+    const token = authHeader.replace('Bearer ', '');
+    const supabase = getSupabaseUserClient(token);
+
+    const { name, description } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'O nome do nível é obrigatório.' });
+    }
+
+    const { data, error } = await supabase
+      .from('hr_job_levels')
+      .insert([{ name: name.trim(), description: description ? description.trim() : null }])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.status(201).json(data);
+  } catch (error: any) {
+    console.error('Error creating HR level:', error);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+};
+
+export const getLevelById = async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ error: 'Missing authorization header' });
+    }
+    const token = authHeader.replace('Bearer ', '');
+    const supabase = getSupabaseUserClient(token);
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('hr_job_levels')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error) throw error;
+
+    res.json(data);
+  } catch (error: any) {
+    console.error('Error fetching HR level by ID:', error);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+};
+
+export const updateLevel = async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ error: 'Missing authorization header' });
+    }
+    const token = authHeader.replace('Bearer ', '');
+    const supabase = getSupabaseUserClient(token);
+    const { id } = req.params;
+
+    const { name, description } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'O nome do nível é obrigatório.' });
+    }
+
+    const { data, error } = await supabase
+      .from('hr_job_levels')
+      .update({
+        name: name.trim(),
+        description: description ? description.trim() : null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json(data);
+  } catch (error: any) {
+    console.error('Error updating HR level:', error);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+};
+
+export const deleteLevel = async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ error: 'Missing authorization header' });
+    }
+    const token = authHeader.replace('Bearer ', '');
+    const supabase = getSupabaseUserClient(token);
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from('hr_job_levels')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+
+    res.json({ success: true, message: 'Nível excluído com sucesso.' });
+  } catch (error: any) {
+    console.error('Error deleting HR level:', error);
+    res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+};
+
 export const getEmployees = async (req: Request, res: Response) => {
   try {
     const authHeader = req.headers.authorization;
@@ -136,13 +251,13 @@ export const getEmployees = async (req: Request, res: Response) => {
     // Map users with their positions
     const formattedEmployees = users.map((user: any) => {
       const currentPos = currentPositions.find((cp: any) => cp.user_id === user.id);
-      
+
       let missingDocsCount = 0;
       if (currentPos?.position_id) {
         const requiredDocs = positionDocs.filter((pd: any) => pd.position_id === currentPos.position_id);
         const userUploadedDocs = employeeDocs.filter((ed: any) => ed.user_id === user.id);
-        
-        missingDocsCount = requiredDocs.filter((req: any) => 
+
+        missingDocsCount = requiredDocs.filter((req: any) =>
           !userUploadedDocs.some((upl: any) => upl.document_type_id === req.document_type_id)
         ).length;
       }
@@ -292,7 +407,7 @@ export const getEmployeeDocumentationDetails = async (req: Request, res: Respons
         .eq('position_id', currentPos.position_id);
 
       if (posDocsError) throw posDocsError;
-      
+
       requiredDocs = posDocs.map((pd: any) => ({
         id: pd.hr_document_types?.id,
         name: pd.hr_document_types?.name,
@@ -396,7 +511,7 @@ export const getPositionHistory = async (req: Request, res: Response) => {
     if (error) throw error;
 
     const historyByUser: Record<string, any[]> = {};
-    
+
     allHistory.forEach((record: any) => {
       const userId = record.user_id;
       if (!historyByUser[userId]) {
@@ -411,7 +526,7 @@ export const getPositionHistory = async (req: Request, res: Response) => {
       const userRecords = historyByUser[userId];
       for (let i = 0; i < userRecords.length; i++) {
         const current = userRecords[i];
-        
+
         let oldPos = '-';
         if (i > 0) {
           const prev = userRecords[i - 1];
@@ -738,7 +853,7 @@ export const changeEmployeePosition = async (req: Request, res: Response) => {
     }
     const token = authHeader.replace('Bearer ', '');
     const supabase = getSupabaseUserClient(token);
-    
+
     const { data: { user: authUser } } = await supabase.auth.getUser();
 
     const { user_id, position_id, level_id, salary, change_reason } = req.body;
@@ -1448,7 +1563,7 @@ export const updateTrainingCatalog = async (req: Request, res: Response) => {
     if (!authHeader) return res.status(401).json({ error: 'Missing authorization header' });
     const token = authHeader.replace('Bearer ', '');
     const supabase = getSupabaseUserClient(token);
-    
+
     const { id } = req.params;
 
     const { data, error } = await supabase
@@ -1483,7 +1598,7 @@ export const getEmployeeTrainings = async (req: Request, res: Response) => {
       .order('completion_date', { ascending: false });
 
     if (error) throw error;
-    
+
     // Format response to match frontend expectations
     const formattedData = data.map((t: any) => ({
       id: t.id,
@@ -1509,7 +1624,7 @@ export const createEmployeeTraining = async (req: Request, res: Response) => {
     const token = authHeader.replace('Bearer ', '');
     const { data: userObj, error: userError } = await supabaseAdmin.auth.getUser(token);
     if (userError || !userObj.user) return res.status(401).json({ error: 'Invalid token' });
-    
+
     const registered_by = userObj.user.id;
 
     const supabase = getSupabaseUserClient(token);
@@ -1540,10 +1655,10 @@ export const getTrainingMetrics = async (req: Request, res: Response) => {
       .select('workload_hours, cost');
 
     if (error) throw error;
-    
+
     let totalHours = 0;
     let totalCost = 0;
-    
+
     if (data) {
       for (const item of data) {
         totalHours += Number(item.workload_hours) || 0;
@@ -1607,7 +1722,7 @@ export const updateIntegrationType = async (req: Request, res: Response) => {
     if (!authHeader) return res.status(401).json({ error: 'Missing authorization header' });
     const token = authHeader.replace('Bearer ', '');
     const supabase = getSupabaseUserClient(token);
-    
+
     const { id } = req.params;
 
     const { data, error } = await supabase
@@ -1668,7 +1783,7 @@ export const createEmployeeIntegration = async (req: Request, res: Response) => 
     const token = authHeader.replace('Bearer ', '');
     const { data: userObj, error: userError } = await supabaseAdmin.auth.getUser(token);
     if (userError || !userObj.user) return res.status(401).json({ error: 'Invalid token' });
-    
+
     const registered_by = userObj.user.id;
     const supabase = getSupabaseUserClient(token);
 
@@ -1698,11 +1813,11 @@ export const getIntegrationMetrics = async (req: Request, res: Response) => {
       .select('status');
 
     if (error) throw error;
-    
+
     let valid = 0;
     let expired = 0;
     let expiring = 0;
-    
+
     if (data) {
       for (const item of data) {
         if (item.status === 'Válida') valid++;

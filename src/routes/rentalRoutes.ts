@@ -5,6 +5,8 @@ import { authorize } from '../middleware/auth';
 const router = Router();
 
 router.get('/', rentalController.getAllInvoices);
+router.get('/extensions', rentalController.getAllExtensions);
+router.get('/prorrogacoes', rentalController.getAllExtensions);
 router.get('/:id/contract-deal', rentalController.getOrCreateRentalContractDeal);
 router.get('/:id/contracts', rentalController.getRentalContracts);
 router.post('/:id/service-orders', rentalController.createRentalServiceOrder);
