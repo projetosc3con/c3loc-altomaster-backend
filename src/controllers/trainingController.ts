@@ -73,7 +73,7 @@ export const getTrainings = async (req: AuthRequest, res: Response) => {
 
         return {
           ...t,
-          can_delete: t.created_by === user.id,
+          can_delete: profile?.access_level === 'Administrador' || t.created_by === user.id,
           my_assignment: myAssignment
             ? {
                 ...myAssignment,
@@ -149,7 +149,7 @@ export const getTrainings = async (req: AuthRequest, res: Response) => {
             ...a,
             derived_status: derivedStatus,
           },
-          can_delete: isManager && t.created_by === user.id,
+          can_delete: profile?.access_level === 'Administrador' || (isManager && t.created_by === user.id),
         };
       });
 
@@ -250,7 +250,7 @@ export const getTrainingById = async (req: AuthRequest, res: Response) => {
 
     const responseData = {
       ...training,
-      can_delete: isManager && training.created_by === user.id,
+      can_delete: req.profile?.access_level === 'Administrador' || (isManager && training.created_by === user.id),
       can_manage: isManager,
       my_assignment: myAssignment
         ? {
@@ -466,12 +466,14 @@ export const updateTraining = async (req: AuthRequest, res: Response) => {
 /**
  * DELETE /api/trainings/:id
  * Exclui um treinamento.
- * REGRA DO NEGÓCIO: "Somente usuários dos access_level: 'Administrador' e 'Diretoria'.
- * Devem poder cadastrar, atribuir treinamentos a usuários e excluir treinamentos cadastrados por si."
+ * REGRA DO NEGÓCIO:
+ * - 'Administrador' pode excluir qualquer treinamento.
+ * - 'Diretoria' pode excluir apenas treinamentos cadastrados por si.
  */
 export const deleteTraining = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   const user = req.user;
+  const isAdmin = req.profile?.access_level === 'Administrador';
   const isManager = isTrainingManager(req.profile?.access_level);
 
   if (!isManager) {
@@ -489,8 +491,8 @@ export const deleteTraining = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Treinamento não encontrado' });
     }
 
-    // Regra estrita: Somente pode excluir treinamentos cadastrados por si próprio
-    if (training.created_by !== user.id) {
+    // Regra: Diretoria somente pode excluir treinamentos cadastrados por si próprio; Administrador pode excluir qualquer um
+    if (!isAdmin && training.created_by !== user.id) {
       return res.status(403).json({
         error: 'Você só pode excluir treinamentos cadastrados por você mesmo.',
       });

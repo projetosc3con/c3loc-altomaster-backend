@@ -263,7 +263,7 @@ export const exportRentalsToXlsx = async (req: AuthRequest, res: Response) => {
         periodInfoByRentalId[r.id] = getPeriodInfoForStatusOrWindow(
           equips,
           Number(r.total_value) || 0,
-          periodStatus,
+          (dateFrom || dateTo) ? '' : periodStatus,
           targetWindow,
           { start: r.billing_period_start, end: r.billing_period_end, return_date: r.return_date },
           todayStr
