@@ -4,6 +4,7 @@ import { getSupabaseUserClient } from '../config/supabase';
 import { AuthRequest } from '../middleware/auth';
 import { BillStatementItem, CreateBillPayload } from '../types/bill';
 import { normalizeBill, normalizePendingPayment, normalizeBankSlipUrls } from '../utils/billNormalizers';
+import { notifyAdminsAndDirectors } from '../services/notificationService';
 
 // TODO(SECURITY): a tabela `bills` foi criada sem RLS/policies (confirmado
 // via introspecção do schema em 02/08/2026). Esta rota já usa o client
@@ -494,6 +495,19 @@ export const createBill = async (req: AuthRequest, res: Response) => {
 
       if (insertError) throw insertError;
 
+      const actorName = req.profile?.full_name || req.user?.email || 'Usu?rio';
+      const billTitle = type === 'payable' ? 'Nova Conta a Pagar Cadastrada' : 'Nova Conta a Receber Cadastrada';
+      const billTypeLabel = type === 'payable' ? 'conta a pagar' : 'conta a receber';
+      const formattedVal = Number(gross_value || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+      const cpLabel = counterparty_name?.trim() ? ` (${counterparty_name.trim()})` : '';
+      await notifyAdminsAndDirectors({
+        titulo: billTitle,
+        descricao: `${actorName} cadastrou uma ${billTypeLabel} parcelada em ${totalCount}x: "${baseDesc}"${cpLabel} no valor total de ${formattedVal}.`,
+        tabelaOrigem: 'bills',
+        actorUid: req.user?.id || null,
+        registroId: insertedBills[0]?.id || null,
+      });
+
       return res.status(201).json(normalizeBill(insertedBills[0]));
     }
 
@@ -528,6 +542,19 @@ export const createBill = async (req: AuthRequest, res: Response) => {
       .select('*, invoice:rental_invoices(invoice_number, client_name), client:clients(company_name, cnpj), payment:payments(invoice_url, bank_slip_url), creator:users_profiles!created_by(id, full_name, photo_url)')
       .single();
     if (error) throw error;
+
+    const actorName = req.profile?.full_name || req.user?.email || 'Usu?rio';
+    const billTitle = type === 'payable' ? 'Nova Conta a Pagar Cadastrada' : 'Nova Conta a Receber Cadastrada';
+    const billTypeLabel = type === 'payable' ? 'conta a pagar' : 'conta a receber';
+    const formattedVal = Number(gross_value || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+    const descLabel = description?.trim() || counterparty_name?.trim() || 'Lan?amento Manual';
+    await notifyAdminsAndDirectors({
+      titulo: billTitle,
+      descricao: `${actorName} cadastrou uma ${billTypeLabel}: "${descLabel}" no valor de ${formattedVal}.`,
+      tabelaOrigem: 'bills',
+      actorUid: req.user?.id || null,
+      registroId: data?.id || null,
+    });
 
     return res.status(201).json(normalizeBill(data));
   } catch (error: any) {

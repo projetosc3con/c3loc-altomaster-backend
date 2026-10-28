@@ -1,11 +1,12 @@
 import { Response } from 'express';
-import { getSupabaseUserClient } from '../config/supabase';
+import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
 import { AuthRequest } from '../middleware/auth';
 import { bbExtratoService } from '../services/bbExtratoService';
 import { normalizeBill } from '../utils/billNormalizers';
 import {
   BankStatementLine,
   BankStatementMatchResult,
+  BankStatementSnapshot,
   ReconcileBankStatementResponse,
 } from '../types/bill';
 
@@ -223,6 +224,131 @@ export const linkStatementLineToBill = async (req: AuthRequest, res: Response) =
     return res.json(updatedBill);
   } catch (error: any) {
     console.error('[linkStatementLineToBill] Erro:', error.message);
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+// Busca o extrato bancário do período no Banco do Brasil e salva um snapshot
+// na tabela `bank_statement_snapshots` SEM realizar a conciliação nos bills.
+export const saveBankStatementSnapshot = async (req: AuthRequest, res: Response) => {
+  try {
+    const rawFrom = req.query.from ?? req.body?.from;
+    const rawTo = req.query.to ?? req.body?.to;
+    const period = resolvePeriod(rawFrom, rawTo);
+
+    const { simulated, lines } = await bbExtratoService.fetchExtrato(period);
+
+    const totalCredits = Number(
+      lines
+        .filter((l) => l.dc_indicator === 'C')
+        .reduce((acc, l) => acc + (Number(l.value) || 0), 0)
+        .toFixed(2)
+    );
+
+    const totalDebits = Number(
+      lines
+        .filter((l) => l.dc_indicator === 'D')
+        .reduce((acc, l) => acc + (Number(l.value) || 0), 0)
+        .toFixed(2)
+    );
+
+    const { data, error } = await supabaseAdmin
+      .from('bank_statement_snapshots')
+      .insert({
+        period_from: period.from,
+        period_to: period.to,
+        simulated,
+        total_lines: lines.length,
+        total_credits: totalCredits,
+        total_debits: totalDebits,
+        lines,
+        created_by: req.user?.id || null,
+      })
+      .select(
+        '*, created_by_user:users_profiles!bank_statement_snapshots_created_by_fkey(id, full_name, email, photo_url)'
+      )
+      .single();
+
+    if (error) throw error;
+
+    return res.status(201).json(data as BankStatementSnapshot);
+  } catch (error: any) {
+    console.error('[saveBankStatementSnapshot] Erro:', error.message);
+    const status = error.status || 500;
+    const msg = String(error.message || '');
+    if (
+      status === 503 ||
+      status === 403 ||
+      msg.includes('503') ||
+      msg.includes('403') ||
+      msg.includes('serviço subjacente') ||
+      msg.includes('chave de aplicacao') ||
+      msg.includes('AppKey')
+    ) {
+      return res.status(503).json({ error: 'Serviço inacessível no momento. Tente novamente mais tarde.' });
+    }
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+// Lista os snapshots de extratos bancários já armazenados no banco
+export const listBankStatementSnapshots = async (req: AuthRequest, res: Response) => {
+  try {
+    let query = supabaseAdmin
+      .from('bank_statement_snapshots')
+      .select(
+        '*, created_by_user:users_profiles!bank_statement_snapshots_created_by_fkey(id, full_name, email, photo_url)'
+      )
+      .order('created_at', { ascending: false });
+
+    if (typeof req.query.from === 'string' && req.query.from) {
+      query = query.gte('period_to', req.query.from);
+    }
+    if (typeof req.query.to === 'string' && req.query.to) {
+      query = query.lte('period_from', req.query.to);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    return res.json((data || []) as BankStatementSnapshot[]);
+  } catch (error: any) {
+    console.error('[listBankStatementSnapshots] Erro:', error.message);
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+export const getBankStatementSnapshotById = async (req: AuthRequest, res: Response) => {
+  try {
+    const id = req.params.id as string;
+    const { data, error } = await supabaseAdmin
+      .from('bank_statement_snapshots')
+      .select(
+        '*, created_by_user:users_profiles!bank_statement_snapshots_created_by_fkey(id, full_name, email, photo_url)'
+      )
+      .eq('id', id)
+      .single();
+
+    if (error) throw error;
+    return res.json(data as BankStatementSnapshot);
+  } catch (error: any) {
+    console.error('[getBankStatementSnapshotById] Erro:', error.message);
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+export const deleteBankStatementSnapshot = async (req: AuthRequest, res: Response) => {
+  try {
+    const id = req.params.id as string;
+    const { error } = await supabaseAdmin
+      .from('bank_statement_snapshots')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+    return res.json({ message: 'Snapshot de extrato excluído com sucesso.' });
+  } catch (error: any) {
+    console.error('[deleteBankStatementSnapshot] Erro:', error.message);
     return res.status(500).json({ error: error.message });
   }
 };

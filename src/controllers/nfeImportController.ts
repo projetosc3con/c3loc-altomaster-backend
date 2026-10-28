@@ -5,6 +5,7 @@ import { parseNfeXml, ParsedNfeData, normalizeUnit } from '../services/nfeParser
 import { parseDanfePdf } from '../services/danfeParserService';
 import { recordStockMovement } from '../services/stockMovementService';
 import { getCategoryPrefix } from './partController';
+import { notifyAdminsAndDirectors } from '../services/notificationService';
 
 export const parseXml = async (req: AuthRequest, res: Response) => {
   try {
@@ -343,6 +344,20 @@ export const processImport = async (req: AuthRequest, res: Response) => {
           throw new Error(`Erro ao gerar fatura/conta a pagar da parcela ${instNumber}: ${billErr.message}`);
         }
         billsCreated++;
+      }
+
+      if (billsCreated > 0) {
+        const actorName = req.profile?.full_name || req.user?.email || 'Usu?rio';
+        const billTitle = billType === 'payable' ? 'Nova Conta a Pagar Cadastrada' : 'Nova Conta a Receber Cadastrada';
+        const billTypeLabel = billType === 'payable' ? 'conta a pagar' : 'conta a receber';
+        const totalInvVal = Number(parsed_data.totals?.total_invoice || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+        await notifyAdminsAndDirectors({
+          titulo: billTitle,
+          descricao: `${actorName} cadastrou ${ billTypeLabel } (${billsCreated} parcela(s)) via importa??o da ${docLabel} n? ${invoiceNumber} (${counterpartyName}) no valor total de ${totalInvVal}.`,
+          tabelaOrigem: 'bills',
+          actorUid: req.user?.id || null,
+          registroId: accessKey,
+        });
       }
     }
 

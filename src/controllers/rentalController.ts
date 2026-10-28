@@ -3,6 +3,7 @@ import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
 import { deleteDealsAndSubDependencies } from './crmController';
 import { recordHourMeterUpdate } from '../services/hourMeterService';
+import { notifyAdminsAndDirectors } from '../services/notificationService';
 
 const updateEquipmentItemStatus = async (
   supabase: any,
@@ -870,6 +871,19 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
           });
       }
     }
+
+    // Gerar notificação para Administradores e Diretoria (exceto o usuário que criou)
+    const actorName = req.profile?.full_name || req.user?.email || 'Usuário';
+    const invLabel = createdInvoice.invoice_number ? `#${createdInvoice.invoice_number}` : '';
+    const clientLabel = createdInvoice.client_name || invoiceData.client_name || 'Cliente';
+    const formattedVal = Number(total_value || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+    await notifyAdminsAndDirectors({
+      titulo: 'Nova Locação Cadastrada',
+      descricao: `${actorName} cadastrou a locação ${invLabel} para "${clientLabel}" no valor de ${formattedVal}.`.replace(/\s+/g, ' '),
+      tabelaOrigem: 'rental_invoices',
+      actorUid: req.user?.id || null,
+      registroId: createdInvoice.id,
+    });
 
     return res.status(201).json(createdInvoice);
   } catch (error: any) {
@@ -1964,6 +1978,19 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
           .eq('id', formRecord.id);
       }
     }
+
+    // 12. Gerar notificação de prorrogação para Administradores e Diretoria (exceto o autor)
+    const actorName = req.profile?.full_name || req.user?.email || 'Usuário';
+    const invLabel = updatedInvoice.invoice_number ? `#${updatedInvoice.invoice_number}` : '';
+    const clientLabel = updatedInvoice.client_name || 'Cliente';
+    const formattedExtVal = Number(extensionTotal || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+    await notifyAdminsAndDirectors({
+      titulo: 'Prorrogação de Locação Lançada',
+      descricao: `${actorName} lançou uma prorrogação na locação ${invLabel} (${clientLabel}) no valor de ${formattedExtVal}.`.replace(/\s+/g, ' '),
+      tabelaOrigem: 'rental_invoices',
+      actorUid: req.user?.id || null,
+      registroId: updatedInvoice.id,
+    });
 
     return res.json({
       success: true,

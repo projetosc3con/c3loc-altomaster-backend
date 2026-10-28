@@ -14,7 +14,8 @@ import {
   getRentalInvoiceEquipments,
   getServiceOrderParts,
   getServiceOrders,
-  getStockMovements
+  getStockMovements,
+  getBankStatementSnapshots,
 } from '../controllers/powerBiController';
 
 const router = Router();
@@ -56,5 +57,9 @@ router.get('/service_orders', getServiceOrders);
 router.get('/os', getServiceOrders); // Alias amigável
 
 router.get('/stock_movements', getStockMovements);
+
+router.get('/bank_statement_snapshots', getBankStatementSnapshots);
+router.get('/bank_statements', getBankStatementSnapshots); // Alias amigável
+router.get('/extratos', getBankStatementSnapshots); // Alias amigável
 
 export default router;

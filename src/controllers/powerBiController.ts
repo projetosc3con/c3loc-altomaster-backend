@@ -18,7 +18,8 @@ export const getPowerBiOverview = async (req: Request, res: Response) => {
       rental_invoice_equipments: '/api/powerbi/rental_invoice_equipments',
       service_order_parts: '/api/powerbi/service_order_parts',
       service_orders: '/api/powerbi/service_orders',
-      stock_movements: '/api/powerbi/stock_movements'
+      stock_movements: '/api/powerbi/stock_movements',
+      bank_statement_snapshots: '/api/powerbi/bank_statement_snapshots',
     }
   });
 };
@@ -194,6 +195,20 @@ export const getStockMovements = async (req: Request, res: Response) => {
   try {
     const { data, error } = await supabaseAdmin
       .from('stock_movements')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    return res.json(data || []);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+export const getBankStatementSnapshots = async (req: Request, res: Response) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('bank_statement_snapshots')
       .select('*')
       .order('created_at', { ascending: false });
 

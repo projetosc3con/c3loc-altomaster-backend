@@ -24,6 +24,7 @@ import billRoutes from './routes/billRoutes';
 import powerBiRoutes from './routes/powerBiRoutes';
 import cronRoutes from './routes/cronRoutes';
 import trainingRoutes from './routes/trainingRoutes';
+import notificationRoutes from './routes/notificationRoutes';
 
 dotenv.config();
 
@@ -74,6 +75,7 @@ app.use('/api/fiscal', authenticate, fiscalRoutes);
 // TODO(SECURITY): ver aviso em billController.ts — `bills` ainda não tem RLS/policies.
 app.use('/api/bills', authenticate, billRoutes);
 app.use('/api/trainings', authenticate, trainingRoutes);
+app.use('/api/notifications', authenticate, notificationRoutes);
 
 if (!process.env.VERCEL) {
   app.listen(PORT, () => {

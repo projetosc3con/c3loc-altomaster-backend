@@ -1,6 +1,13 @@
 import { Router } from 'express';
 import { listBills, createBill, updateBill, deleteBill, splitBillIntoInstallments } from '../controllers/billController';
-import { reconcileBankStatement, linkStatementLineToBill } from '../controllers/bankReconciliationController';
+import {
+  reconcileBankStatement,
+  linkStatementLineToBill,
+  saveBankStatementSnapshot,
+  listBankStatementSnapshots,
+  getBankStatementSnapshotById,
+  deleteBankStatementSnapshot,
+} from '../controllers/bankReconciliationController';
 import { authorize } from '../middleware/auth';
 
 const router = Router();
@@ -11,6 +18,12 @@ const router = Router();
 const fullAccess = authorize(['Administrador', 'Diretoria', 'Gerente', 'Financeiro']);
 const managerOrAdmin = authorize(['Administrador', 'Gerente', 'Diretoria']);
 const adminOnly = authorize(['Administrador']);
+
+// Snapshots de extrato bancário armazenados para consulta e BI
+router.get('/statement-snapshots', fullAccess, listBankStatementSnapshots);
+router.post('/statement-snapshots', fullAccess, saveBankStatementSnapshot);
+router.get('/statement-snapshots/:id', fullAccess, getBankStatementSnapshotById);
+router.delete('/statement-snapshots/:id', managerOrAdmin, deleteBankStatementSnapshot);
 
 // Conciliação bancária — dado financeiro cross-cliente, mesmo nível de acesso
 // das demais rotas sensíveis (ver TODO(SECURITY) em billController.ts sobre
