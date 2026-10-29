@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
+import { notifyUsers } from '../services/notificationService';
 import {
   CreateTrainingDTO,
   AssignTrainingDTO,
@@ -520,7 +521,7 @@ export const deleteTraining = async (req: AuthRequest, res: Response) => {
  * - Usuários do tipo 'Diretoria' não devem poder gerir os treinamentos atribuídos a si mesmos.
  */
 export const assignTraining = async (req: AuthRequest, res: Response) => {
-  const { id: trainingId } = req.params;
+  const trainingId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const user = req.user;
   const profile = req.profile;
   const isManager = isTrainingManager(profile?.access_level);
@@ -545,7 +546,7 @@ export const assignTraining = async (req: AuthRequest, res: Response) => {
   try {
     const { data: training } = await supabaseAdmin
       .from('trainings')
-      .select('id, default_due_days')
+      .select('id, title, default_due_days')
       .eq('id', trainingId)
       .single();
 
@@ -577,6 +578,35 @@ export const assignTraining = async (req: AuthRequest, res: Response) => {
       `);
 
     if (error) throw error;
+
+    // Notificar os colaboradores atribuídos com a data limite (se informada)
+    try {
+      let dueDateFormatted = '';
+      if (calculatedDueDate) {
+        const parts = calculatedDueDate.split('-');
+        if (parts.length === 3) {
+          dueDateFormatted = `${parts[2]}/${parts[1]}/${parts[0]}`;
+        } else {
+          dueDateFormatted = calculatedDueDate;
+        }
+      }
+
+      const trainingTitle = training.title ? `"${training.title}"` : 'um novo treinamento';
+      const descricao = dueDateFormatted
+        ? `Você foi vinculado ao treinamento ${trainingTitle} com data limite até ${dueDateFormatted}.`
+        : `Você foi vinculado ao treinamento ${trainingTitle}.`;
+
+      await notifyUsers({
+        titulo: 'Novo Treinamento Atribuído',
+        descricao,
+        tabelaOrigem: 'training_assignments',
+        notificar: user_ids,
+        actorUid: user.id,
+        registroId: trainingId,
+      });
+    } catch (notifErr: any) {
+      console.error('[assignTraining] Erro ao enviar notificação aos usuários:', notifErr?.message || notifErr);
+    }
 
     return res.status(200).json(data);
   } catch (error: any) {

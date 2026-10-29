@@ -1,5 +1,57 @@
 import { supabaseAdmin } from '../config/supabase';
 
+export interface CreateUserNotificationParams {
+  titulo: string;
+  descricao: string;
+  tabelaOrigem: string;
+  notificar: string | string[];
+  actorUid?: string | null;
+  registroId?: string | number | null;
+}
+
+/**
+ * Cria registros de notificação na tabela `public.notifications` para usuários específicos (`notificar`).
+ */
+export const notifyUsers = async ({
+  titulo,
+  descricao,
+  tabelaOrigem,
+  notificar,
+  actorUid,
+  registroId,
+}: CreateUserNotificationParams): Promise<void> => {
+  try {
+    const userIds = Array.isArray(notificar) ? notificar : [notificar];
+    const uniqueUserIds = Array.from(new Set(userIds.filter(Boolean)));
+
+    if (uniqueUserIds.length === 0) {
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const rows = uniqueUserIds.map((targetUserId) => ({
+      titulo,
+      descricao,
+      tabelaOrigem,
+      uid: actorUid || null,
+      timestamp: nowIso,
+      notificar: targetUserId,
+      lido: false,
+      registroId: registroId != null ? String(registroId) : null,
+    }));
+
+    const { error: insertError } = await supabaseAdmin
+      .from('notifications')
+      .insert(rows);
+
+    if (insertError) {
+      console.error('[notificationService] Erro ao inserir notificações para usuários:', insertError.message);
+    }
+  } catch (err: any) {
+    console.error('[notificationService] Erro inesperado ao gerar notificações para usuários:', err?.message || err);
+  }
+};
+
 export interface CreateSystemNotificationParams {
   titulo: string;
   descricao: string;

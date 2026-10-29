@@ -3,6 +3,7 @@ import axios from 'axios';
 import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
 import { emailService } from '../services/emailService';
+import { notifyAdminsAndDirectors } from '../services/notificationService';
 // Pipelines
 export const getPipelines = async (req: AuthRequest, res: Response) => {
   try {
@@ -1620,6 +1621,24 @@ export const uploadSignedContract = async (req: AuthRequest, res: Response) => {
       });
     } catch (emailErr) {
       console.error('[crmController] Erro ao enviar notificação interna de contrato assinado:', emailErr);
+    }
+
+    // Notificação no sistema ao anexar crm_deal_contracts assinado
+    // Gatilhos: status === 'Assinado', signed_file_url preenchida e signed_uploaded_at preenchido
+    if (data && data.status === 'Assinado' && data.signed_file_url && data.signed_uploaded_at) {
+      const actorName = req.profile?.full_name || req.user?.email || 'Um usuário';
+      const snapshot = data.snapshot || {};
+      const clientLabel = snapshot.locatario?.company_name || 'Cliente';
+      const contractNumLabel = data.contract_number ? `#${data.contract_number}` : '';
+      const equipLabel = snapshot.equipment?.description ? ` (${snapshot.equipment.description})` : '';
+
+      await notifyAdminsAndDirectors({
+        titulo: 'Contrato Assinado Anexado',
+        descricao: `${actorName} anexou o contrato assinado ${contractNumLabel} do cliente "${clientLabel}"${equipLabel}.`.replace(/\s+/g, ' '),
+        tabelaOrigem: 'crm_deal_contracts',
+        actorUid: req.user?.id || null,
+        registroId: String(dealId || data.deal_id || data.id),
+      });
     }
 
     res.json(data);

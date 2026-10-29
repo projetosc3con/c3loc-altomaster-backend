@@ -140,6 +140,8 @@ export interface BankStatementSnapshot {
   total_lines: number;
   total_credits: number;
   total_debits: number;
+  period_balance?: number;
+  saldo_anterior?: number;
   lines: BankStatementLine[];
   created_by: string | null;
   created_by_user?: {

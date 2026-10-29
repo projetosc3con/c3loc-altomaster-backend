@@ -70,6 +70,9 @@ function assertPeriodWithinLimit(from: string, to: string) {
 // ser descartadas antes de conciliar.
 const TRANSACTION_STAGE_CODES = new Set(['1', '2', '3']);
 
+// Para gravação de snapshots de extrato, incluímos também o código 'SA' (Saldo Anterior / Atual)
+const SNAPSHOT_STAGE_CODES = new Set(['1', '2', '3', 'SA']);
+
 function dcToType(dc: 'C' | 'D'): BillType {
   return dc === 'C' ? 'receivable' : 'payable';
 }
@@ -106,8 +109,8 @@ function extractCounterpartyDetails(
 
 function normalizeBbLine(raw: BbExtratoLancamentoRaw): BankStatementLine | null {
   const dc = raw.indicadorSinalLancamento;
-  if (dc === '*') return null; // valor bloqueado, sem D/C definido — não conciliável
-  if (raw.valorLancamento === 0) return null; // saldo anterior ou marcador de saldo do dia com valor 0
+  if (dc === '*' && raw.indicadorTipoLancamento !== 'SA') return null; // valor bloqueado, sem D/C definido — não conciliável
+  if (raw.valorLancamento === 0 && raw.indicadorTipoLancamento !== 'SA') return null; // saldo anterior ou marcador de saldo do dia com valor 0
 
   const { counterpartyName, enrichedDescription } = extractCounterpartyDetails(
     raw.textoDescricaoSubHistorico,
@@ -118,12 +121,14 @@ function normalizeBbLine(raw: BbExtratoLancamentoRaw): BankStatementLine | null 
     ? String(raw.numeroCadastroPessoaFisicaCadastroNacPessoasJuridicasContrapartida).replace(/\D/g, '') || null
     : null;
 
+  const effectiveDc: 'C' | 'D' = dc === 'D' ? 'D' : 'C';
+
   return {
     bank_date: ddmmaaaaToIso(raw.dataLancamento),
     value: Math.abs(raw.valorLancamento),
-    dc_indicator: dc,
-    type: dcToType(dc),
-    description: enrichedDescription,
+    dc_indicator: effectiveDc,
+    type: dcToType(effectiveDc),
+    description: enrichedDescription || (raw.indicadorTipoLancamento === 'SA' ? 'SALDO ANTERIOR' : null),
     counterparty_name: counterpartyName,
     counterparty_document: cleanDoc,
     complementary_info: raw.textoInformacaoComplementar ? String(raw.textoInformacaoComplementar).trim() : null,
@@ -166,44 +171,61 @@ interface ExtratoParams {
   to: string; // YYYY-MM-DD
 }
 
-interface FetchExtratoResult {
+export interface FetchExtratoResult {
   simulated: boolean;
   lines: BankStatementLine[];
 }
 
-// Fixture pequeno e claramente fake, usado enquanto ENABLE_BB_EXTRATO_FETCH
-// não estiver 'true' — permite demonstrar o fluxo completo de conciliação
-// (match/vincular/cadastrar) sem credenciais reais do BB. Os valores/datas
-// não têm relação com dados reais; ajuste-os se quiser forçar um match
-// contra bills de teste específicos.
-function buildSimulatedLines(params: ExtratoParams): BankStatementLine[] {
+export interface FetchExtratoSnapshotResult {
+  simulated: boolean;
+  lines: BankStatementLine[];
+  periodBalance: number;
+  saLancamento: BbExtratoLancamentoRaw | null;
+}
+
+// Fixture usado enquanto ENABLE_BB_EXTRATO_FETCH não estiver 'true' —
+// permite demonstrar o fluxo completo de conciliação e de snapshots com
+// saldo do período sem credenciais reais do BB.
+function buildSimulatedRawLines(params: ExtratoParams): BbExtratoLancamentoRaw[] {
+  const fromNum = parseInt(isoToDdmmaaaa(params.from), 10);
   const from = new Date(params.from);
   const to = new Date(params.to);
   const mid = new Date(from.getTime() + (to.getTime() - from.getTime()) / 2);
-  const midIso = mid.toISOString().slice(0, 10);
+  const midNum = parseInt(isoToDdmmaaaa(mid.toISOString().slice(0, 10)), 10);
 
   return [
     {
-      bank_date: params.from,
-      value: 1250.0,
-      dc_indicator: 'C',
-      type: 'receivable',
-      description: 'PIX RECEBIDO (simulado)',
-      document_number: null,
-      unique_transaction_id: null,
-      raw: { simulated: true, data: params.from, valorLancamento: 1250.0, indicadorSinalLancamento: 'C' },
+      indicadorTipoLancamento: 'SA',
+      dataLancamento: fromNum,
+      valorLancamento: 15420.5,
+      indicadorSinalLancamento: 'C',
+      textoDescricaoSubHistorico: 'SALDO ANTERIOR',
+      textoInformacaoComplementar: 'Saldo Inicial do Período (simulado)',
     },
     {
-      bank_date: midIso,
-      value: 480.5,
-      dc_indicator: 'D',
-      type: 'payable',
-      description: 'PAGAMENTO FORNECEDOR (simulado)',
-      document_number: null,
-      unique_transaction_id: null,
-      raw: { simulated: true, data: midIso, valorLancamento: 480.5, indicadorSinalLancamento: 'D' },
+      indicadorTipoLancamento: '1',
+      dataLancamento: fromNum,
+      valorLancamento: 1250.0,
+      indicadorSinalLancamento: 'C',
+      textoDescricaoSubHistorico: 'PIX RECEBIDO',
+      textoInformacaoComplementar: 'PIX RECEBIDO (simulado)',
+    },
+    {
+      indicadorTipoLancamento: '1',
+      dataLancamento: midNum,
+      valorLancamento: 480.5,
+      indicadorSinalLancamento: 'D',
+      textoDescricaoSubHistorico: 'PAGAMENTO FORNECEDOR',
+      textoInformacaoComplementar: 'PAGAMENTO FORNECEDOR (simulado)',
     },
   ];
+}
+
+function buildSimulatedLines(params: ExtratoParams): BankStatementLine[] {
+  return buildSimulatedRawLines(params)
+    .filter((raw) => TRANSACTION_STAGE_CODES.has(raw.indicadorTipoLancamento))
+    .map(normalizeBbLine)
+    .filter((line): line is BankStatementLine => line !== null);
 }
 
 const MAX_RETRIES = 2;
@@ -282,15 +304,11 @@ class BbExtratoService {
     }
   }
 
-  // Busca o extrato de conta corrente no período informado, paginando até
-  // esgotar (numeroPaginaProximo === 0). Enquanto ENABLE_BB_EXTRATO_FETCH
-  // !== 'true', não chama o BB — devolve um fixture simulado (ver
-  // buildSimulatedLines), pra permitir testar o fluxo completo de
-  // conciliação sem depender de certificado/credenciais reais do BB.
-  async fetchExtrato(params: ExtratoParams): Promise<FetchExtratoResult> {
+  // Busca todas as páginas brutas de extrato no BB (ou gera fixture simulado)
+  private async fetchRawLines(params: ExtratoParams): Promise<{ simulated: boolean; rawLines: BbExtratoLancamentoRaw[] }> {
     if (process.env.ENABLE_BB_EXTRATO_FETCH !== 'true') {
-      console.log('[bbExtratoService.fetchExtrato] SIMULADO (ENABLE_BB_EXTRATO_FETCH=false) - período:', params);
-      return { simulated: true, lines: buildSimulatedLines(params) };
+      console.log('[bbExtratoService.fetchRawLines] SIMULADO (ENABLE_BB_EXTRATO_FETCH=false) - período:', params);
+      return { simulated: true, rawLines: buildSimulatedRawLines(params) };
     }
 
     assertPeriodWithinLimit(params.from, params.to);
@@ -319,12 +337,45 @@ class BbExtratoService {
       pageNumber = page.numeroPaginaProximo;
     }
 
+    return { simulated: false, rawLines };
+  }
+
+  // Busca o extrato de conta corrente no período informado para CONCILIAÇÃO.
+  // Suprime códigos informativos como 'SA', trazendo apenas transações reais ('1','2','3').
+  async fetchExtrato(params: ExtratoParams): Promise<FetchExtratoResult> {
+    const { simulated, rawLines } = await this.fetchRawLines(params);
     const lines = rawLines
       .filter((raw) => TRANSACTION_STAGE_CODES.has(raw.indicadorTipoLancamento))
       .map(normalizeBbLine)
       .filter((line): line is BankStatementLine => line !== null);
 
-    return { simulated: false, lines };
+    return { simulated, lines };
+  }
+
+  // Busca o extrato de conta corrente no período informado para ARMAZENAMENTO DE SNAPSHOT.
+  // Inclui o código 'SA' (Saldo Anterior / Saldo Atual) e extrai o saldo do período.
+  async fetchExtratoForSnapshot(params: ExtratoParams): Promise<FetchExtratoSnapshotResult> {
+    const { simulated, rawLines } = await this.fetchRawLines(params);
+
+    // Encontra o lançamento do tipo 'SA' para computar o saldo do período
+    const saRaw = rawLines.find((raw) => raw.indicadorTipoLancamento === 'SA') || null;
+    let periodBalance = 0;
+    if (saRaw) {
+      const rawVal = Number(saRaw.valorLancamento) || 0;
+      periodBalance = saRaw.indicadorSinalLancamento === 'D' ? -Math.abs(rawVal) : Math.abs(rawVal);
+    }
+
+    const lines = rawLines
+      .filter((raw) => SNAPSHOT_STAGE_CODES.has(raw.indicadorTipoLancamento))
+      .map(normalizeBbLine)
+      .filter((line): line is BankStatementLine => line !== null);
+
+    return {
+      simulated,
+      lines,
+      periodBalance,
+      saLancamento: saRaw,
+    };
   }
 }
 

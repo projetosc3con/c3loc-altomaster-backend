@@ -74,6 +74,34 @@ describe('bbExtratoService', () => {
     expect(result.lines[1]).toMatchObject({ bank_date: '2026-08-21', value: 50, type: 'payable' });
   });
 
+  it('fetchExtratoForSnapshot inclui o lançamento "SA" e extrai periodBalance', async () => {
+    process.env.ENABLE_BB_EXTRATO_FETCH = 'true';
+    process.env.BB_APP_KEY = 'app-key';
+    process.env.BB_AGENCIA = '551';
+    process.env.BB_CONTA = '5087';
+    process.env.BB_ENV = 'homologacao';
+    mockGetToken.mockResolvedValue('token-123');
+
+    mockHttp.get.mockResolvedValueOnce({
+      data: {
+        numeroPaginaProximo: 0,
+        listaLancamento: [
+          { indicadorTipoLancamento: 'SA', dataLancamento: 20082026, valorLancamento: 8450.75, indicadorSinalLancamento: 'C', textoDescricaoSubHistorico: 'SALDO ANTERIOR' },
+          { indicadorTipoLancamento: '1', dataLancamento: 20082026, valorLancamento: 300, indicadorSinalLancamento: 'C', textoIdentificadorUnicoTransacao: 'E2' },
+        ],
+      },
+    });
+
+    const { bbExtratoService } = await import('../../services/bbExtratoService');
+    const result = await bbExtratoService.fetchExtratoForSnapshot({ from: '2026-08-01', to: '2026-08-20' });
+
+    expect(result.simulated).toBe(false);
+    expect(result.periodBalance).toBe(8450.75);
+    expect(result.saLancamento?.valorLancamento).toBe(8450.75);
+    expect(result.lines).toHaveLength(2);
+    expect(result.lines.some((l) => (l.raw as any)?.indicadorTipoLancamento === 'SA')).toBe(true);
+  });
+
   it('normaliza erro do BB (shape documentado code/message) em BbApiError', async () => {
     process.env.ENABLE_BB_EXTRATO_FETCH = 'true';
     process.env.BB_APP_KEY = 'app-key';

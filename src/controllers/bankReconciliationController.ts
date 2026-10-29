@@ -236,18 +236,19 @@ export const saveBankStatementSnapshot = async (req: AuthRequest, res: Response)
     const rawTo = req.query.to ?? req.body?.to;
     const period = resolvePeriod(rawFrom, rawTo);
 
-    const { simulated, lines } = await bbExtratoService.fetchExtrato(period);
+    const { simulated, lines, periodBalance } = await bbExtratoService.fetchExtratoForSnapshot(period);
 
+    // Total de créditos e débitos operacionais (excluindo lançamentos de saldo tipo 'SA' para não distorcer a movimentação)
     const totalCredits = Number(
       lines
-        .filter((l) => l.dc_indicator === 'C')
+        .filter((l) => l.dc_indicator === 'C' && (l.raw as any)?.indicadorTipoLancamento !== 'SA')
         .reduce((acc, l) => acc + (Number(l.value) || 0), 0)
         .toFixed(2)
     );
 
     const totalDebits = Number(
       lines
-        .filter((l) => l.dc_indicator === 'D')
+        .filter((l) => l.dc_indicator === 'D' && (l.raw as any)?.indicadorTipoLancamento !== 'SA')
         .reduce((acc, l) => acc + (Number(l.value) || 0), 0)
         .toFixed(2)
     );
@@ -261,6 +262,8 @@ export const saveBankStatementSnapshot = async (req: AuthRequest, res: Response)
         total_lines: lines.length,
         total_credits: totalCredits,
         total_debits: totalDebits,
+        period_balance: periodBalance ?? 0,
+        saldo_anterior: periodBalance ?? 0,
         lines,
         created_by: req.user?.id || null,
       })
