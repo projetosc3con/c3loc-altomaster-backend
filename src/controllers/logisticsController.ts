@@ -52,32 +52,21 @@ export const getAllContracts = async (req: AuthRequest, res: Response) => {
  */
 // Helper para extrair equipamentos pretendidos definidos no contrato
 const extractContractIntendedEquipments = async (supabase: any, contract: any): Promise<any[]> => {
-  // 1. Snapshot com lista de equipamentos
-  if (contract?.snapshot?.equipments && Array.isArray(contract.snapshot.equipments) && contract.snapshot.equipments.length > 0) {
-    return contract.snapshot.equipments;
-  }
-  // 2. Snapshot legado com equipment.items
-  if (contract?.snapshot?.equipment?.items && Array.isArray(contract.snapshot.equipment.items) && contract.snapshot.equipment.items.length > 0) {
-    return contract.snapshot.equipment.items;
-  }
-  // 3. Formulário de contrato com JSON em equipment_model
-  const equipModel = contract?.contract_form?.equipment_model;
-  if (equipModel && typeof equipModel === 'string' && equipModel.startsWith('[EQUIPMENTS_JSON]:')) {
-    try {
-      const parsed = JSON.parse(equipModel.replace('[EQUIPMENTS_JSON]:', ''));
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-    } catch (e) {
-      // Ignorar erro de parse
-    }
-  }
-  // 4. Se houver fatura vinculada à negociação ou contrato
+  const contractId = contract?.id;
   const dealRentalInvoiceId = contract?.deal?.rental_invoice_id || contract?.rental_invoice_id;
-  if (dealRentalInvoiceId) {
-    const { data: invEquips } = await supabase
-      .from('rental_invoice_equipments')
-      .select('*')
-      .eq('rental_invoice_id', dealRentalInvoiceId)
-      .order('created_at', { ascending: true });
+
+  // 1. Se houver equipamentos já triados/faturados na tabela rental_invoice_equipments
+  if (contractId || dealRentalInvoiceId) {
+    let query = supabase.from('rental_invoice_equipments').select('*');
+    if (contractId && dealRentalInvoiceId) {
+      query = query.or(`deal_contract_id.eq.${contractId},rental_invoice_id.eq.${dealRentalInvoiceId}`);
+    } else if (contractId) {
+      query = query.eq('deal_contract_id', contractId);
+    } else {
+      query = query.eq('rental_invoice_id', dealRentalInvoiceId);
+    }
+
+    const { data: invEquips } = await query.order('created_at', { ascending: true });
     if (invEquips && invEquips.length > 0) {
       return invEquips.map((e: any) => ({
         tempId: e.id,
@@ -96,6 +85,25 @@ const extractContractIntendedEquipments = async (supabase: any, contract: any): 
         cost_training: Number(e.cost_training) || 0,
         total_value: Number(e.total_value) || 0
       }));
+    }
+  }
+
+  // 2. Snapshot com lista de equipamentos
+  if (contract?.snapshot?.equipments && Array.isArray(contract.snapshot.equipments) && contract.snapshot.equipments.length > 0) {
+    return contract.snapshot.equipments;
+  }
+  // 3. Snapshot legado com equipment.items
+  if (contract?.snapshot?.equipment?.items && Array.isArray(contract.snapshot.equipment.items) && contract.snapshot.equipment.items.length > 0) {
+    return contract.snapshot.equipment.items;
+  }
+  // 4. Formulário de contrato com JSON em equipment_model
+  const equipModel = contract?.contract_form?.equipment_model;
+  if (equipModel && typeof equipModel === 'string' && equipModel.startsWith('[EQUIPMENTS_JSON]:')) {
+    try {
+      const parsed = JSON.parse(equipModel.replace('[EQUIPMENTS_JSON]:', ''));
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    } catch (e) {
+      // Ignorar erro de parse
     }
   }
   // 5. Fallback com único equipamento do formulário ou snapshot
