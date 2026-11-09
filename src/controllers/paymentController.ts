@@ -190,6 +190,8 @@ export const createChargeForInvoice = async (req: AuthRequest, res: Response) =>
     const divergent = Math.abs(charge.value - invoice.total_value) >= CENTS_TOLERANCE;
 
     let emailSent = false;
+    // [STANDBY - RESEND] Notificações via Resend temporariamente em standby
+    /*
     if (client.email) {
       try {
         await emailService.sendBoletoEmail({
@@ -206,6 +208,7 @@ export const createChargeForInvoice = async (req: AuthRequest, res: Response) =>
         console.error('[createChargeForInvoice] Falha ao enviar e-mail de boleto:', emailError.response?.data || emailError.message);
       }
     }
+    */
 
     return res.status(201).json({
       invoice_id: invoice.id,

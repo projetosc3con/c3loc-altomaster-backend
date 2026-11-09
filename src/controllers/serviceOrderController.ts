@@ -129,13 +129,20 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
 
     if (osError) throw osError;
 
-    // 2. Update equipment status based on OS status (only for equipment not linked to active rental)
-    if (osData.equipment_id && !osData.rental_invoice_id) {
+    // 2. Update equipment status based on OS status
+    if (osData.equipment_id) {
         const isAvailable = osData.status === 'Concluída' || osData.status === 'Encerrada com pendências' || osData.status === 'Cancelada';
-        await supabase
-            .from('equipments')
-            .update({ status: isAvailable ? 'Disponível' : 'Em Manutenção' })
-            .eq('id', osData.equipment_id);
+        if (osData.order_type === 'Interna') {
+            await supabase
+                .from('equipments')
+                .update({ status: isAvailable ? 'Disponível' : 'Em Manutenção' })
+                .eq('id', osData.equipment_id);
+        } else if (!osData.rental_invoice_id) {
+            await supabase
+                .from('equipments')
+                .update({ status: isAvailable ? 'Disponível' : 'Em Manutenção' })
+                .eq('id', osData.equipment_id);
+        }
     }
 
     // 2.1 Se hour_meter_after for informado, atualizar o horímetro do equipamento e registrar log

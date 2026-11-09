@@ -422,6 +422,8 @@ async function sendFaturaEmailForInvoice(invoice: any) {
     .single();
   const companyName = settings?.company_name || 'C3Loc';
 
+  // [STANDBY - RESEND] Envio de fatura de locação por e-mail temporariamente em standby
+  /*
   await emailService.sendFaturaLocacaoEmail({
     to: client.email,
     clientName: client.company_name || invoice.client_name || 'Cliente',
@@ -431,6 +433,7 @@ async function sendFaturaEmailForInvoice(invoice: any) {
     totalValue: Number(invoice.total_value) || 0,
     faturaLink: invoice.fatura_pdf_url || undefined,
   });
+  */
 }
 
 // Compartilhado entre a emissão síncrona (emitNfseAndNotifyClient, quando o
@@ -460,6 +463,8 @@ async function sendNfseEmailForInvoice(invoiceId: string, nfseLink: string) {
   const companyName = settings?.company_name || 'C3Loc';
 
   try {
+    // [STANDBY - RESEND] Envio de NFS-e por e-mail temporariamente em standby
+    /*
     await emailService.sendNfseEmail({
       to: client.email,
       clientName: client.company_name || invoice.client_name || 'Cliente',
@@ -467,6 +472,7 @@ async function sendNfseEmailForInvoice(invoiceId: string, nfseLink: string) {
       equipmentDescription: invoice.equipment_name || 'Equipamento',
       nfseLink,
     });
+    */
   } catch (emailError: any) {
     console.error('[sendNfseEmailForInvoice] Falha ao enviar e-mail de NFS-e:', emailError.response?.data || emailError.message);
   }

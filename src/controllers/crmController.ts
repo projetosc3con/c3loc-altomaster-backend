@@ -1591,7 +1591,8 @@ export const uploadSignedContract = async (req: AuthRequest, res: Response) => {
       }]);
     }
 
-    // Send email notification to logistics team
+    // [STANDBY - RESEND] Send email notification to logistics team temporariamente em standby
+    /*
     try {
       const { data: fullDeal } = await supabase.from('crm_deals').select('title').eq('id', dealId).single();
       const snapshot = data.snapshot || {};
@@ -1622,6 +1623,7 @@ export const uploadSignedContract = async (req: AuthRequest, res: Response) => {
     } catch (emailErr) {
       console.error('[crmController] Erro ao enviar notificação interna de contrato assinado:', emailErr);
     }
+    */
 
     // Notificação no sistema ao anexar crm_deal_contracts assinado
     // Gatilhos: status === 'Assinado', signed_file_url preenchida e signed_uploaded_at preenchido
@@ -1810,6 +1812,8 @@ export const sendContractEmail = async (req: AuthRequest, res: Response) => {
     const companyName = settings?.company_name || 'C3Loc';
 
     // 6. Send email
+    // [STANDBY - RESEND] Envio de e-mail de contrato temporariamente em standby
+    /*
     await emailService.sendContractEmail({
       to: contactEmail,
       contactName: contactName || snapshot.locatario?.company_name || 'Cliente',
@@ -1821,8 +1825,9 @@ export const sendContractEmail = async (req: AuthRequest, res: Response) => {
       pdfBase64: pdf_base64 || undefined,
       pdfFilename,
     });
+    */
 
-    res.json({ message: 'E-mail enviado com sucesso', sentTo: contactEmail });
+    res.json({ message: 'Envio de e-mail temporariamente em standby', sentTo: contactEmail });
   } catch (error: any) {
     console.error('[crmController] Erro em sendContractEmail:', error);
     res.status(500).json({ error: error.message });

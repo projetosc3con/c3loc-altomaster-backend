@@ -325,6 +325,10 @@ function buildFaturaLocacaoEmailTemplate(params: FaturaLocacaoEmailParams, reply
 `.trim();
 }
 
+// [STANDBY - RESEND] Notificações por e-mail via Resend temporariamente em standby.
+// Defina RESEND_ENABLED=true no .env (ou altere esta constante) quando desejar reativar.
+const RESEND_ENABLED = process.env.RESEND_ENABLED === 'true';
+
 class EmailService {
   private http: AxiosInstance;
 
@@ -336,6 +340,10 @@ class EmailService {
   }
 
   async sendBoletoEmail(params: BoletoEmailParams): Promise<void> {
+    if (!RESEND_ENABLED) {
+      console.log('[emailService] [STANDBY] Envio de e-mail de boleto via Resend em standby (ignorado).');
+      return;
+    }
     const apiKey = process.env.RESEND_API_KEY;
     if (!apiKey) throw new Error('RESEND_API_KEY não configurada');
 
@@ -365,6 +373,10 @@ class EmailService {
   }
 
   async sendContractEmail(params: ContractEmailParams): Promise<void> {
+    if (!RESEND_ENABLED) {
+      console.log('[emailService] [STANDBY] Envio de e-mail de contrato via Resend em standby (ignorado).');
+      return;
+    }
     const apiKey = process.env.RESEND_API_KEY;
     if (!apiKey) throw new Error('RESEND_API_KEY não configurada');
 
@@ -396,6 +408,10 @@ class EmailService {
   }
 
   async sendNfseEmail(params: NfseEmailParams): Promise<void> {
+    if (!RESEND_ENABLED) {
+      console.log('[emailService] [STANDBY] Envio de e-mail de NFS-e via Resend em standby (ignorado).');
+      return;
+    }
     const apiKey = process.env.RESEND_API_KEY;
     if (!apiKey) throw new Error('RESEND_API_KEY não configurada');
 
@@ -417,6 +433,10 @@ class EmailService {
   }
 
   async sendFaturaLocacaoEmail(params: FaturaLocacaoEmailParams): Promise<void> {
+    if (!RESEND_ENABLED) {
+      console.log('[emailService] [STANDBY] Envio de e-mail de fatura de locação via Resend em standby (ignorado).');
+      return;
+    }
     const apiKey = process.env.RESEND_API_KEY;
     if (!apiKey) throw new Error('RESEND_API_KEY não configurada');
 
@@ -447,6 +467,10 @@ class EmailService {
   }
 
   async sendSignedContractNotification(params: SignedContractNotificationParams): Promise<void> {
+    if (!RESEND_ENABLED) {
+      console.log('[emailService] [STANDBY] Envio de notificação interna de contrato via Resend em standby (ignorado).');
+      return;
+    }
     const apiKey = process.env.RESEND_API_KEY;
     if (!apiKey) throw new Error('RESEND_API_KEY não configurada');
 

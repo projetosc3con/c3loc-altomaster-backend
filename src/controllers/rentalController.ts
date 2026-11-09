@@ -34,8 +34,20 @@ const updateEquipmentItemStatus = async (
 
     if (!hasCurrentActive) {
       const { data: currentEq } = await supabase.from('equipments').select('status').eq('id', equipmentId).single();
-      if (currentEq && currentEq.status === 'Locado') {
-        await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', equipmentId);
+      if (currentEq) {
+        // Verificar se há alguma OS aberta para este equipamento antes de forçar 'Disponível'
+        const { data: openOs } = await supabase
+          .from('service_orders')
+          .select('id')
+          .eq('equipment_id', equipmentId)
+          .in('status', ['Aberta', 'Em Andamento', 'Aguardando Peças'])
+          .limit(1);
+
+        if (openOs && openOs.length > 0) {
+          await supabase.from('equipments').update({ status: 'Em Manutenção' }).eq('id', equipmentId);
+        } else if (currentEq.status === 'Locado') {
+          await supabase.from('equipments').update({ status: 'Disponível' }).eq('id', equipmentId);
+        }
       }
     }
   } else {
@@ -1034,9 +1046,53 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
       }
     }
 
+    const ALLOWED_RENTAL_COLUMNS = new Set([
+      'client_id',
+      'client_name',
+      'cnpj',
+      'equipment_id',
+      'equipment_name',
+      'equipment_type',
+      'equipment_size',
+      'asset_number',
+      'work_site',
+      'billing_period_start',
+      'billing_period_end',
+      'billing_status',
+      'return_date',
+      'cost_rental',
+      'cost_insurance',
+      'cost_freight',
+      'cost_rcd',
+      'cost_third_party',
+      'cost_training',
+      'total_value',
+      'due_date',
+      'payment_method',
+      'bank_reconciliation_date',
+      'reconciliation_status',
+      'notes',
+      'created_by',
+      'invoice_number',
+      'client_score',
+      'billing_method',
+      'document_type',
+      'manual_due_date',
+      'fatura_pdf_url',
+      'deal_id',
+      'return_checklist_urls',
+    ]);
+
+    const sanitizedUpdateData: Record<string, any> = {};
+    for (const key of Object.keys(updateData)) {
+      if (ALLOWED_RENTAL_COLUMNS.has(key)) {
+        sanitizedUpdateData[key] = updateData[key];
+      }
+    }
+
     const { data: updatedInvoice, error } = await supabase
       .from('rental_invoices')
-      .update(updateData)
+      .update(sanitizedUpdateData)
       .eq('id', id)
       .select()
       .single();
@@ -1514,7 +1570,15 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
 
 export const createRentalServiceOrder = async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
-  const { equipment_id } = req.body;
+  const {
+    equipment_id,
+    order_type = 'Externa',
+    description,
+    notes,
+    client_request,
+    hour_meter_before,
+    execution_location,
+  } = req.body;
 
   try {
     const supabase = getSupabaseUserClient(req.token!);
@@ -1598,6 +1662,17 @@ export const createRentalServiceOrder = async (req: AuthRequest, res: Response) 
       : (addressParts || '');
 
     const shortInvoiceRef = rental.invoice_number ? `Locação #${rental.invoice_number}` : `Locação`;
+    const isInternal = order_type === 'Interna';
+
+    const locNumber = rental.invoice_number
+      ? (String(rental.invoice_number).startsWith('#') ? rental.invoice_number : `#${rental.invoice_number}`)
+      : '';
+    const baseClientReq = locNumber
+      ? `Manutenção gerada no retorno da locação ${locNumber}`
+      : 'Manutenção gerada no retorno da locação';
+    const defaultInternalReq = notes
+      ? `${baseClientReq}, observação: ${notes}`
+      : baseClientReq;
 
     const osPayload = {
       rental_invoice_id: rental.id,
@@ -1606,16 +1681,22 @@ export const createRentalServiceOrder = async (req: AuthRequest, res: Response) 
       equipment_name: equipment.name,
       equipment_model: equipment.model,
       equipment_serial_number: equipment.serial_number,
-      order_type: 'Externa', // Ordens de serviço abertas direto da locação são externas por padrão
+      order_type: isInternal ? 'Interna' : 'Externa',
       status: 'Aberta',
       execution_date: new Date().toISOString().split('T')[0],
-      execution_location: rental.work_site || addressParts || '',
+      execution_location: execution_location !== undefined ? (execution_location || '') : (isInternal ? '' : (rental.work_site || addressParts || '')),
       client_name: client.company_name || rental.client_name || '',
       client_address: fullLocation,
       client_contact_name: client.contact_name || '',
       client_phone: client.phone || '',
-      client_request: `Manutenção preventiva/corretiva em campo para o equipamento ${equipment.asset_number || ''} atrelado à ${shortInvoiceRef}.`,
-      description: `Ordem de serviço externa gerada a partir da ${shortInvoiceRef}. Obra/Local: ${rental.work_site || 'Não especificado'}.`,
+      client_request: client_request || (isInternal
+        ? defaultInternalReq
+        : `Manutenção preventiva/corretiva em campo para o equipamento ${equipment.asset_number || ''} atrelado à ${shortInvoiceRef}.`),
+      description: description || (isInternal
+        ? `Ordem de serviço interna de manutenção gerada na devolução da ${shortInvoiceRef}. Obra/Origem: ${rental.work_site || 'Não especificado'}.`
+        : `Ordem de serviço externa gerada a partir da ${shortInvoiceRef}. Obra/Local: ${rental.work_site || 'Não especificado'}.`),
+      notes: notes || null,
+      hour_meter_before: hour_meter_before != null && hour_meter_before !== '' ? Number(hour_meter_before) : null,
     };
 
     const { data: newOs, error: osInsertError } = await supabase
@@ -1627,6 +1708,28 @@ export const createRentalServiceOrder = async (req: AuthRequest, res: Response) 
     if (osInsertError) {
       console.error('[createRentalServiceOrder] Erro ao criar OS:', osInsertError);
       throw osInsertError;
+    }
+
+    // Se a OS for Interna (ou retorno para oficina), colocar equipamento em 'Em Manutenção'
+    if (isInternal) {
+      await supabase.from('equipments').update({ status: 'Em Manutenção' }).eq('id', targetEquipmentId);
+    }
+
+    // Se fornecido horímetro, registrar histórico
+    if (hour_meter_before != null && hour_meter_before !== '') {
+      try {
+        await recordHourMeterUpdate(supabase, {
+          equipment_id: targetEquipmentId,
+          new_hour_meter: Number(hour_meter_before),
+          source_type: 'rental_return',
+          reference_id: rental.id,
+          reference_number: rental.invoice_number,
+          notes: `Horímetro registrado na abertura da OS #${newOs.os_number || ''}`,
+          created_by: req.user?.id || null,
+        });
+      } catch (hmErr) {
+        console.warn('[createRentalServiceOrder] Erro ao atualizar horímetro:', hmErr);
+      }
     }
 
     return res.status(201).json(newOs);
