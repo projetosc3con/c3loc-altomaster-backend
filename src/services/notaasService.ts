@@ -143,8 +143,20 @@ export class NotaasService {
    * Enfileira a emissão da NF-e no Notaas
    */
   async enqueueNfe(payload: any): Promise<{ invoiceId: string; status: string; pollUrl: string }> {
-    const response = await notaasClient.post('/api/v1/nfe/emitir', payload);
-    return response.data;
+    try {
+      const response = await notaasClient.post('/api/v1/nfe/emitir', payload);
+      return response.data;
+    } catch (err: any) {
+      if (err.response?.data) {
+        const errorDetail =
+          err.response.data.error ||
+          err.response.data.message ||
+          (err.response.data.campos ? JSON.stringify(err.response.data.campos) : JSON.stringify(err.response.data));
+        console.error('[NotaasService] Erro retornado pela API Notaas:', errorDetail);
+        throw new Error(`Erro na validação da API Notaas: ${errorDetail}`);
+      }
+      throw err;
+    }
   }
 
   /**
@@ -168,8 +180,8 @@ export class NotaasService {
   /**
    * Faz polling até a nota atingir status terminal ('issued' ou 'error' / 'cancelled')
    */
-  async pollUntilTerminal(invoiceId: string, maxAttempts = 30, delayMs = 1500): Promise < any > {
-      for(let attempt = 1; attempt <= maxAttempts; attempt++) {
+  async pollUntilTerminal(invoiceId: string, maxAttempts = 40, delayMs = 2500): Promise<any> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const statusData = await this.getNfeStatus(invoiceId);
       const st = statusData.status;
 
@@ -179,7 +191,13 @@ export class NotaasService {
 
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
-    throw new Error('Tempo limite excedido aguardando autorização da NF-e pela SEFAZ.');
+
+    const finalCheck = await this.getNfeStatus(invoiceId);
+    if (finalCheck?.status === 'issued' || finalCheck?.status === 'error' || finalCheck?.status === 'cancelled') {
+      return finalCheck;
+    }
+
+    throw new Error('Tempo limite excedido aguardando autorização da NF-e pela SEFAZ. Consulte o status da nota no painel do Notaas.');
   }
 
   /**
@@ -309,26 +327,38 @@ export class NotaasService {
 
     const cleanDoc = cleanDigits(params.recipient.cnpj);
     const destDoc = cleanDoc.length === 11 ? { cpf: cleanDoc } : { cnpj: cleanDoc };
+    const cleanIE = cleanDigits(params.recipient.state_subscription);
+    const destIE = isDestIsento ? undefined : (cleanIE || params.recipient.state_subscription?.trim());
 
-    const payload = {
+    // Objeto do destinatário em conformidade estrita com a API do Notaas
+    const dest: any = {
+      nome: params.recipient.company_name,
+      ...destDoc,
+      indIEDest: isDestIsento ? 9 : 1,
+      indicadorIEDest: isDestIsento ? 9 : 1,
+      endereco: {
+        logradouro: params.recipient.address_street || 'Avenida Principal',
+        numero: params.recipient.address_number || 'SN',
+        bairro: params.recipient.address_neighborhood || 'Centro',
+        cidade: params.recipient.address_city || 'Cuiaba',
+        codigoMunicipio,
+        uf: destUf,
+        cep: cleanDigits(params.recipient.address_zip) || '78050000',
+      },
+    };
+
+    // Para destinatário contribuinte (não isento), informa as tags de IE reconhecidas
+    if (!isDestIsento && destIE) {
+      dest.ie = destIE;
+      dest.IE = destIE;
+      dest.inscricaoEstadual = destIE;
+    }
+
+    const payload: any = {
       modelo: 55,
       tpNF: isSaida ? 1 : 0, // 1 = Saída, 0 = Entrada (retorno)
       naturezaOperacao: natureName,
-      dest: {
-        nome: params.recipient.company_name,
-        ...destDoc,
-        inscricaoEstadual: isDestIsento ? undefined : params.recipient.state_subscription?.trim(),
-        indicadorIEDest: isDestIsento ? 9 : 1, // 9 = Não Contribuinte, 1 = Contribuinte
-        endereco: {
-          logradouro: params.recipient.address_street || 'Avenida Principal',
-          numero: params.recipient.address_number || 'SN',
-          bairro: params.recipient.address_neighborhood || 'Centro',
-          cidade: params.recipient.address_city || 'Cuiaba',
-          codigoMunicipio,
-          uf: destUf,
-          cep: cleanDigits(params.recipient.address_zip) || '78050000',
-        },
-      },
+      dest,
       items,
       pagamentos: [
         {
@@ -342,6 +372,13 @@ export class NotaasService {
     };
 
     console.log(`[NotaasService] Enviando NF-e (${params.direction}) para o Notaas...`);
+    console.log(`[NotaasService] Destinatário payload:`, JSON.stringify({
+      nome: dest.nome,
+      doc: destDoc,
+      ie: dest.ie,
+      indIEDest: dest.indIEDest,
+      endereco: dest.endereco,
+    }));
     const enqueueResult = await this.enqueueNfe(payload);
     const invoiceId = enqueueResult.invoiceId;
     console.log(`[NotaasService] Enfileirado com sucesso, invoiceId: ${invoiceId}`);

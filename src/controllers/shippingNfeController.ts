@@ -12,8 +12,8 @@ export async function emitShippingNfeSaida(req: AuthRequest, res: Response) {
     const supabase = getSupabaseUserClient(req.token!);
     const contractId = Array.isArray(req.params.contractId) ? req.params.contractId[0] : req.params.contractId;
 
-    // 1. Buscar contrato
-    const { data: contract, error: contractErr } = await supabase
+    // 1. Buscar contrato com supabaseAdmin para evitar inconsistência de RLS
+    const { data: contract, error: contractErr } = await supabaseAdmin
       .from('crm_deal_contracts')
       .select('*')
       .eq('id', contractId)
@@ -26,7 +26,7 @@ export async function emitShippingNfeSaida(req: AuthRequest, res: Response) {
     // Buscar contract_form se contract_form_id estiver presente
     let contractForm: any = null;
     if (contract.contract_form_id) {
-      const { data: cf } = await supabase
+      const { data: cf } = await supabaseAdmin
         .from('crm_deal_contract_forms')
         .select('*')
         .eq('id', contract.contract_form_id)
@@ -38,7 +38,7 @@ export async function emitShippingNfeSaida(req: AuthRequest, res: Response) {
     let rentalInvoiceId = contract.rental_invoice_id;
     let rentalInvoice: any = null;
     if (rentalInvoiceId) {
-      const { data: inv } = await supabase
+      const { data: inv } = await supabaseAdmin
         .from('rental_invoices')
         .select('*')
         .eq('id', rentalInvoiceId)
@@ -49,7 +49,7 @@ export async function emitShippingNfeSaida(req: AuthRequest, res: Response) {
     // 3. Buscar equipamentos triados (rental_invoice_equipments ou fallback snapshot)
     let equipments: any[] = [];
     if (rentalInvoiceId) {
-      const { data: eqItems } = await supabase
+      const { data: eqItems } = await supabaseAdmin
         .from('rental_invoice_equipments')
         .select('*')
         .or(`deal_contract_id.eq.${contractId},rental_invoice_id.eq.${rentalInvoiceId}`);
@@ -99,29 +99,78 @@ export async function emitShippingNfeSaida(req: AuthRequest, res: Response) {
       })
     );
 
-    // 4. Buscar dados do cliente / destinatário
+    // 4. Buscar dados do cliente / destinatário com resolução profunda
     const form = contractForm || contract.contract_form || contract.snapshot?.contract_form || {};
     let clientId = contract.client_id || rentalInvoice?.client_id;
     let client: any = null;
 
+    // Se clientId ainda não estiver no contrato, busca pelo deal_id
+    if (!clientId && contract.deal_id) {
+      const { data: deal } = await supabaseAdmin
+        .from('crm_deals')
+        .select('client_id')
+        .eq('id', contract.deal_id)
+        .maybeSingle();
+      if (deal?.client_id) {
+        clientId = deal.client_id;
+      }
+    }
+
     if (clientId) {
-      const { data: cl } = await supabase
+      const { data: cl } = await supabaseAdmin
         .from('clients')
         .select('*')
         .eq('id', clientId)
-        .single();
+        .maybeSingle();
       client = cl;
     }
 
-    const companyName = form.locatario_company_name || client?.company_name || rentalInvoice?.client_name || 'Cliente';
     const cnpj = form.locatario_cnpj || client?.cnpj || rentalInvoice?.cnpj || '';
-    const stateSub = form.locatario_state_subscription || client?.state_subscription || '';
-    const street = form.locatario_address || client?.address_street || 'Avenida Principal';
-    const number = form.locatario_number || client?.address_number || 'SN';
-    const neighborhood = form.locatario_neighborhood || client?.address_neighborhood || 'Centro';
-    const city = form.locatario_city || client?.address_city || 'Cuiaba';
-    const uf = form.locatario_state || client?.address_state || 'MT';
-    const zip = form.locatario_zip || client?.address_zip || '78050000';
+    if (!client && cnpj) {
+      const cleanCnpj = cnpj.replace(/\D/g, '');
+      const { data: clByCnpj } = await supabaseAdmin
+        .from('clients')
+        .select('*')
+        .or(`cnpj.eq.${cnpj},cnpj.eq.${cleanCnpj}`)
+        .maybeSingle();
+      if (clByCnpj) client = clByCnpj;
+    }
+
+    const companyName = client?.company_name || form.locatario_company_name || rentalInvoice?.client_name || 'Cliente';
+    const stateSub =
+      client?.state_subscription ||
+      form.locatario_state_registration ||
+      form.locatario_state_subscription ||
+      form.state_subscription ||
+      form.state_registration ||
+      rentalInvoice?.state_subscription ||
+      '';
+    let street = client?.address_street || form.locatario_address || '';
+    let number = client?.address_number || form.locatario_number || '';
+    let neighborhood = client?.address_neighborhood || form.locatario_neighborhood || '';
+    let city = client?.address_city || form.locatario_city || '';
+    let uf = client?.address_state || form.locatario_state || '';
+    let zip = client?.address_zip || form.locatario_zip || '';
+
+    // Se endereço estruturado estiver incompleto mas houver locatario_address_full, extrair via regex
+    if ((!street || !city) && form.locatario_address_full) {
+      const full = String(form.locatario_address_full).trim();
+      const match = full.match(/^(.*?)(?:,\s*(\d+|SN|S\/N))?(?:\s*-\s*(.*?))?(?:\/([A-Z]{2}))?$/i);
+      if (match) {
+        if (!street) street = match[1]?.trim() || '';
+        if (!number) number = match[2]?.trim() || 'SN';
+        if (!city && match[3]) city = match[3]?.trim() || '';
+        if (!uf && match[4]) uf = match[4]?.toUpperCase().trim() || '';
+      }
+    }
+
+    street = street || 'Avenida Principal';
+    number = number || 'SN';
+    neighborhood = neighborhood || 'Centro';
+    city = city || 'Cuiaba';
+    uf = (uf || 'MT').toUpperCase().trim();
+    zip = zip || '78050000';
+
     const workSite =
       contract.snapshot?.work_site ||
       contractForm?.work_site ||
@@ -137,6 +186,16 @@ export async function emitShippingNfeSaida(req: AuthRequest, res: Response) {
         .update({ work_site: workSite })
         .eq('id', rentalInvoiceId);
     }
+
+    console.log('[emitShippingNfeSaida] Destinatário resolvido:', {
+      contractNumber: contract.contract_number,
+      companyName,
+      cnpj,
+      stateSub,
+      city,
+      uf,
+      workSite,
+    });
 
     const result = await notaasService.processShippingNfe({
       direction: 'SAIDA',
@@ -172,10 +231,9 @@ export async function emitShippingNfeSaida(req: AuthRequest, res: Response) {
  */
 export async function emitShippingNfeRetorno(req: AuthRequest, res: Response) {
   try {
-    const supabase = getSupabaseUserClient(req.token!);
     const rentalId = Array.isArray(req.params.rentalId) ? req.params.rentalId[0] : req.params.rentalId;
 
-    const { data: rental, error: rentalErr } = await supabase
+    const { data: rental, error: rentalErr } = await supabaseAdmin
       .from('rental_invoices')
       .select('*')
       .eq('id', rentalId)
@@ -188,23 +246,33 @@ export async function emitShippingNfeRetorno(req: AuthRequest, res: Response) {
     // 1. Buscar cliente e verificar se é isento
     let client: any = null;
     if (rental.client_id) {
-      const { data: cl } = await supabase
+      const { data: cl } = await supabaseAdmin
         .from('clients')
         .select('*')
         .eq('id', rental.client_id)
-        .single();
+        .maybeSingle();
       client = cl;
     }
 
-    const stateSub = client?.state_subscription || '';
+    if (!client && rental.cnpj) {
+      const cleanCnpj = rental.cnpj.replace(/\D/g, '');
+      const { data: clByCnpj } = await supabaseAdmin
+        .from('clients')
+        .select('*')
+        .or(`cnpj.eq.${rental.cnpj},cnpj.eq.${cleanCnpj}`)
+        .maybeSingle();
+      if (clByCnpj) client = clByCnpj;
+    }
+
+    const stateSub = client?.state_subscription || rental.state_subscription || '';
     if (!isClientIsento(stateSub)) {
       return res.status(400).json({
-        error: 'Cliente possui Inscrição Estadual ativa. A NF-e de retorno deve ser emitida pelo próprio cliente.',
+        error: `Cliente possui Inscrição Estadual ativa (${stateSub}). A NF-e de retorno deve ser emitida pelo próprio cliente.`,
       });
     }
 
     // 2. Buscar equipamentos da locação
-    const { data: eqItems } = await supabase
+    const { data: eqItems } = await supabaseAdmin
       .from('rental_invoice_equipments')
       .select('*')
       .eq('rental_invoice_id', rentalId);
@@ -251,7 +319,7 @@ export async function emitShippingNfeRetorno(req: AuthRequest, res: Response) {
     let dealContractId: string | undefined = undefined;
     let contractNumber: string = rental.invoice_number;
 
-    const { data: ctByRental } = await supabase
+    const { data: ctByRental } = await supabaseAdmin
       .from('crm_deal_contracts')
       .select('id, snapshot, contract_form_id, contract_number')
       .eq('rental_invoice_id', rentalId)
@@ -259,7 +327,7 @@ export async function emitShippingNfeRetorno(req: AuthRequest, res: Response) {
 
     let contractObj = ctByRental;
     if (!contractObj && rental.deal_id) {
-      const { data: ctByDeal } = await supabase
+      const { data: ctByDeal } = await supabaseAdmin
         .from('crm_deal_contracts')
         .select('id, snapshot, contract_form_id, contract_number')
         .eq('deal_id', rental.deal_id)
@@ -270,7 +338,7 @@ export async function emitShippingNfeRetorno(req: AuthRequest, res: Response) {
     }
 
     if (!contractObj) {
-      const { data: saidaInvoice } = await supabase
+      const { data: saidaInvoice } = await supabaseAdmin
         .from('rental_shipping_invoices')
         .select('deal_contract_id')
         .eq('rental_invoice_id', rentalId)
@@ -280,7 +348,7 @@ export async function emitShippingNfeRetorno(req: AuthRequest, res: Response) {
         .maybeSingle();
 
       if (saidaInvoice?.deal_contract_id) {
-        const { data: ctById } = await supabase
+        const { data: ctById } = await supabaseAdmin
           .from('crm_deal_contracts')
           .select('id, snapshot, contract_form_id, contract_number')
           .eq('id', saidaInvoice.deal_contract_id)
@@ -301,7 +369,7 @@ export async function emitShippingNfeRetorno(req: AuthRequest, res: Response) {
       } else if (contractObj.snapshot?.contract_form?.work_site) {
         workSite = contractObj.snapshot.contract_form.work_site;
       } else if (contractObj.contract_form_id) {
-        const { data: cf } = await supabase
+        const { data: cf } = await supabaseAdmin
           .from('crm_deal_contract_forms')
           .select('work_site')
           .eq('id', contractObj.contract_form_id)
