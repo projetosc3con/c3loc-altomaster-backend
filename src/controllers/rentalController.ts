@@ -63,6 +63,124 @@ export const getDaysInclusive = (startStr: string, endStr: string): number => {
   return diff >= 0 ? diff + 1 : 0;
 };
 
+const normalizePeriodDateStr = (d?: string | null): string =>
+  d ? String(d).split('T')[0].trim() : '';
+
+const getRentalMachineKey = (eq: any, fallbackIndex: number): string =>
+  eq.equipment_id || eq.asset_number || eq.equipment_name || eq.id || `idx-${fallbackIndex}`;
+
+/**
+ * Resolve o último período de cada máquina distinta, descartando máquinas históricas
+ * que já foram substituídas por outra em períodos posteriores sem sobreposição.
+ */
+export const resolveLatestMachinesWithSwapStatus = <T extends Record<string, any>>(equipments: T[]) => {
+  if (!equipments || equipments.length === 0) {
+    return {
+      allLatestMachines: [] as T[],
+      nonSupersededMachines: [] as T[],
+      activeMachines: [] as T[],
+      supersededMachines: [] as T[],
+      machineMap: new Map<string, T>(),
+    };
+  }
+
+  const machineMap = new Map<string, T>();
+  equipments.forEach((eq, idx) => {
+    const key = getRentalMachineKey(eq, idx);
+    const existing = machineMap.get(key);
+    if (!existing) {
+      machineMap.set(key, eq);
+      return;
+    }
+
+    const exEnd = normalizePeriodDateStr(existing.billing_period_end);
+    const curEnd = normalizePeriodDateStr(eq.billing_period_end);
+    const exStart = normalizePeriodDateStr(existing.billing_period_start);
+    const curStart = normalizePeriodDateStr(eq.billing_period_start);
+
+    if (curEnd > exEnd || (curEnd === exEnd && curStart >= exStart)) {
+      machineMap.set(key, eq);
+    }
+  });
+
+  const normalizedRows = equipments.map((row, idx) => ({
+    row,
+    key: getRentalMachineKey(row, idx),
+    start: normalizePeriodDateStr(row.billing_period_start),
+    end: normalizePeriodDateStr(row.billing_period_end),
+    ret: normalizePeriodDateStr(row.return_date),
+  }));
+
+  const isSupersededEntry = (entryKey: string, item: T): boolean => {
+    const sM = normalizePeriodDateStr(item.billing_period_start);
+    const eM = normalizePeriodDateStr(item.billing_period_end);
+    if (!eM) return false;
+
+    const concurrentKeys = new Set<string>();
+    for (const r of normalizedRows) {
+      if (r.key === entryKey) continue;
+      if (r.ret && sM && r.ret < sM) continue;
+      const hasDates = Boolean(r.start || r.end);
+      const overlaps =
+        hasDates &&
+        (!r.start || r.start <= eM) &&
+        (!r.end || !sM || r.end >= sM);
+      if (overlaps) {
+        concurrentKeys.add(r.key);
+      }
+    }
+
+    for (const r of normalizedRows) {
+      if (r.key === entryKey) continue;
+      if (r.start && r.start > eM && !concurrentKeys.has(r.key)) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  const nonSupersededMachines: T[] = [];
+  const supersededMachines: T[] = [];
+
+  for (const [key, item] of machineMap.entries()) {
+    const hasReturnDate = Boolean(normalizePeriodDateStr(item.return_date));
+    if (!hasReturnDate && isSupersededEntry(key, item)) {
+      supersededMachines.push(item);
+    } else {
+      nonSupersededMachines.push(item);
+    }
+  }
+
+  const activeMachines = nonSupersededMachines.filter(
+    (item) => !normalizePeriodDateStr(item.return_date)
+  );
+
+  return {
+    allLatestMachines: Array.from(machineMap.values()),
+    nonSupersededMachines,
+    activeMachines,
+    supersededMachines,
+    machineMap,
+  };
+};
+
+const computeConsolidatedReturnDate = (equipments: any[]): string | null => {
+  const { nonSupersededMachines } = resolveLatestMachinesWithSwapStatus(equipments);
+  const allHaveReturnDate =
+    nonSupersededMachines.length > 0 &&
+    nonSupersededMachines.every((e: any) => Boolean(normalizePeriodDateStr(e.return_date)));
+
+  if (!allHaveReturnDate) return null;
+
+  const sortedReturnDates = nonSupersededMachines
+    .map((e: any) => normalizePeriodDateStr(e.return_date))
+    .filter(Boolean)
+    .sort((a: string, b: string) => a.localeCompare(b));
+
+  return sortedReturnDates.length > 0 ? sortedReturnDates[sortedReturnDates.length - 1] : null;
+};
+
 export interface PeriodWindow {
   start?: string; // YYYY-MM-DD
   end?: string;   // YYYY-MM-DD
@@ -707,33 +825,8 @@ export const createInvoice = async (req: AuthRequest, res: Response) => {
       if (starts.length > 0) billing_period_start = starts[0];
       if (ends.length > 0) billing_period_end = ends[ends.length - 1];
 
-      // Agrupar os equipamentos por máquina para encontrar o último período de cada equipamento distinto
-      const machineMap = new Map<string, any>();
-      for (const eq of rawEquipments) {
-        const key = eq.equipment_id || eq.asset_number || eq.equipment_name || eq.id;
-        const existing = machineMap.get(key);
-        if (!existing) {
-          machineMap.set(key, eq);
-        } else {
-          const existingEnd = existing.billing_period_end ? String(existing.billing_period_end).split('T')[0] : '';
-          const currentEnd = eq.billing_period_end ? String(eq.billing_period_end).split('T')[0] : '';
-          if (currentEnd >= existingEnd) {
-            machineMap.set(key, eq);
-          }
-        }
-      }
-
-      // Só preenche a data de retorno da locação como um todo quando a última máquina for retornada
-      const distinctMachines = Array.from(machineMap.values());
-      const allHaveReturnDate = distinctMachines.length > 0 && distinctMachines.every((e: any) => Boolean(e.return_date && String(e.return_date).trim()));
-      if (allHaveReturnDate) {
-        const sortedReturnDates = distinctMachines
-          .map((e: any) => String(e.return_date).trim().split('T')[0])
-          .sort((a: string, b: string) => a.localeCompare(b));
-        return_date = sortedReturnDates[sortedReturnDates.length - 1];
-      } else {
-        return_date = null;
-      }
+      // Só preenche a data de retorno da locação como um todo quando todas as máquinas ativas forem retornadas
+      return_date = computeConsolidatedReturnDate(rawEquipments);
 
       // Representação consolidada do primeiro / múltiplos equipamentos
       equipment_id = rawEquipments[0].equipment_id;
@@ -944,33 +1037,8 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
       if (starts.length > 0) updateData.billing_period_start = starts[0];
       if (ends.length > 0) updateData.billing_period_end = ends[ends.length - 1];
 
-      // Agrupar os equipamentos por máquina para encontrar o último período de cada equipamento distinto
-      const machineMap = new Map<string, any>();
-      for (const eq of rawEquipments) {
-        const key = eq.equipment_id || eq.asset_number || eq.equipment_name || eq.id;
-        const existing = machineMap.get(key);
-        if (!existing) {
-          machineMap.set(key, eq);
-        } else {
-          const existingEnd = existing.billing_period_end ? String(existing.billing_period_end).split('T')[0] : '';
-          const currentEnd = eq.billing_period_end ? String(eq.billing_period_end).split('T')[0] : '';
-          if (currentEnd >= existingEnd) {
-            machineMap.set(key, eq);
-          }
-        }
-      }
-
-      // Só preenche a data de retorno da locação como um todo quando a última máquina for retornada
-      const distinctMachines = Array.from(machineMap.values());
-      const allHaveReturnDate = distinctMachines.length > 0 && distinctMachines.every((e: any) => Boolean(e.return_date && String(e.return_date).trim()));
-      if (allHaveReturnDate) {
-        const sortedReturnDates = distinctMachines
-          .map((e: any) => String(e.return_date).trim().split('T')[0])
-          .sort((a: string, b: string) => a.localeCompare(b));
-        updateData.return_date = sortedReturnDates[sortedReturnDates.length - 1];
-      } else {
-        updateData.return_date = null;
-      }
+      // Só preenche a data de retorno da locação como um todo quando todas as máquinas ativas forem retornadas
+      updateData.return_date = computeConsolidatedReturnDate(rawEquipments);
 
       updateData.equipment_id = rawEquipments[0].equipment_id || existingInvoice?.equipment_id || null;
       updateData.equipment_name = rawEquipments.length === 1
@@ -1820,27 +1888,13 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
       .select('*')
       .eq('rental_invoice_id', id);
 
-    // Agrupar por máquina para pegar o último período de cada equipamento
-    const machineMap = new Map<string, any>();
-    for (const eq of (currentEquips || [])) {
-      const key = eq.equipment_id || eq.asset_number || eq.equipment_name || eq.id;
-      const existing = machineMap.get(key);
-      if (!existing) {
-        machineMap.set(key, eq);
-      } else {
-        const existingEnd = existing.billing_period_end ? String(existing.billing_period_end).split('T')[0] : '';
-        const currentEnd = eq.billing_period_end ? String(eq.billing_period_end).split('T')[0] : '';
-        if (currentEnd >= existingEnd) {
-          machineMap.set(key, eq);
-        }
-      }
-    }
+    // Resolver máquinas ativas do ciclo atual (descartando máquinas substituídas em trocas anteriores)
+    const { activeMachines: activeEquips, machineMap } = resolveLatestMachinesWithSwapStatus(currentEquips || []);
 
     if (rawExtensions.length === 0 && (req.body.new_end_date || req.body.billing_period_end)) {
       const targetEnd = (req.body.new_end_date || req.body.billing_period_end).split('T')[0];
 
-      // Apenas máquinas ativas (que NÃO foram devolvidas em seu último período)
-      const activeEquips = Array.from(machineMap.values()).filter((eq: any) => !eq.return_date || !String(eq.return_date).trim());
+      // Apenas máquinas ativas do ciclo atual (não devolvidas e não substituídas)
       const baseEquips = activeEquips.length > 0 ? activeEquips : [rental];
 
       let newStartStr = req.body.billing_period_start;
@@ -1885,9 +1939,10 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
         return res.status(400).json({ error: 'A data de início do período não pode ser posterior à data de término.' });
       }
 
-      // Validar se este equipamento já teve retorno registrado em seu último período
+      // Validar se este equipamento já teve retorno registrado em seu último período (exceto se entrou por troca explícita)
+      const isExplicitSwap = Boolean(ext.replaced_from_equipment_id && ext.replaced_from_equipment_id !== ext.equipment_id);
       const eqKey = ext.equipment_id || ext.asset_number || ext.equipment_name;
-      if (eqKey && machineMap.has(eqKey)) {
+      if (!isExplicitSwap && eqKey && machineMap.has(eqKey)) {
         const lastEq = machineMap.get(eqKey);
         if (lastEq.return_date && String(lastEq.return_date).trim()) {
           return res.status(400).json({
@@ -1935,10 +1990,13 @@ export const extendInvoice = async (req: AuthRequest, res: Response) => {
       throw insertError;
     }
 
-    // 6. Atualizar status dos equipamentos no inventário para 'Locado'
+    // 6. Atualizar status dos equipamentos no inventário para 'Locado' (e reavaliar máquinas substituídas)
     for (const ext of rawExtensions) {
       if (ext.equipment_id) {
         await updateEquipmentItemStatus(supabase, ext.equipment_id, ext.billing_period_end, null);
+      }
+      if (ext.replaced_from_equipment_id && ext.replaced_from_equipment_id !== ext.equipment_id) {
+        await updateEquipmentItemStatus(supabase, ext.replaced_from_equipment_id, ext.previous_period_end || '2000-01-01', null);
       }
     }
 
