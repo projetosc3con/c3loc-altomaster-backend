@@ -3,6 +3,7 @@ import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
 import { asaasService } from '../services/asaasService';
 import { AsaasCustomerRequest } from '../types/asaas';
+import { cnpjService } from '../services/cnpjService';
 
 export const getAllClients = async (req: AuthRequest, res: Response) => {
   try {
@@ -16,6 +17,17 @@ export const getAllClients = async (req: AuthRequest, res: Response) => {
     return res.json(data);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
+  }
+};
+
+export const lookupCnpj = async (req: AuthRequest, res: Response) => {
+  const { cnpj } = req.params;
+  try {
+    const cnpjStr = Array.isArray(cnpj) ? cnpj[0] : (cnpj || '');
+    const result = await cnpjService.lookupCnpj(cnpjStr);
+    return res.json(result);
+  } catch (error: any) {
+    return res.status(400).json({ error: error.message || 'Erro ao consultar CNPJ' });
   }
 };
 

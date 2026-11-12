@@ -4,6 +4,7 @@ import { AuthRequest } from '../middleware/auth';
 import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
 import { emailService } from '../services/emailService';
 import { notifyAdminsAndDirectors } from '../services/notificationService';
+import { cnpjService } from '../services/cnpjService';
 // Pipelines
 export const getPipelines = async (req: AuthRequest, res: Response) => {
   try {
@@ -439,44 +440,23 @@ export const convertLead = async (req: AuthRequest, res: Response) => {
       const unmaskedCnpj = lead.cnpj.replace(/\D/g, '');
       if (unmaskedCnpj.length === 14) {
         try {
-          const response = await axios.get(`https://api.opencnpj.org/${unmaskedCnpj}`);
-          if (response.status === 200) {
-            const data = response.data;
-
-            const tipo_logradouro = data.tipo_logradouro || '';
-            const logradouro = data.logradouro || '';
-            const numero = data.numero || '';
-            const bairro = data.bairro || '';
-            const municipio = data.municipio || '';
-            const uf = data.uf || '';
-            const cepStr = (data.cep || '').replace(/\D/g, '');
-            const cep_formatado = cepStr.length === 8 ? `${cepStr.slice(0, 5)}-${cepStr.slice(5)}` : data.cep || '';
-            const address_street = `${tipo_logradouro} ${logradouro}`.trim();
-            
-            // Construir complemento apenas com o que existe
-            const address_parts = [];
-            if (address_street) address_parts.push(address_street);
-            if (numero) address_parts.push(`Nº ${numero}`);
-            if (bairro) address_parts.push(bairro);
-            if (municipio) address_parts.push(municipio);
-            if (uf) address_parts.push(uf);
-            if (cep_formatado) address_parts.push(`CEP: ${cep_formatado}`);
-
+          const cnpjData = await cnpjService.lookupCnpj(unmaskedCnpj);
+          if (cnpjData && cnpjData.valid) {
             clientData = {
               ...clientData,
-              company_name: data.razao_social || data.razao_scoial || lead.company_name,
-              address_street,
-              address_number: numero,
-              address_complement: address_parts.join(', '),
-              address_city: municipio,
-              address_state: uf,
-              address_zip: cep_formatado,
-              email: data.email || '',
-              phone: data.telefones?.[0] ? `(${data.telefones[0].ddd}) ${data.telefones[0].numero}` : ''
+              company_name: cnpjData.company_name || lead.company_name,
+              address_street: cnpjData.address_street || '',
+              address_number: cnpjData.address_number || '',
+              address_complement: cnpjData.address_complement || '',
+              address_city: cnpjData.address_city || '',
+              address_state: cnpjData.address_state || '',
+              address_zip: cnpjData.address_zip || '',
+              email: cnpjData.email || '',
+              phone: cnpjData.phone || ''
             };
           }
         } catch (err) {
-          console.error('[crmController] Erro ao buscar CNPJ (opencnpj):', err);
+          console.error('[crmController] Erro ao buscar CNPJ via cnpjService:', err);
         }
       }
     }

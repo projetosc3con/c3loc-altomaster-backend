@@ -10,6 +10,7 @@ const fullAccess = authorize(['Administrador', 'Diretoria', 'Gerente']);
 const financeAccess = authorize(['Administrador', 'Diretoria', 'Gerente', 'Financeiro']);
 
 router.get('/', clientController.getAllClients);
+router.get('/lookup-cnpj/:cnpj', clientController.lookupCnpj);
 router.get('/:id', clientController.getClientById);
 router.post('/', fullAccess, clientController.createClient);
 router.put('/:id', clientController.updateClient); // Assuming Comercial can edit clients as they can access /clientes/:id
