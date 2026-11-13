@@ -226,196 +226,239 @@ export async function emitShippingNfeSaida(req: AuthRequest, res: Response) {
 }
 
 /**
+ * Lógica reutilizável para emitir NF-e de Retorno (Entrada) de uma locação
+ */
+export async function executeEmitShippingNfeRetorno(
+  rentalId: string,
+  userId?: string,
+  options?: { forceSystemEmit?: boolean }
+): Promise<any> {
+  const { data: rental, error: rentalErr } = await supabaseAdmin
+    .from('rental_invoices')
+    .select('*')
+    .eq('id', rentalId)
+    .single();
+
+  if (rentalErr || !rental) {
+    throw new Error('Locação não encontrada.');
+  }
+
+  // 1. Buscar cliente e verificar se é isento
+  let client: any = null;
+  if (rental.client_id) {
+    const { data: cl } = await supabaseAdmin
+      .from('clients')
+      .select('*')
+      .eq('id', rental.client_id)
+      .maybeSingle();
+    client = cl;
+  }
+
+  if (!client && rental.cnpj) {
+    const cleanCnpj = rental.cnpj.replace(/\D/g, '');
+    const { data: clByCnpj } = await supabaseAdmin
+      .from('clients')
+      .select('*')
+      .or(`cnpj.eq.${rental.cnpj},cnpj.eq.${cleanCnpj}`)
+      .maybeSingle();
+    if (clByCnpj) client = clByCnpj;
+  }
+
+  const stateSub = client?.state_subscription || rental.state_subscription || '';
+  if (!options?.forceSystemEmit && !isClientIsento(stateSub)) {
+    throw new Error(
+      `Cliente possui Inscrição Estadual ativa (${stateSub}). A NF-e de retorno deve ser emitida pelo próprio cliente.`
+    );
+  }
+
+  // 2. Buscar equipamentos da locação (deduplicando máquinas físicas únicas)
+  const { data: eqItems } = await supabaseAdmin
+    .from('rental_invoice_equipments')
+    .select('*')
+    .eq('rental_invoice_id', rentalId);
+
+  const rawEquipmentsList = eqItems && eqItems.length > 0 ? eqItems : [rental];
+  const uniqueEquipmentsMap = new Map<string, any>();
+  for (const eq of rawEquipmentsList) {
+    const key = eq.equipment_id || eq.asset_number || eq.id || String(uniqueEquipmentsMap.size);
+    uniqueEquipmentsMap.set(key, eq);
+  }
+  const equipmentsList = Array.from(uniqueEquipmentsMap.values());
+
+  const enrichedEquipments = await Promise.all(
+    equipmentsList.map(async (eq) => {
+      let val = Number(eq.value) || 0;
+      let ncm = eq.ncm || '84272090';
+      let model = eq.model;
+      let serial = eq.serial_number;
+      let asset = eq.asset_number;
+
+      if (eq.equipment_id) {
+        const { data: masterEq } = await supabaseAdmin
+          .from('equipments')
+          .select('value, ncm, model, serial_number, asset_number')
+          .eq('id', eq.equipment_id)
+          .single();
+
+        if (masterEq) {
+          val = Number(masterEq.value) > 0 ? Number(masterEq.value) : val;
+          ncm = masterEq.ncm || ncm;
+          model = masterEq.model || model;
+          serial = masterEq.serial_number || serial;
+          asset = masterEq.asset_number || asset;
+        }
+      }
+
+      return {
+        equipment_id: eq.equipment_id,
+        asset_number: asset,
+        equipment_name: eq.equipment_name || 'Plataforma Elevatória',
+        model: model || 'N/A',
+        serial_number: serial || 'N/A',
+        ncm,
+        value: val > 0 ? val : 330000,
+      };
+    })
+  );
+
+  // 3. Buscar contrato vinculado em crm_deal_contracts para obter ID, dados da obra e número do contrato
+  let dealContractId: string | undefined = undefined;
+  let contractNumber: string = rental.invoice_number;
+
+  const { data: ctByRental } = await supabaseAdmin
+    .from('crm_deal_contracts')
+    .select('id, snapshot, contract_form_id, contract_number')
+    .eq('rental_invoice_id', rentalId)
+    .maybeSingle();
+
+  let contractObj = ctByRental;
+  if (!contractObj && rental.deal_id) {
+    const { data: ctByDeal } = await supabaseAdmin
+      .from('crm_deal_contracts')
+      .select('id, snapshot, contract_form_id, contract_number')
+      .eq('deal_id', rental.deal_id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    contractObj = ctByDeal;
+  }
+
+  if (!contractObj) {
+    const { data: saidaInvoice } = await supabaseAdmin
+      .from('rental_shipping_invoices')
+      .select('deal_contract_id')
+      .eq('rental_invoice_id', rentalId)
+      .not('deal_contract_id', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (saidaInvoice?.deal_contract_id) {
+      const { data: ctById } = await supabaseAdmin
+        .from('crm_deal_contracts')
+        .select('id, snapshot, contract_form_id, contract_number')
+        .eq('id', saidaInvoice.deal_contract_id)
+        .maybeSingle();
+      contractObj = ctById;
+    }
+  }
+
+  let workSite = '';
+  let contractForm: any = null;
+  if (contractObj) {
+    dealContractId = contractObj.id;
+    if (contractObj.contract_number) {
+      contractNumber = contractObj.contract_number;
+    }
+
+    if (contractObj.contract_form_id) {
+      const { data: cf } = await supabaseAdmin
+        .from('crm_deal_contract_forms')
+        .select('*')
+        .eq('id', contractObj.contract_form_id)
+        .maybeSingle();
+      contractForm = cf;
+    }
+
+    if (contractObj.snapshot?.work_site) {
+      workSite = contractObj.snapshot.work_site;
+    } else if (contractObj.snapshot?.contract_form?.work_site) {
+      workSite = contractObj.snapshot.contract_form.work_site;
+    } else if (contractForm?.work_site) {
+      workSite = contractForm.work_site;
+    }
+  }
+
+  if (!workSite && rental.work_site) {
+    workSite = rental.work_site;
+  }
+
+  if (workSite && rental.work_site !== workSite) {
+    await supabaseAdmin
+      .from('rental_invoices')
+      .update({ work_site: workSite })
+      .eq('id', rentalId);
+  }
+
+  const form = contractForm || contractObj?.snapshot?.contract_form || {};
+
+  return notaasService.processShippingNfe({
+    direction: 'RETORNO',
+    rentalInvoiceId: rentalId,
+    dealContractId,
+    contractNumber,
+    workSite,
+    recipient: {
+      company_name: client?.company_name || form.locatario_company_name || rental.client_name || 'Cliente',
+      cnpj: client?.cnpj || form.locatario_cnpj || rental.cnpj || '',
+      state_subscription: stateSub || form.locatario_state_registration || form.locatario_state_subscription || '',
+      address_street: client?.address_street || form.locatario_address || 'Avenida Principal',
+      address_number: client?.address_number || form.locatario_number || 'SN',
+      address_neighborhood: client?.address_neighborhood || form.locatario_neighborhood || 'Centro',
+      address_city: client?.address_city || form.locatario_city || 'Cuiaba',
+      address_state: client?.address_state || form.locatario_state || 'MT',
+      address_zip: client?.address_zip || form.locatario_zip || '78050000',
+    },
+    equipments: enrichedEquipments,
+    userId,
+  });
+}
+
+/**
  * POST /api/fiscal/shipping/retorno/:rentalId
- * Emite a NF-e de Retorno (Entrada) pelo sistema se o cliente for ISENTO
+ * Emite a NF-e de Retorno (Entrada) pelo sistema se o cliente for ISENTO (ou quando forceSystemEmit = true)
  */
 export async function emitShippingNfeRetorno(req: AuthRequest, res: Response) {
   try {
     const rentalId = Array.isArray(req.params.rentalId) ? req.params.rentalId[0] : req.params.rentalId;
-
-    const { data: rental, error: rentalErr } = await supabaseAdmin
-      .from('rental_invoices')
-      .select('*')
-      .eq('id', rentalId)
-      .single();
-
-    if (rentalErr || !rental) {
-      return res.status(404).json({ error: 'Locação não encontrada.' });
-    }
-
-    // 1. Buscar cliente e verificar se é isento
-    let client: any = null;
-    if (rental.client_id) {
-      const { data: cl } = await supabaseAdmin
-        .from('clients')
-        .select('*')
-        .eq('id', rental.client_id)
-        .maybeSingle();
-      client = cl;
-    }
-
-    if (!client && rental.cnpj) {
-      const cleanCnpj = rental.cnpj.replace(/\D/g, '');
-      const { data: clByCnpj } = await supabaseAdmin
-        .from('clients')
-        .select('*')
-        .or(`cnpj.eq.${rental.cnpj},cnpj.eq.${cleanCnpj}`)
-        .maybeSingle();
-      if (clByCnpj) client = clByCnpj;
-    }
-
-    const stateSub = client?.state_subscription || rental.state_subscription || '';
-    if (!isClientIsento(stateSub)) {
-      return res.status(400).json({
-        error: `Cliente possui Inscrição Estadual ativa (${stateSub}). A NF-e de retorno deve ser emitida pelo próprio cliente.`,
-      });
-    }
-
-    // 2. Buscar equipamentos da locação
-    const { data: eqItems } = await supabaseAdmin
-      .from('rental_invoice_equipments')
-      .select('*')
-      .eq('rental_invoice_id', rentalId);
-
-    const equipmentsList = eqItems && eqItems.length > 0 ? eqItems : [rental];
-
-    const enrichedEquipments = await Promise.all(
-      equipmentsList.map(async (eq) => {
-        let val = Number(eq.value) || 0;
-        let ncm = eq.ncm || '84272090';
-        let model = eq.model;
-        let serial = eq.serial_number;
-        let asset = eq.asset_number;
-
-        if (eq.equipment_id) {
-          const { data: masterEq } = await supabaseAdmin
-            .from('equipments')
-            .select('value, ncm, model, serial_number, asset_number')
-            .eq('id', eq.equipment_id)
-            .single();
-
-          if (masterEq) {
-            val = Number(masterEq.value) > 0 ? Number(masterEq.value) : val;
-            ncm = masterEq.ncm || ncm;
-            model = masterEq.model || model;
-            serial = masterEq.serial_number || serial;
-            asset = masterEq.asset_number || asset;
-          }
-        }
-
-        return {
-          equipment_id: eq.equipment_id,
-          asset_number: asset,
-          equipment_name: eq.equipment_name || 'Plataforma Elevatória',
-          model: model || 'N/A',
-          serial_number: serial || 'N/A',
-          ncm,
-          value: val > 0 ? val : 330000,
-        };
-      })
-    );
-
-    // 3. Buscar contrato vinculado em crm_deal_contracts para obter ID, dados da obra e número do contrato
-    let dealContractId: string | undefined = undefined;
-    let contractNumber: string = rental.invoice_number;
-
-    const { data: ctByRental } = await supabaseAdmin
-      .from('crm_deal_contracts')
-      .select('id, snapshot, contract_form_id, contract_number')
-      .eq('rental_invoice_id', rentalId)
-      .maybeSingle();
-
-    let contractObj = ctByRental;
-    if (!contractObj && rental.deal_id) {
-      const { data: ctByDeal } = await supabaseAdmin
-        .from('crm_deal_contracts')
-        .select('id, snapshot, contract_form_id, contract_number')
-        .eq('deal_id', rental.deal_id)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      contractObj = ctByDeal;
-    }
-
-    if (!contractObj) {
-      const { data: saidaInvoice } = await supabaseAdmin
-        .from('rental_shipping_invoices')
-        .select('deal_contract_id')
-        .eq('rental_invoice_id', rentalId)
-        .not('deal_contract_id', 'is', null)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (saidaInvoice?.deal_contract_id) {
-        const { data: ctById } = await supabaseAdmin
-          .from('crm_deal_contracts')
-          .select('id, snapshot, contract_form_id, contract_number')
-          .eq('id', saidaInvoice.deal_contract_id)
-          .maybeSingle();
-        contractObj = ctById;
-      }
-    }
-
-    let workSite = '';
-    if (contractObj) {
-      dealContractId = contractObj.id;
-      if (contractObj.contract_number) {
-        contractNumber = contractObj.contract_number;
-      }
-
-      if (contractObj.snapshot?.work_site) {
-        workSite = contractObj.snapshot.work_site;
-      } else if (contractObj.snapshot?.contract_form?.work_site) {
-        workSite = contractObj.snapshot.contract_form.work_site;
-      } else if (contractObj.contract_form_id) {
-        const { data: cf } = await supabaseAdmin
-          .from('crm_deal_contract_forms')
-          .select('work_site')
-          .eq('id', contractObj.contract_form_id)
-          .maybeSingle();
-        if (cf?.work_site) {
-          workSite = cf.work_site;
-        }
-      }
-    }
-
-    if (!workSite && rental.work_site) {
-      workSite = rental.work_site;
-    }
-
-    if (workSite && rental.work_site !== workSite) {
-      await supabaseAdmin
-        .from('rental_invoices')
-        .update({ work_site: workSite })
-        .eq('id', rentalId);
-    }
-
-    const result = await notaasService.processShippingNfe({
-      direction: 'RETORNO',
-      rentalInvoiceId: rentalId,
-      dealContractId,
-      contractNumber,
-      workSite,
-      recipient: {
-        company_name: client?.company_name || rental.client_name || 'Cliente',
-        cnpj: client?.cnpj || rental.cnpj || '',
-        state_subscription: stateSub,
-        address_street: client?.address_street || 'Avenida Principal',
-        address_number: client?.address_number || 'SN',
-        address_neighborhood: client?.address_neighborhood || 'Centro',
-        address_city: client?.address_city || 'Cuiaba',
-        address_state: client?.address_state || 'MT',
-        address_zip: client?.address_zip || '78050000',
-      },
-      equipments: enrichedEquipments,
-      userId: req.user?.id,
-    });
-
+    const forceSystemEmit = Boolean(req.body?.forceSystemEmit);
+    const result = await executeEmitShippingNfeRetorno(rentalId, req.user?.id, { forceSystemEmit });
     return res.json(result);
   } catch (error: any) {
     console.error('[emitShippingNfeRetorno] Erro:', error);
-    return res.status(500).json({ error: error.message || 'Erro ao emitir NF-e de retorno.' });
+    const isClientRuleErr = error.message?.includes('Inscrição Estadual ativa');
+    return res.status(isClientRuleErr ? 400 : 500).json({ error: error.message || 'Erro ao emitir NF-e de retorno.' });
+  }
+}
+
+/**
+ * POST /api/fiscal/shipping/cancel/:shippingInvoiceId
+ * Cancela uma NF-e de remessa junto à SEFAZ via Notaas
+ */
+export async function cancelShippingNfe(req: AuthRequest, res: Response) {
+  try {
+    const rawId = req.params.shippingInvoiceId;
+    const shippingInvoiceId = Array.isArray(rawId) ? rawId[0] : rawId;
+    const { motivo } = req.body || {};
+
+    const updated = await notaasService.cancelShippingInvoiceRecord(
+      shippingInvoiceId,
+      motivo || 'Cancelamento da locacao antes da saida fisica do equipamento'
+    );
+    return res.json(updated);
+  } catch (error: any) {
+    console.error('[cancelShippingNfe] Erro:', error);
+    return res.status(500).json({ error: error.message || 'Erro ao cancelar NF-e de remessa.' });
   }
 }
 

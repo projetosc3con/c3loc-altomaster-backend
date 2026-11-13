@@ -201,6 +201,115 @@ export class NotaasService {
   }
 
   /**
+   * Cancela uma NF-e autorizada junto à SEFAZ via Notaas (`POST /api/v1/nfe/cancelar`)
+   */
+  async cancelNfe(invoiceId: string, motivo: string): Promise<any> {
+    const cleanMotivo = (motivo || '').trim() || 'Cancelamento da locacao antes da saida fisica do equipamento';
+    const finalMotivo =
+      cleanMotivo.length < 15
+        ? `${cleanMotivo} - Cancelamento de operacao de remessa`.slice(0, 255)
+        : cleanMotivo.slice(0, 255);
+
+    let cancelResponseData: any;
+    try {
+      const response = await notaasClient.post('/api/v1/nfe/cancelar', {
+        invoiceId,
+        motivo: finalMotivo,
+      });
+      cancelResponseData = response.data;
+    } catch (err: any) {
+      if (err.response?.data) {
+        const errorDetail =
+          err.response.data.error ||
+          err.response.data.message ||
+          err.response.data.motivo ||
+          (err.response.data.campos ? JSON.stringify(err.response.data.campos) : JSON.stringify(err.response.data));
+        console.error('[NotaasService] Erro ao solicitar cancelamento na API Notaas:', errorDetail);
+        throw new Error(`Falha ao cancelar NF-e na SEFAZ: ${errorDetail}`);
+      }
+      throw err;
+    }
+
+    if (cancelResponseData?.status === 'cancelled') {
+      return cancelResponseData;
+    }
+
+    const maxAttempts = 20;
+    const delayMs = 2000;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      const statusData = await this.getNfeStatus(invoiceId);
+      const st = statusData?.status;
+
+      if (st === 'cancelled') {
+        return statusData;
+      }
+
+      if (st === 'error') {
+        const errMsg =
+          statusData.motivo ||
+          statusData.xMotivo ||
+          statusData.error ||
+          statusData.mensagem ||
+          'Rejeição no cancelamento pela SEFAZ';
+        throw new Error(`SEFAZ rejeitou o cancelamento: ${errMsg}`);
+      }
+    }
+
+    const finalCheck = await this.getNfeStatus(invoiceId);
+    if (finalCheck?.status === 'cancelled') {
+      return finalCheck;
+    }
+
+    if (finalCheck?.motivo && finalCheck?.status !== 'issued') {
+      throw new Error(`Não foi possível confirmar o cancelamento na SEFAZ: ${finalCheck.motivo}`);
+    }
+
+    return cancelResponseData || finalCheck;
+  }
+
+  /**
+   * Cancela o registro de NF-e de remessa em rental_shipping_invoices e no Notaas/SEFAZ
+   */
+  async cancelShippingInvoiceRecord(shippingInvoiceId: string, motivo: string): Promise<any> {
+    const { data: inv, error: fetchErr } = await supabaseAdmin
+      .from('rental_shipping_invoices')
+      .select('*')
+      .eq('id', shippingInvoiceId)
+      .single();
+
+    if (fetchErr || !inv) {
+      throw new Error('Registro de NF-e de remessa não encontrado.');
+    }
+
+    if (inv.status === 'cancelled') {
+      return inv;
+    }
+
+    if (inv.notaas_invoice_id) {
+      await this.cancelNfe(inv.notaas_invoice_id, motivo);
+    }
+
+    const { data: updated, error: updErr } = await supabaseAdmin
+      .from('rental_shipping_invoices')
+      .update({
+        status: 'cancelled',
+        status_message: `Cancelada: ${(motivo || 'Cancelamento de locação').slice(0, 200)}`,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', shippingInvoiceId)
+      .select('*')
+      .single();
+
+    if (updErr) {
+      console.error('[NotaasService] Erro ao atualizar status para cancelled em rental_shipping_invoices:', updErr);
+      return { ...inv, status: 'cancelled' };
+    }
+
+    return updated;
+  }
+
+  /**
    * Executa o ciclo completo de emissão de NF-e de Remessa (Saída) ou Retorno (Entrada):
    * 1. Monta o payload padronizado
    * 2. Envia para o Notaas e aguarda autorização SEFAZ

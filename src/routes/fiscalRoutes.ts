@@ -6,6 +6,7 @@ import {
   emitShippingNfeRetorno,
   registerExternalShippingNfe,
   getShippingDocuments,
+  cancelShippingNfe,
 } from '../controllers/shippingNfeController';
 import { authorize } from '../middleware/auth';
 
@@ -30,6 +31,7 @@ router.get('/nfe/:id', nfeAccess, nfeImportController.getImportById);
 router.post('/shipping/saida/:contractId', nfeAccess, emitShippingNfeSaida);
 router.post('/shipping/retorno/:rentalId', nfeAccess, emitShippingNfeRetorno);
 router.post('/shipping/retorno-externo/:rentalId', nfeAccess, registerExternalShippingNfe);
+router.post('/shipping/cancel/:shippingInvoiceId', nfeAccess, cancelShippingNfe);
 router.get('/shipping/documents/:rentalOrContractId', nfeAccess, getShippingDocuments);
 
 export default router;

@@ -4,6 +4,8 @@ import { getSupabaseUserClient, supabaseAdmin } from '../config/supabase';
 import { deleteDealsAndSubDependencies } from './crmController';
 import { recordHourMeterUpdate } from '../services/hourMeterService';
 import { notifyAdminsAndDirectors } from '../services/notificationService';
+import { notaasService } from '../services/notaasService';
+import { executeEmitShippingNfeRetorno } from './shippingNfeController';
 
 const updateEquipmentItemStatus = async (
   supabase: any,
@@ -1192,7 +1194,8 @@ export const updateInvoice = async (req: AuthRequest, res: Response) => {
 };
 
 export const deleteInvoice = async (req: AuthRequest, res: Response) => {
-  const { id } = req.params;
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
   try {
     // Validação de permissão: Apenas Administrador e Diretoria
     const allowedRoles = ['Administrador', 'Diretoria'];
@@ -1204,18 +1207,120 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
     }
 
     const supabase = getSupabaseUserClient(req.token!);
-
-    // 1. Buscar equipamentos vinculados para liberá-los no estoque
-    const { data: items } = await supabase
-      .from('rental_invoice_equipments')
-      .select('equipment_id')
-      .eq('rental_invoice_id', id);
+    const nfeAction: 'CANCELAR_REMESSA' | 'EMITIR_RETORNO' | undefined =
+      req.body?.nfe_action || (req.query?.nfe_action as any);
+    const cancelReason: string =
+      req.body?.cancel_reason ||
+      (req.query?.cancel_reason as string) ||
+      'Cancelamento da locacao antes da saida fisica do equipamento';
 
     const { data: currentInvoice } = await supabase
       .from('rental_invoices')
       .select('equipment_id, deal_id')
       .eq('id', id)
       .maybeSingle();
+
+    // 0. Identificar contratos e notas fiscais de remessa/retorno vinculadas à locação ANTES de excluir dados
+    const { data: dealsByRental } = await supabase
+      .from('crm_deals')
+      .select('id')
+      .eq('rental_invoice_id', id);
+
+    const { data: contractsByRental } = await supabase
+      .from('crm_deal_contracts')
+      .select('id, deal_id')
+      .eq('rental_invoice_id', id);
+
+    const relatedDealIds = new Set<string>();
+    if (currentInvoice?.deal_id) {
+      relatedDealIds.add(currentInvoice.deal_id);
+    }
+    (dealsByRental || []).forEach((d: any) => {
+      if (d.id) relatedDealIds.add(d.id);
+    });
+    (contractsByRental || []).forEach((c: any) => {
+      if (c.deal_id) relatedDealIds.add(c.deal_id);
+    });
+
+    const allContractIdsSet = new Set<string>();
+    (contractsByRental || []).forEach((c: any) => {
+      if (c.id) allContractIdsSet.add(c.id);
+    });
+    if (relatedDealIds.size > 0) {
+      const { data: contractsByDeals } = await supabase
+        .from('crm_deal_contracts')
+        .select('id')
+        .in('deal_id', Array.from(relatedDealIds));
+      (contractsByDeals || []).forEach((c: any) => {
+        if (c.id) allContractIdsSet.add(c.id);
+      });
+    }
+    const allContractIds = Array.from(allContractIdsSet);
+
+    // Buscar todas as notas fiscais de transporte (remessa/retorno) ligadas à locação ou aos seus contratos
+    const { data: shippingByRental } = await supabaseAdmin
+      .from('rental_shipping_invoices')
+      .select('*')
+      .eq('rental_invoice_id', id);
+
+    let shippingByContracts: any[] = [];
+    if (allContractIds.length > 0) {
+      const { data: sbc } = await supabaseAdmin
+        .from('rental_shipping_invoices')
+        .select('*')
+        .in('deal_contract_id', allContractIds);
+      shippingByContracts = sbc || [];
+    }
+
+    const shippingMap = new Map<string, any>();
+    [...(shippingByRental || []), ...shippingByContracts].forEach((doc: any) => {
+      if (doc?.id) shippingMap.set(doc.id, doc);
+    });
+    const allShippingDocs = Array.from(shippingMap.values());
+
+    const activeSaidaDocs = allShippingDocs.filter(
+      (doc: any) => doc.direction === 'SAIDA' && doc.status === 'issued'
+    );
+    const activeRetornoDocs = allShippingDocs.filter(
+      (doc: any) => doc.direction === 'RETORNO' && doc.status === 'issued'
+    );
+
+    let returnNfeResult: any = null;
+
+    if (activeSaidaDocs.length > 0) {
+      const effectiveAction = nfeAction || 'CANCELAR_REMESSA';
+
+      if (effectiveAction === 'CANCELAR_REMESSA') {
+        for (const saidaDoc of activeSaidaDocs) {
+          await notaasService.cancelShippingInvoiceRecord(saidaDoc.id, cancelReason);
+        }
+      } else if (effectiveAction === 'EMITIR_RETORNO') {
+        if (activeRetornoDocs.length === 0) {
+          returnNfeResult = await executeEmitShippingNfeRetorno(id, req.user?.id, {
+            forceSystemEmit: true,
+          });
+        }
+      }
+    }
+
+    // Desvincular todas as notas fiscais de remessa/retorno da locação e dos contratos para preservar o histórico fiscal sem erro de FK
+    await supabaseAdmin
+      .from('rental_shipping_invoices')
+      .update({ rental_invoice_id: null, deal_contract_id: null })
+      .eq('rental_invoice_id', id);
+
+    if (allContractIds.length > 0) {
+      await supabaseAdmin
+        .from('rental_shipping_invoices')
+        .update({ rental_invoice_id: null, deal_contract_id: null })
+        .in('deal_contract_id', allContractIds);
+    }
+
+    // 1. Buscar equipamentos vinculados para liberá-los no estoque
+    const { data: items } = await supabase
+      .from('rental_invoice_equipments')
+      .select('equipment_id')
+      .eq('rental_invoice_id', id);
 
     const equipIdsToFree = new Set<string>();
     if (items) {
@@ -1258,29 +1363,7 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
       throw faturasDeleteError;
     }
 
-    // 4. Identificar e excluir TODOS os crm_deals relacionados a esta locação e todas as suas subdependências
-    const { data: dealsByRental } = await supabase
-      .from('crm_deals')
-      .select('id')
-      .eq('rental_invoice_id', id);
-
-    const { data: contractsByRental } = await supabase
-      .from('crm_deal_contracts')
-      .select('id, deal_id')
-      .eq('rental_invoice_id', id);
-
-    const relatedDealIds = new Set<string>();
-    if (currentInvoice?.deal_id) {
-      relatedDealIds.add(currentInvoice.deal_id);
-    }
-    (dealsByRental || []).forEach((d: any) => {
-      if (d.id) relatedDealIds.add(d.id);
-    });
-    (contractsByRental || []).forEach((c: any) => {
-      if (c.deal_id) relatedDealIds.add(c.deal_id);
-    });
-
-    // Desvincular deal_id na locação para permitir exclusão sem restrições de FK
+    // 4. Desvincular deal_id na locação e excluir TODOS os crm_deals e contratos relacionados
     await supabase.from('rental_invoices').update({ deal_id: null }).eq('id', id);
 
     const directContractIds = (contractsByRental || []).map((c: any) => c.id).filter(Boolean);
@@ -1339,7 +1422,13 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
 
     return res.status(200).json({
       success: true,
-      message: 'Locação, contas financeiras e negociações do CRM vinculadas foram excluídas com sucesso.'
+      returnNfe: returnNfeResult,
+      message:
+        nfeAction === 'EMITIR_RETORNO'
+          ? 'NF-e de Retorno emitida e locação excluída com sucesso.'
+          : activeSaidaDocs.length > 0
+            ? 'NF-e de Remessa cancelada e locação excluída com sucesso.'
+            : 'Locação, contas financeiras e negociações do CRM vinculadas foram excluídas com sucesso.'
     });
   } catch (error: any) {
     console.error('[deleteInvoice] Erro ao excluir locação:', error);

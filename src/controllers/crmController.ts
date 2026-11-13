@@ -703,6 +703,8 @@ export const deleteDealsAndSubDependencies = async (supabase: any, dealIds: stri
 
   // 6. Delete rental_invoice_equipments linked to these contracts if any
   if (contractIds.length > 0) {
+    // Desvincular notas fiscais de remessa/retorno para preservar histórico fiscal sem violar FK
+    await supabaseAdmin.from('rental_shipping_invoices').update({ deal_contract_id: null }).in('deal_contract_id', contractIds);
     // Desvincular rental_invoice_equipments ligados a esses contratos (não excluir da locação)
     await supabase.from('rental_invoice_equipments').update({ deal_contract_id: null }).in('deal_contract_id', contractIds);
     // Desvincular active_contract_id em quaisquer negociações que apontem para esses contratos
