@@ -103,13 +103,19 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
 
         let isLinked = mainRental?.equipment_id === equip.id;
         if (!isLinked) {
-          const { data: childEquip } = await supabase
+          let childQuery = supabase
             .from('rental_invoice_equipments')
             .select('id')
-            .eq('rental_invoice_id', osData.rental_invoice_id)
-            .eq('equipment_id', equip.id)
-            .maybeSingle();
-          isLinked = Boolean(childEquip);
+            .eq('rental_invoice_id', osData.rental_invoice_id);
+
+          if (equip.asset_number) {
+            childQuery = childQuery.or(`equipment_id.eq.${equip.id},asset_number.eq.${equip.asset_number}`);
+          } else {
+            childQuery = childQuery.eq('equipment_id', equip.id);
+          }
+
+          const { data: childEquip } = await childQuery.limit(1);
+          isLinked = Boolean(childEquip && childEquip.length > 0);
         }
 
         if (!isLinked) {

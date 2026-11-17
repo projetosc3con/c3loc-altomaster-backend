@@ -1726,7 +1726,8 @@ export const getOrCreateRentalContractDeal = async (req: AuthRequest, res: Respo
 };
 
 export const createRentalServiceOrder = async (req: AuthRequest, res: Response) => {
-  const { id } = req.params;
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
   const {
     equipment_id,
     order_type = 'Externa',
@@ -1762,11 +1763,10 @@ export const createRentalServiceOrder = async (req: AuthRequest, res: Response) 
           .from('rental_invoice_equipments')
           .select('equipment_id')
           .eq('rental_invoice_id', id)
-          .limit(1)
-          .maybeSingle();
+          .limit(1);
 
-        if (firstEquip) {
-          targetEquipmentId = firstEquip.equipment_id;
+        if (firstEquip && firstEquip.length > 0 && firstEquip[0].equipment_id) {
+          targetEquipmentId = firstEquip[0].equipment_id;
         }
       }
     }
@@ -1775,32 +1775,43 @@ export const createRentalServiceOrder = async (req: AuthRequest, res: Response) 
       return res.status(400).json({ error: 'Nenhum equipamento foi especificado para a Ordem de Serviço.' });
     }
 
-    // 3. Validar se o equipamento pertence à locação
-    const isMainEquip = rental.equipment_id === targetEquipmentId;
+    // 3. Buscar dados completos do equipamento (suporta UUID ou asset_number)
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(targetEquipmentId));
+    let equipQuery = supabase.from('equipments').select('*');
+    if (isUuid) {
+      equipQuery = equipQuery.eq('id', targetEquipmentId);
+    } else {
+      equipQuery = equipQuery.eq('asset_number', targetEquipmentId);
+    }
+    const { data: equipment, error: equipError } = await equipQuery.maybeSingle();
+
+    if (equipError || !equipment) {
+      return res.status(404).json({ error: 'Equipamento não encontrado no cadastro.' });
+    }
+
+    targetEquipmentId = equipment.id;
+
+    // 4. Validar se o equipamento pertence à locação (como equipamento principal ou em rental_invoice_equipments)
+    const isMainEquip = rental.equipment_id === equipment.id;
     let isChildEquip = false;
     if (!isMainEquip) {
-      const { data: checkChild } = await supabase
+      let childQuery = supabase
         .from('rental_invoice_equipments')
         .select('id')
-        .eq('rental_invoice_id', id)
-        .eq('equipment_id', targetEquipmentId)
-        .maybeSingle();
-      isChildEquip = Boolean(checkChild);
+        .eq('rental_invoice_id', id);
+
+      if (equipment.asset_number) {
+        childQuery = childQuery.or(`equipment_id.eq.${equipment.id},asset_number.eq.${equipment.asset_number}`);
+      } else {
+        childQuery = childQuery.eq('equipment_id', equipment.id);
+      }
+
+      const { data: checkChild } = await childQuery.limit(1);
+      isChildEquip = Boolean(checkChild && checkChild.length > 0);
     }
 
     if (!isMainEquip && !isChildEquip) {
       return res.status(400).json({ error: 'O equipamento informado não pertence a esta locação.' });
-    }
-
-    // 4. Buscar dados completos do equipamento
-    const { data: equipment, error: equipError } = await supabase
-      .from('equipments')
-      .select('*')
-      .eq('id', targetEquipmentId)
-      .single();
-
-    if (equipError || !equipment) {
-      return res.status(404).json({ error: 'Equipamento não encontrado no cadastro.' });
     }
 
     // 5. Montar endereço e dados de contato do cliente / obra
