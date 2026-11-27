@@ -116,6 +116,7 @@ export interface EmitRemessaParams {
   rentalInvoiceId?: string;
   contractNumber?: string;
   workSite?: string;
+  outboundCfop?: string;
   recipient: NfeRecipientData;
   equipments: NfeEquipmentItem[];
   userId?: string;
@@ -320,18 +321,34 @@ export class NotaasService {
    */
   async processShippingNfe(params: EmitRemessaParams): Promise<any> {
     const isSaida = params.direction === 'SAIDA';
+    const isLegacyAssetOutbound =
+      !isSaida && (params.outboundCfop === '5554' || params.outboundCfop === '6554');
+
     const natureName = isSaida
-      ? 'REMESSA DE BEM DO ATIVO IMOBILIZADO'
-      : 'RETORNO DE BEM DO ATIVO IMOBILIZADO POR LOCACAO';
+      ? 'REMESSA DE BEM POR CONTA DE CONTRATO DE LOCACAO'
+      : isLegacyAssetOutbound
+        ? 'RETORNO DE BEM DO ATIVO IMOBILIZADO POR LOCACAO'
+        : 'RETORNO DE BEM REMETIDO POR CONTA DE CONTRATO DE LOCACAO';
 
     const isDestIsento = isClientIsento(params.recipient.state_subscription);
     const destUf = (params.recipient.address_state || 'MT').toUpperCase().trim();
     const isInternal = destUf === 'MT';
 
     // CFOPs:
-    // Saída: 5554 (interno) / 6554 (interestadual)
-    // Retorno: 1554 (interno) / 2554 (interestadual)
-    const cfop = isSaida ? (isInternal ? '5554' : '6554') : (isInternal ? '1554' : '2554');
+    // Saída (Locação): 5908 (interno MT) / 6908 (interestadual)
+    // Retorno (Locação): 1909 (interno MT) / 2909 (interestadual)
+    // Compatibilidade para retorno de notas antigas emitidas com 5554/6554: 1554 / 2554
+    const cfop = isSaida
+      ? isInternal
+        ? '5908'
+        : '6908'
+      : isLegacyAssetOutbound
+        ? isInternal
+          ? '1554'
+          : '2554'
+        : isInternal
+          ? '1909'
+          : '2909';
 
     // Validação de equipamentos
     if (!params.equipments || params.equipments.length === 0) {
@@ -426,9 +443,12 @@ export class NotaasService {
     }
 
     const workSiteStr = effectiveWorkSite ? `Local da obra: ${effectiveWorkSite}. ` : '';
+    const legalNotice = isLegacyAssetOutbound
+      ? 'ICMS ISENTO CFE ART. 81, ANEXO IV DO RICMS/MT.'
+      : 'NAO INCIDENCIA DE ICMS CFE ART. 5o DO RICMS/MT.';
     const infoComplementar = isSaida
-      ? `EMPRESA OPTANTE PELO SIMPLES NACIONAL CFE LC 123/2006. ICMS ISENTO CFE ART. 81, ANEXO IV DO RICMS/MT. ${workSiteStr}CONTRATO DE LOCACAO No ${params.contractNumber || 'S/N'}.`
-      : `EMPRESA OPTANTE PELO SIMPLES NACIONAL CFE LC 123/2006. ICMS ISENTO CFE ART. 81, ANEXO IV DO RICMS/MT. ${workSiteStr}RETORNO DE LOCACAO CONFORME CONTRATO No ${params.contractNumber || 'S/N'}.`;
+      ? `EMPRESA OPTANTE PELO SIMPLES NACIONAL CFE LC 123/2006. ${legalNotice} ${workSiteStr}CONTRATO DE LOCACAO No ${params.contractNumber || 'S/N'}.`
+      : `EMPRESA OPTANTE PELO SIMPLES NACIONAL CFE LC 123/2006. ${legalNotice} ${workSiteStr}RETORNO DE LOCACAO CONFORME CONTRATO No ${params.contractNumber || 'S/N'}.`;
 
     const codigoMunicipio =
       params.recipient.ibge_code ||

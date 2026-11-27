@@ -72,6 +72,71 @@ describe('billRoutes', () => {
       expect(res.body).toHaveLength(1);
       expect(res.body[0].id).toBe(unreconciled.id);
     });
+
+    it('inclui fatura parcelada com 1 parcela recebida e outra atrasada ao filtrar status=Atrasado com group_nfe=true', async () => {
+      const groupId = 'group-cw2-247';
+      const paidInst = makeBill({
+        type: 'receivable',
+        origin: 'MANUAL',
+        counterparty_name: 'CW2 INFRALOG LTDA',
+        description: 'Prorrogação de Locação #247/2026 - Parcela 1/2',
+        gross_value: 4000,
+        net_value: 4000,
+        due_date: '2026-09-28',
+        status: 'Recebido',
+        reconciled_at: '2026-11-10T15:57:51.777Z',
+        bank_raw_snapshot: {
+          group_id: groupId,
+          installment_number: 1,
+          total_installments: 2,
+          fatura_numero: '8/2026',
+          original_description: 'Prorrogação de Locação #247/2026',
+        },
+      });
+      const overdueInst = makeBill({
+        type: 'receivable',
+        origin: 'MANUAL',
+        counterparty_name: 'CW2 INFRALOG LTDA',
+        description: 'Prorrogação de Locação #247/2026 - Parcela 2/2',
+        gross_value: 2000,
+        net_value: 2000,
+        due_date: '2026-10-28',
+        status: 'Atrasado',
+        reconciled_at: null,
+        bank_raw_snapshot: {
+          group_id: groupId,
+          installment_number: 2,
+          total_installments: 2,
+          fatura_numero: '8/2026',
+          original_description: 'Prorrogação de Locação #247/2026',
+        },
+      });
+      const overduePayment = makePayment({
+        status: 'OVERDUE',
+        due_date: '2026-10-15',
+      });
+
+      db.seed('bills', [paidInst, overdueInst]);
+      db.seed('payments', [overduePayment]);
+
+      const res = await request(app)
+        .get('/api/bills?type=receivable&status=Atrasado&group_nfe=true')
+        .set('x-test-profile', profileHeader('Administrador'));
+
+      expect(res.status).toBe(200);
+      expect(res.body.total).toBe(2);
+
+      const groupedBill = res.body.data.find((i: any) => i.source === 'bill');
+      expect(groupedBill).toBeDefined();
+      expect(groupedBill.status).toBe('Atrasado');
+      expect(groupedBill.due_date).toBe('2026-10-28');
+      expect(groupedBill.installments_count).toBe(2);
+      expect(groupedBill.paid_installments_count).toBe(1);
+
+      const paymentItem = res.body.data.find((i: any) => i.source === 'payment');
+      expect(paymentItem).toBeDefined();
+      expect(paymentItem.id).toBe(overduePayment.id);
+    });
   });
 
   describe('POST /api/bills', () => {

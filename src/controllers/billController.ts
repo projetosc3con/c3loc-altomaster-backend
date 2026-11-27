@@ -91,20 +91,23 @@ function groupBillsWithInstallments(items: BillStatementItem[]): BillStatementIt
     const paidCount = installments.filter((i) => i.status === 'Recebido' || i.status === 'Pago' || i.status === 'No prazo').length;
     const allReconciled = installments.every((i) => i.is_reconciled);
 
-    // Próximo vencimento pendente (ou o último se todos quitados)
-    const pendingInst = installments.find((i) => i.status !== 'Recebido' && i.status !== 'Pago' && i.status !== 'No prazo');
+    // Próximo vencimento pendente — prioriza parcela atrasada, depois a próxima em aberto (ou a última se todas quitadas)
+    const overdueInst = installments.find((i) => i.status === 'Atrasado');
+    const pendingInst = overdueInst || installments.find((i) => i.status !== 'Recebido' && i.status !== 'Pago' && i.status !== 'No prazo');
     const targetDueDate = pendingInst?.due_date || installments[installments.length - 1]?.due_date || first.due_date;
+
+    const anyOverdue = Boolean(overdueInst);
+    const anyDivergent = installments.some((i) => i.status === 'Divergente');
 
     let consolidatedStatus = 'Pendente';
     if (paidCount === totalCount) {
       consolidatedStatus = first.type === 'payable' ? 'Pago' : 'Recebido';
+    } else if (anyOverdue) {
+      consolidatedStatus = 'Atrasado';
+    } else if (anyDivergent) {
+      consolidatedStatus = 'Divergente';
     } else if (paidCount > 0) {
       consolidatedStatus = `Parcial (${paidCount}/${totalCount})`;
-    } else {
-      const anyOverdue = installments.some((i) => i.status === 'Atrasado');
-      if (anyOverdue) {
-        consolidatedStatus = 'Atrasado';
-      }
     }
 
     let invoiceNum: string;
@@ -219,8 +222,18 @@ export const getFilteredBills = async (supabase: any, query: any): Promise<BillS
 
   if (status && shouldGroupNfe) {
     finalItems = finalItems.filter((item) => {
+      if (item.source === 'payment') {
+        if (status === 'Pendente') return item.status === 'PENDING';
+        if (status === 'Atrasado') return item.status === 'OVERDUE';
+        if (status === 'Recebido' || status === 'Pago') return item.status === 'RECEIVED';
+        if (status === 'Aguardando compensação') return item.status === 'CONFIRMED';
+        return false;
+      }
       if (item.status === status) return true;
+      if (status === 'Pago' && item.type === 'payable' && item.status === 'Recebido') return true;
       if (item.status.startsWith('Parcial') && status === 'Pendente') return true;
+      if (status === 'Atrasado' && Array.isArray(item.installments) && item.installments.some((i) => i.status === 'Atrasado')) return true;
+      if (status === 'Divergente' && Array.isArray(item.installments) && item.installments.some((i) => i.status === 'Divergente')) return true;
       return false;
     });
   }

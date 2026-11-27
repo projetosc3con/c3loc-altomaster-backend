@@ -6,13 +6,73 @@ import { recordHourMeterUpdate } from '../services/hourMeterService';
 
 const SERVICE_ORDER_SELECT = '*, service_order_parts(*, parts(*)), service_order_labor(*), executor:users_profiles!executed_by(id, full_name)';
 
+const normalizeFuelType = (val?: string | null): string =>
+  (val || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase();
+
+const validatePreventivePartsReference = async (
+  supabase: any,
+  equipmentId: string | undefined,
+  parts: any[]
+): Promise<string | null> => {
+  if (!parts || parts.length === 0) return null;
+
+  let allowedPartIds: Set<string> | null = null;
+  if (equipmentId) {
+    const { data: refParts, error: refErr } = await supabase
+      .from('equipment_parts')
+      .select('part_id')
+      .eq('equipment_id', equipmentId);
+
+    if (!refErr && Array.isArray(refParts) && refParts.length > 0) {
+      allowedPartIds = new Set(refParts.map((r: any) => r.part_id));
+    }
+  }
+
+  const requestedIds = Array.from(new Set(parts.map((p: any) => p.part_id).filter(Boolean)));
+  if (requestedIds.length === 0) return null;
+
+  const { data: dbParts } = await supabase
+    .from('parts')
+    .select('id, description, category')
+    .in('id', requestedIds);
+
+  const partMap = new Map<string, any>((dbParts || []).map((p: any) => [p.id, p]));
+
+  for (const partId of requestedIds) {
+    const part = partMap.get(partId);
+    if (!part) return `Peça com ID ${partId} não encontrada.`;
+    if (allowedPartIds) {
+      if (!allowedPartIds.has(partId)) {
+        return `A peça "${part.description}" não faz parte da lista de peças cadastrada para este equipamento.`;
+      }
+    } else if ((part.category || 'Peça') !== 'Peça') {
+      return `O material "${part.description}" não é do tipo "Peça".`;
+    }
+  }
+
+  return null;
+};
+
 export const getAllServiceOrders = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const { data, error } = await supabase
+    const category = typeof req.query.category === 'string' ? req.query.category.toUpperCase() : '';
+    let query = supabase
       .from('service_orders')
       .select(SERVICE_ORDER_SELECT)
       .order('created_at', { ascending: false });
+
+    if (category === 'PREVENTIVA') {
+      query = query.eq('maintenance_category', 'PREVENTIVA');
+    } else if (category === 'OS') {
+      query = query.or('maintenance_category.eq.OS,maintenance_category.is.null');
+    }
+
+    const { data, error } = await query;
 
     if (error) throw error;
     return res.json(data);
@@ -54,8 +114,20 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
     delete osData.equipment;
     delete osData.equipments;
 
-    // 0. Validate parts stock availability before doing anything
+    const isPreventive = osData.maintenance_category === 'PREVENTIVA';
+    if (!osData.maintenance_category) {
+      osData.maintenance_category = 'OS';
+    }
+
+    // 0. Validate parts stock availability before doing anything (somente itens marcados como utilizados/substituídos)
     if (parts && Array.isArray(parts) && parts.length > 0) {
+        if (isPreventive) {
+          const refValidationError = await validatePreventivePartsReference(supabase, osData.equipment_id, parts);
+          if (refValidationError) {
+            return res.status(400).json({ error: refValidationError });
+          }
+        }
+
         for (const p of parts) {
             const { data: part, error: partError } = await supabase
                 .from('parts')
@@ -67,7 +139,8 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
                 return res.status(404).json({ error: `Peça com ID ${p.part_id} não encontrada.` });
             }
 
-            if ((part.quantity || 0) < p.quantity_used) {
+            const consumesStock = isPreventive ? p.was_used !== false : true;
+            if (consumesStock && (part.quantity || 0) < (Number(p.quantity_used) || 0)) {
                 return res.status(400).json({ 
                     error: `Estoque insuficiente para a peça "${part.description}". Estoque disponível: ${part.quantity || 0}, solicitado: ${p.quantity_used}.` 
                 });
@@ -75,19 +148,31 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
         }
     }
 
-    // 0.1 Validate equipment status: if "Locado", OS can only be opened with a valid rental_invoice_id
+    // 0.1 Validate equipment status & preventive type matching
+    let currentEquipStatus: string | null = null;
     if (osData.equipment_id) {
       const { data: equip, error: eqErr } = await supabase
         .from('equipments')
-        .select('id, name, asset_number, status')
+        .select('id, name, asset_number, status, type')
         .eq('id', osData.equipment_id)
         .single();
 
       if (eqErr || !equip) {
         return res.status(404).json({ error: 'Equipamento não encontrado.' });
       }
+      currentEquipStatus = equip.status;
 
-      if (equip.status === 'Locado') {
+      if (isPreventive && osData.preventive_type) {
+        const expectedType = normalizeFuelType(osData.preventive_type);
+        const actualType = normalizeFuelType(equip.type);
+        if (expectedType && actualType && expectedType !== actualType) {
+          return res.status(400).json({
+            error: `O equipamento "${equip.asset_number || equip.name}" é do tipo "${equip.type}", incompatível com manutenção preventiva "${osData.preventive_type}".`,
+          });
+        }
+      }
+
+      if (equip.status === 'Locado' && !isPreventive) {
         if (!osData.rental_invoice_id) {
           return res.status(400).json({
             error: `O equipamento "${equip.asset_number || equip.name}" está com status "Locado". Ordens de serviço para equipamentos locados só podem ser abertas diretamente a partir da respectiva locação.`
@@ -135,15 +220,15 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
 
     if (osError) throw osError;
 
-    // 2. Update equipment status based on OS status
-    if (osData.equipment_id) {
+    // 2. Update equipment status based on OS status (não sobrescreve status 'Locado' em preventiva ou OS vinculada à locação)
+    if (osData.equipment_id && !(isPreventive && currentEquipStatus === 'Locado')) {
         const isAvailable = osData.status === 'Concluída' || osData.status === 'Encerrada com pendências' || osData.status === 'Cancelada';
-        if (osData.order_type === 'Interna') {
+        if (osData.order_type === 'Interna' && !isPreventive) {
             await supabase
                 .from('equipments')
                 .update({ status: isAvailable ? 'Disponível' : 'Em Manutenção' })
                 .eq('id', osData.equipment_id);
-        } else if (!osData.rental_invoice_id) {
+        } else if (!osData.rental_invoice_id && currentEquipStatus !== 'Locado') {
             await supabase
                 .from('equipments')
                 .update({ status: isAvailable ? 'Disponível' : 'Em Manutenção' })
@@ -159,7 +244,9 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
             source_type: 'service_order',
             reference_id: os.id,
             reference_number: os.os_number ? String(os.os_number) : null,
-            notes: `Horímetro registrado na OS #${os.os_number || ''}`,
+            notes: isPreventive
+              ? `Horímetro registrado na Preventiva #${os.os_number || ''}`
+              : `Horímetro registrado na OS #${os.os_number || ''}`,
             created_by: req.user?.id || null,
         });
     }
@@ -180,8 +267,12 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
 
         if (partsError) throw partsError;
 
-        // 4. Update parts stock and record SAIDA audit log
+        // 4. Update parts stock and record SAIDA audit log (para preventiva, apenas peças marcadas como substituídas)
         for (const p of parts) {
+            const consumesStock = isPreventive ? p.was_used !== false : true;
+            const qtyUsed = Number(p.quantity_used) || 0;
+            if (!consumesStock || qtyUsed <= 0) continue;
+
             const { data: part } = await supabase
                 .from('parts')
                 .select('id, quantity, unit_value, description, internal_code')
@@ -189,7 +280,6 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
                 .single();
             if (part) {
                 const prevStock = Number(part.quantity) || 0;
-                const qtyUsed = Number(p.quantity_used) || 0;
                 const newStock = prevStock - qtyUsed;
 
                 await supabase
@@ -206,8 +296,12 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
                     new_stock: newStock,
                     reference_type: 'SERVICE_ORDER',
                     reference_id: os.id,
-                    reference_label: `OS #${os.os_number || os.id.slice(0, 8)}`,
-                    notes: `Aplicação de material na OS #${os.os_number || ''} (${osData.equipment_name || 'Equipamento'}).`,
+                    reference_label: isPreventive
+                      ? `PREV #${os.os_number || os.id.slice(0, 8)}`
+                      : `OS #${os.os_number || os.id.slice(0, 8)}`,
+                    notes: isPreventive
+                      ? `Substituição de peça na Manutenção Preventiva #${os.os_number || ''} (${osData.equipment_name || 'Equipamento'}).`
+                      : `Aplicação de material na OS #${os.os_number || ''} (${osData.equipment_name || 'Equipamento'}).`,
                     created_by: req.user?.id || null,
                 });
             }
@@ -222,7 +316,10 @@ export const createServiceOrder = async (req: AuthRequest, res: Response) => {
             labor_date: l.labor_date || null,
             start_time: l.start_time || null,
             end_time: l.end_time || null,
-            labor_type: l.labor_type || 'T'
+            labor_type: l.labor_type || 'T',
+            ...(l.vehicle_plate !== undefined ? { vehicle_plate: l.vehicle_plate || null } : {}),
+            ...(l.km_start !== undefined ? { km_start: l.km_start !== '' && l.km_start !== null ? Number(l.km_start) : null } : {}),
+            ...(l.km_end !== undefined ? { km_end: l.km_end !== '' && l.km_end !== null ? Number(l.km_end) : null } : {}),
         }));
 
         const { error: laborError } = await supabase
@@ -255,6 +352,23 @@ export const updateServiceOrder = async (req: AuthRequest, res: Response) => {
         delete osData.equipment;
         delete osData.equipments;
 
+        // Buscar registro atual para saber categoria (OS vs PREVENTIVA) e equipment_id
+        const { data: existingOs } = await supabase
+            .from('service_orders')
+            .select('id, maintenance_category, equipment_id, os_number')
+            .eq('id', id)
+            .maybeSingle();
+
+        const isPreventive = (osData.maintenance_category || existingOs?.maintenance_category) === 'PREVENTIVA';
+        const effectiveTargetEqId = osData.equipment_id || existingOs?.equipment_id;
+
+        if (isPreventive && parts && Array.isArray(parts) && parts.length > 0) {
+            const refValidationError = await validatePreventivePartsReference(supabase, effectiveTargetEqId, parts);
+            if (refValidationError) {
+                return res.status(400).json({ error: refValidationError });
+            }
+        }
+
         // 0. Validate and calculate stock adjustments
         let oldQuantities: Record<string, number> = {};
         let newQuantities: Record<string, number> = {};
@@ -265,19 +379,21 @@ export const updateServiceOrder = async (req: AuthRequest, res: Response) => {
             // Fetch current parts allocated to this OS
             const { data: oldParts, error: oldPartsError } = await supabase
                 .from('service_order_parts')
-                .select('part_id, quantity_used')
+                .select('part_id, quantity_used, was_used')
                 .eq('service_order_id', id);
 
             if (oldPartsError) throw oldPartsError;
 
             if (oldParts) {
                 for (const op of oldParts) {
-                    oldQuantities[op.part_id] = op.quantity_used || 0;
+                    const consumed = isPreventive ? op.was_used !== false : true;
+                    oldQuantities[op.part_id] = (oldQuantities[op.part_id] || 0) + (consumed ? (Number(op.quantity_used) || 0) : 0);
                 }
             }
 
             for (const np of parts) {
-                newQuantities[np.part_id] = np.quantity_used || 0;
+                const consumed = isPreventive ? np.was_used !== false : true;
+                newQuantities[np.part_id] = (newQuantities[np.part_id] || 0) + (consumed ? (Number(np.quantity_used) || 0) : 0);
             }
 
             affectedPartIds = Array.from(new Set([
@@ -333,18 +449,32 @@ export const updateServiceOrder = async (req: AuthRequest, res: Response) => {
 
         if (osError) throw osError;
 
-        // 2. Update equipment status based on OS status (only for equipment not linked to active rental)
+        // 2. Update equipment status based on OS status (only for equipment not linked to active rental and not 'Locado' in preventive)
         if (os.equipment_id && !os.rental_invoice_id) {
-            if (os.status === 'Concluída' || os.status === 'Encerrada com pendências' || os.status === 'Cancelada') {
-                await supabase
+            let skipStatusUpdate = false;
+            if (isPreventive) {
+                const { data: eqRow } = await supabase
                     .from('equipments')
-                    .update({ status: 'Disponível' })
-                    .eq('id', os.equipment_id);
-            } else {
-                await supabase
-                    .from('equipments')
-                    .update({ status: 'Em Manutenção' })
-                    .eq('id', os.equipment_id);
+                    .select('status')
+                    .eq('id', os.equipment_id)
+                    .maybeSingle();
+                if (eqRow?.status === 'Locado') {
+                    skipStatusUpdate = true;
+                }
+            }
+
+            if (!skipStatusUpdate) {
+                if (os.status === 'Concluída' || os.status === 'Encerrada com pendências' || os.status === 'Cancelada') {
+                    await supabase
+                        .from('equipments')
+                        .update({ status: 'Disponível' })
+                        .eq('id', os.equipment_id);
+                } else {
+                    await supabase
+                        .from('equipments')
+                        .update({ status: 'Em Manutenção' })
+                        .eq('id', os.equipment_id);
+                }
             }
         }
 
@@ -438,7 +568,10 @@ export const updateServiceOrder = async (req: AuthRequest, res: Response) => {
                     labor_date: l.labor_date || null,
                     start_time: l.start_time || null,
                     end_time: l.end_time || null,
-                    labor_type: l.labor_type || 'T'
+                    labor_type: l.labor_type || 'T',
+                    ...(l.vehicle_plate !== undefined ? { vehicle_plate: l.vehicle_plate || null } : {}),
+                    ...(l.km_start !== undefined ? { km_start: l.km_start !== '' && l.km_start !== null ? Number(l.km_start) : null } : {}),
+                    ...(l.km_end !== undefined ? { km_end: l.km_end !== '' && l.km_end !== null ? Number(l.km_end) : null } : {}),
                 }));
 
                 const { error: laborError } = await supabase

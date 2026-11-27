@@ -402,12 +402,33 @@ export async function executeEmitShippingNfeRetorno(
 
   const form = contractForm || contractObj?.snapshot?.contract_form || {};
 
+  // Verificar o CFOP da NF-e de saída vinculada para compatibilidade no retorno (5554/6554 -> 1554/2554; 5908/6908 -> 1909/2909)
+  let outboundCfop: string | undefined = undefined;
+  const { data: latestOutbound } = await supabaseAdmin
+    .from('rental_shipping_invoices')
+    .select('cfop')
+    .eq('direction', 'SAIDA')
+    .eq('status', 'issued')
+    .or(
+      dealContractId
+        ? `rental_invoice_id.eq.${rentalId},deal_contract_id.eq.${dealContractId}`
+        : `rental_invoice_id.eq.${rentalId}`
+    )
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (latestOutbound?.cfop) {
+    outboundCfop = String(latestOutbound.cfop).replace(/\D/g, '');
+  }
+
   return notaasService.processShippingNfe({
     direction: 'RETORNO',
     rentalInvoiceId: rentalId,
     dealContractId,
     contractNumber,
     workSite,
+    outboundCfop,
     recipient: {
       company_name: client?.company_name || form.locatario_company_name || rental.client_name || 'Cliente',
       cnpj: client?.cnpj || form.locatario_cnpj || rental.cnpj || '',
@@ -485,8 +506,8 @@ export async function registerExternalShippingNfe(req: AuthRequest, res: Respons
         nfe_number: nfe_number ? Number(nfe_number) : null,
         access_key: access_key?.replace(/\D/g, '') || null,
         status: 'issued',
-        natureza_operacao: 'RETORNO DE BEM DO ATIVO IMOBILIZADO POR LOCACAO (CLIENTE)',
-        cfop: '1554',
+        natureza_operacao: 'RETORNO DE BEM REMETIDO POR CONTA DE CONTRATO DE LOCACAO (CLIENTE)',
+        cfop: '1909',
         danfe_pdf_url: danfe_pdf_url || null,
         created_by: req.user?.id || null,
       })

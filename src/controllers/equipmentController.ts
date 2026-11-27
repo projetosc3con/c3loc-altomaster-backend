@@ -149,10 +149,11 @@ export const getEquipmentById = async (req: AuthRequest, res: Response) => {
 export const createEquipment = async (req: AuthRequest, res: Response) => {
   try {
     const supabase = getSupabaseUserClient(req.token!);
+    const { reference_parts, ...bodyRest } = req.body;
     const insertData = {
-      ...req.body,
-      created_by: req.user?.id || req.body.created_by || null,
-      hour_meter: req.body.hour_meter != null && req.body.hour_meter !== '' ? Number(req.body.hour_meter) : 0,
+      ...bodyRest,
+      created_by: req.user?.id || bodyRest.created_by || null,
+      hour_meter: bodyRest.hour_meter != null && bodyRest.hour_meter !== '' ? Number(bodyRest.hour_meter) : 0,
     };
     const { data, error } = await supabase
       .from('equipments')
@@ -176,6 +177,13 @@ export const createEquipment = async (req: AuthRequest, res: Response) => {
         });
     }
 
+    // Salvar lista de peças de referência (apenas Administrador e Diretoria, sem baixa de estoque)
+    const userRole = req.profile?.access_level;
+    const canManageParts = userRole === 'Administrador' || userRole === 'Diretoria';
+    if (data && canManageParts && Array.isArray(reference_parts) && reference_parts.length > 0) {
+      await syncEquipmentReferenceParts(supabase, data.id, reference_parts, req.user?.id || null);
+    }
+
     return res.status(201).json(data);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
@@ -183,10 +191,12 @@ export const createEquipment = async (req: AuthRequest, res: Response) => {
 };
 
 export const updateEquipment = async (req: AuthRequest, res: Response) => {
-  const { id } = req.params;
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
   try {
     const supabase = getSupabaseUserClient(req.token!);
-    const updateData = { ...req.body };
+    const { reference_parts, ...bodyRest } = req.body;
+    const updateData = { ...bodyRest };
     delete updateData.id;
     delete updateData.created_at;
     delete updateData.updated_at;
@@ -242,6 +252,10 @@ export const updateEquipment = async (req: AuthRequest, res: Response) => {
             created_by: req.user?.id || null,
           });
       }
+    }
+
+    if (Array.isArray(reference_parts) && canEditHourMeter) {
+      await syncEquipmentReferenceParts(supabase, id, reference_parts, req.user?.id || null);
     }
 
     return res.json(data);
@@ -454,6 +468,132 @@ export const getEquipmentHourMeterLogs = async (req: AuthRequest, res: Response)
     return res.json(data || []);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
+  }
+};
+
+/**
+ * Sincroniza a lista de peças de referência de um equipamento em `equipment_parts`.
+ * Importante: NÃO realiza baixa de estoque — serve exclusivamente como referência para Manutenções Preventivas.
+ */
+async function syncEquipmentReferenceParts(
+  supabase: any,
+  equipmentId: string,
+  items: Array<{ part_id: string; default_quantity?: number; notes?: string | null }>,
+  userId: string | null
+) {
+  // Deduplicar por part_id
+  const uniqueMap = new Map<string, { part_id: string; default_quantity: number; notes: string | null }>();
+  for (const item of items || []) {
+    if (!item?.part_id) continue;
+    const qty = Number(item.default_quantity);
+    uniqueMap.set(item.part_id, {
+      part_id: item.part_id,
+      default_quantity: !isNaN(qty) && qty > 0 ? qty : 1,
+      notes: item.notes ? String(item.notes).trim() : null,
+    });
+  }
+
+  const normalizedItems = Array.from(uniqueMap.values());
+
+  if (normalizedItems.length > 0) {
+    const partIds = normalizedItems.map((i) => i.part_id);
+    const { data: foundParts, error: partsErr } = await supabase
+      .from('parts')
+      .select('id, description, category')
+      .in('id', partIds);
+
+    if (partsErr) throw partsErr;
+
+    const foundMap = new Map<string, any>((foundParts || []).map((p: any) => [p.id, p]));
+    for (const item of normalizedItems) {
+      const part = foundMap.get(item.part_id);
+      if (!part) {
+        throw new Error(`Peça informada (${item.part_id}) não foi encontrada no cadastro de materiais.`);
+      }
+      if ((part.category || 'Peça') !== 'Peça') {
+        throw new Error(
+          `O material "${part.description}" é da categoria "${part.category}" e não pode ser adicionado. Apenas materiais do tipo "Peça" são permitidos na lista de peças do equipamento.`
+        );
+      }
+    }
+  }
+
+  // Substituir lista (sem qualquer movimentação de estoque)
+  const { error: deleteErr } = await supabase
+    .from('equipment_parts')
+    .delete()
+    .eq('equipment_id', equipmentId);
+
+  if (deleteErr) throw deleteErr;
+
+  if (normalizedItems.length > 0) {
+    const rowsToInsert = normalizedItems.map((item) => ({
+      equipment_id: equipmentId,
+      part_id: item.part_id,
+      default_quantity: item.default_quantity,
+      notes: item.notes,
+      created_by: userId,
+    }));
+
+    const { error: insertErr } = await supabase
+      .from('equipment_parts')
+      .insert(rowsToInsert);
+
+    if (insertErr) throw insertErr;
+  }
+}
+
+export const getEquipmentParts = async (req: AuthRequest, res: Response) => {
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
+  try {
+    const supabase = getSupabaseUserClient(req.token!);
+    const { data, error } = await supabase
+      .from('equipment_parts')
+      .select('*, part:parts(*)')
+      .eq('equipment_id', id)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      // Caso a tabela ainda não tenha sido migrada no ambiente, evita erro fatal na tela de manutenção
+      if (error.code === '42P01' || error.message?.includes('equipment_parts')) {
+        return res.json([]);
+      }
+      throw error;
+    }
+
+    return res.json(data || []);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+export const updateEquipmentParts = async (req: AuthRequest, res: Response) => {
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
+  try {
+    const userRole = req.profile?.access_level;
+    if (userRole !== 'Administrador' && userRole !== 'Diretoria') {
+      return res.status(403).json({
+        error: 'Acesso negado: apenas usuários do tipo Administrador ou Diretoria podem editar a lista de peças do equipamento.',
+      });
+    }
+
+    const supabase = getSupabaseUserClient(req.token!);
+    const items = Array.isArray(req.body?.parts) ? req.body.parts : Array.isArray(req.body) ? req.body : [];
+
+    await syncEquipmentReferenceParts(supabase, id, items, req.user?.id || null);
+
+    const { data, error } = await supabase
+      .from('equipment_parts')
+      .select('*, part:parts(*)')
+      .eq('equipment_id', id)
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+    return res.json(data || []);
+  } catch (error: any) {
+    return res.status(400).json({ error: error.message });
   }
 };
 
